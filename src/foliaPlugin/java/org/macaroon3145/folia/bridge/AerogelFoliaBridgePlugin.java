@@ -23,16 +23,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.stream.LongStream;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData;
 import net.minecraft.server.level.ThreadedLevelLightEngine;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.lighting.LevelLightEngine;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.chunk.PalettedContainerRO;
+import net.minecraft.world.level.chunk.Strategy;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.WorldCreator;
@@ -48,6 +54,8 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
     private static final String NETHER_SEED_PROPERTY = "aerogel.folia.seed.the_nether";
     private static final String END_SEED_PROPERTY = "aerogel.folia.seed.the_end";
     private static final String WORLD_SPAWNS_FILE = "world-spawns.tsv";
+    private static final long CHUNK_RETENTION_SWEEP_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1L);
+    private static final long DEFAULT_CHUNK_KEEPALIVE_NANOS = TimeUnit.SECONDS.toNanos(30L);
 
     private SharedMemoryBridge bridge;
     private volatile boolean pollerRunning;
@@ -80,6 +88,9 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
     private volatile long lastExtractionStageNanosSnapshot;
     private volatile long lastResponseStageNanosSnapshot;
     private volatile long lastTimedCompletedSnapshot;
+    private volatile long lastChunkRetentionSweepNanos;
+    private final long chunkKeepAliveNanos = configuredChunkKeepAliveNanos();
+    private final Map<CachedChunkKey, Long> retainedChunks = new java.util.concurrent.ConcurrentHashMap<>();
     private final Long configuredOverworldSeed = configuredWorldSeed(OVERWORLD_SEED_PROPERTY);
     private final Long configuredNetherSeed = configuredWorldSeed(NETHER_SEED_PROPERTY);
     private final Long configuredEndSeed = configuredWorldSeed(END_SEED_PROPERTY);
@@ -161,6 +172,7 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
     private void pollLoop() {
         while (this.pollerRunning && !Thread.currentThread().isInterrupted()) {
             boolean claimed = pollRequests();
+            sweepRetainedChunksIfDue();
             logMetricsIfDue();
             if (!claimed) {
                 LockSupport.parkNanos(200_000L);
@@ -331,12 +343,19 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
                 return;
             }
 
+            SharedMemoryBridge bridgeSnapshot = this.bridge;
+            if (bridgeSnapshot == null || !bridgeSnapshot.isRequestActive(request)) {
+                retainChunk(request.worldKey(), request.chunkX(), request.chunkZ());
+                markRequestFinished(false);
+                return;
+            }
+
             try {
                 long extractionStageStart = System.nanoTime();
                 ChunkPayload payload = extractChunkPayload(world, request.chunkX(), request.chunkZ());
                 long extractionDone = System.nanoTime();
                 this.extractionStageNanosTotal.addAndGet(Math.max(0L, extractionDone - extractionStageStart));
-                scheduleChunkUnload(world, request.chunkX(), request.chunkZ());
+                retainChunk(request.worldKey(), request.chunkX(), request.chunkZ());
 
                 ExecutorService executor = this.responseExecutor;
                 if (executor == null || executor.isShutdown()) {
@@ -352,6 +371,10 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
                         if (localBridge == null) {
                             throw new IllegalStateException("Bridge closed");
                         }
+                        if (!localBridge.isRequestActive(request)) {
+                            markRequestFinished(false);
+                            return;
+                        }
                         localBridge.completeSuccess(request, payload);
                         long responseDone = System.nanoTime();
                         this.responseStageNanosTotal.addAndGet(Math.max(0L, responseDone - responseStageStart));
@@ -363,7 +386,7 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
                     }
                 });
             } catch (Throwable throwable) {
-                scheduleChunkUnload(world, request.chunkX(), request.chunkZ());
+                retainChunk(request.worldKey(), request.chunkX(), request.chunkZ());
                 completeRequestError(world, request, throwable);
                 markRequestFinished(false);
             }
@@ -377,6 +400,44 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
                 world.unloadChunk(chunkX, chunkZ, false);
             }
         });
+    }
+
+    private long configuredChunkKeepAliveNanos() {
+        String configured = System.getProperty("aerogel.folia.bridge.chunk-keepalive-ms");
+        long keepAliveMillis;
+        if (configured == null || configured.isBlank()) {
+            keepAliveMillis = TimeUnit.NANOSECONDS.toMillis(DEFAULT_CHUNK_KEEPALIVE_NANOS);
+        } else {
+            try {
+                keepAliveMillis = Math.max(1L, Long.parseLong(configured.trim()));
+            } catch (NumberFormatException ignored) {
+                keepAliveMillis = TimeUnit.NANOSECONDS.toMillis(DEFAULT_CHUNK_KEEPALIVE_NANOS);
+            }
+        }
+        return TimeUnit.MILLISECONDS.toNanos(keepAliveMillis);
+    }
+
+    private void retainChunk(String worldKey, int chunkX, int chunkZ) {
+        this.retainedChunks.put(new CachedChunkKey(worldKey, chunkX, chunkZ), System.nanoTime());
+    }
+
+    private void sweepRetainedChunksIfDue() {
+        long now = System.nanoTime();
+        long lastSweep = this.lastChunkRetentionSweepNanos;
+        if (lastSweep != 0L && now - lastSweep < CHUNK_RETENTION_SWEEP_INTERVAL_NANOS) return;
+        this.lastChunkRetentionSweepNanos = now;
+
+        for (Map.Entry<CachedChunkKey, Long> entry : this.retainedChunks.entrySet()) {
+            Long touchedAt = entry.getValue();
+            if (touchedAt == null) continue;
+            if (now - touchedAt < this.chunkKeepAliveNanos) continue;
+
+            CachedChunkKey key = entry.getKey();
+            if (!this.retainedChunks.remove(key, touchedAt)) continue;
+            World world = resolveWorld(key.worldKey());
+            if (world == null) continue;
+            scheduleChunkUnload(world, key.chunkX(), key.chunkZ());
+        }
     }
 
     private void completeRequestError(World world, SharedMemoryBridge.ChunkRequest request, Throwable throwable) {
@@ -419,6 +480,8 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
         this.lastExtractionStageNanosSnapshot = 0L;
         this.lastResponseStageNanosSnapshot = 0L;
         this.lastTimedCompletedSnapshot = 0L;
+        this.lastChunkRetentionSweepNanos = 0L;
+        this.retainedChunks.clear();
     }
 
     private void onRequestClaimed(SharedMemoryBridge.ChunkRequest request) {
@@ -539,6 +602,7 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
         return new ChunkPayload(
             heightmaps,
             chunkBytes,
+            collectSnapshotSections(levelChunk),
             light.skyLightMask(),
             light.blockLightMask(),
             light.emptySkyLightMask(),
@@ -546,6 +610,23 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
             light.skyLight(),
             light.blockLight()
         );
+    }
+
+    private List<SnapshotSectionPayload> collectSnapshotSections(LevelChunk levelChunk) {
+        LevelChunkSection[] sections = levelChunk.getSections();
+        List<SnapshotSectionPayload> out = new ArrayList<>(sections.length);
+        Strategy<BlockState> strategy = Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY);
+        for (LevelChunkSection section : sections) {
+            PalettedContainerRO.PackedData<BlockState> packed = section.getStates().pack(strategy);
+            List<BlockState> paletteEntries = packed.paletteEntries();
+            int[] palette = new int[paletteEntries.size()];
+            for (int i = 0; i < paletteEntries.size(); i++) {
+                palette[i] = Block.getId(paletteEntries.get(i));
+            }
+            long[] storage = packed.storage().orElseGet(LongStream::empty).toArray();
+            out.add(new SnapshotSectionPayload(packed.bitsPerEntry(), palette, storage));
+        }
+        return out;
     }
 
     private LightPayload collectLightPayload(ServerLevel level, int chunkX, int chunkZ) {
@@ -652,12 +733,20 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
     private record ChunkPayload(
         List<HeightmapPayload> heightmaps,
         byte[] chunkData,
+        List<SnapshotSectionPayload> snapshotSections,
         long[] skyLightMask,
         long[] blockLightMask,
         long[] emptySkyLightMask,
         long[] emptyBlockLightMask,
         List<byte[]> skyLight,
         List<byte[]> blockLight
+    ) {
+    }
+
+    private record SnapshotSectionPayload(
+        int bitsPerEntry,
+        int[] palette,
+        long[] storage
     ) {
     }
 
@@ -668,6 +757,13 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
         long[] emptyBlockLightMask,
         List<byte[]> skyLight,
         List<byte[]> blockLight
+    ) {
+    }
+
+    private record CachedChunkKey(
+        String worldKey,
+        int chunkX,
+        int chunkZ
     ) {
     }
 
@@ -689,6 +785,7 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
         private static final int REQUEST_STATE_EMPTY = 0;
         private static final int REQUEST_STATE_READY = 1;
         private static final int REQUEST_STATE_PROCESSING = 2;
+        private static final int REQUEST_STATE_CANCELLED = 3;
 
         private static final int RESPONSE_STATE_OFFSET = 4;
         private static final int RESPONSE_ID_OFFSET = 8;
@@ -796,6 +893,9 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
         void completeSuccess(ChunkRequest request, ChunkPayload payload) {
             Slot slot = this.slots.get(request.slotIndex());
             synchronized (slot.lock) {
+                if (!isRequestActive(slot, request)) {
+                    return;
+                }
                 byte[] responseBytes;
                 try {
                     responseBytes = encodePayload(payload);
@@ -808,6 +908,10 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
                     completeError(request, "Chunk payload too large: " + responseBytes.length);
                     return;
                 }
+                // Drop right before writing response if request got cancelled while payload was being encoded.
+                if (!isRequestActive(slot, request)) {
+                    return;
+                }
 
                 writeResponse(slot, RESPONSE_STATE_SUCCESS, request.requestId(), responseBytes);
             }
@@ -816,11 +920,25 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
         void completeError(ChunkRequest request, String message) {
             Slot slot = this.slots.get(request.slotIndex());
             synchronized (slot.lock) {
+                if (!isRequestActive(slot, request)) {
+                    return;
+                }
                 byte[] payload = message.getBytes(StandardCharsets.UTF_8);
                 if (payload.length > (RESPONSE_FILE_SIZE - RESPONSE_PAYLOAD_OFFSET)) {
                     payload = "bridge_error".getBytes(StandardCharsets.UTF_8);
                 }
+                // Drop right before writing response if request is no longer active.
+                if (!isRequestActive(slot, request)) {
+                    return;
+                }
                 writeResponse(slot, RESPONSE_STATE_ERROR, request.requestId(), payload);
+            }
+        }
+
+        boolean isRequestActive(ChunkRequest request) {
+            Slot slot = this.slots.get(request.slotIndex());
+            synchronized (slot.lock) {
+                return isRequestActive(slot, request);
             }
         }
 
@@ -868,6 +986,18 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
 
             data.writeInt(payload.chunkData().length);
             data.write(payload.chunkData());
+            data.writeInt(payload.snapshotSections().size());
+            for (SnapshotSectionPayload section : payload.snapshotSections()) {
+                data.writeInt(section.bitsPerEntry());
+                data.writeInt(section.palette().length);
+                for (int stateId : section.palette()) {
+                    data.writeInt(stateId);
+                }
+                data.writeInt(section.storage().length);
+                for (long value : section.storage()) {
+                    data.writeLong(value);
+                }
+            }
             writeLongArray(data, payload.skyLightMask());
             writeLongArray(data, payload.blockLightMask());
             writeLongArray(data, payload.emptySkyLightMask());
@@ -899,6 +1029,11 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
             slot.responseBuffer.putInt(RESPONSE_PAYLOAD_LEN_OFFSET, payload.length);
             writeBytes(slot.responseBuffer, RESPONSE_PAYLOAD_OFFSET, payload);
             slot.responseBuffer.putInt(RESPONSE_STATE_OFFSET, state);
+        }
+
+        private static boolean isRequestActive(Slot slot, ChunkRequest request) {
+            return slot.requestBuffer.getInt(REQUEST_STATE_OFFSET) == REQUEST_STATE_PROCESSING
+                && slot.requestBuffer.getLong(REQUEST_ID_OFFSET) == request.requestId();
         }
 
         private static void readBytes(MappedByteBuffer buffer, int offset, byte[] destination) {

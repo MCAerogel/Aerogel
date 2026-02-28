@@ -1,6 +1,7 @@
 package org.macaroon3145.world.generators
 
 import org.macaroon3145.world.ChunkGenerationContext
+import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.GeneratedChunk
 import org.macaroon3145.world.HeightmapData
 import org.macaroon3145.world.BlockStateLookupWorldGenerator
@@ -19,9 +20,12 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicIntegerArray
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.min
 
@@ -34,6 +38,14 @@ object FoliaSharedMemoryWorldGenerator : WorldGenerator, BlockStateLookupWorldGe
 
     override fun blockStateAt(worldKey: String, x: Int, y: Int, z: Int): Int {
         return client.blockStateAt(worldKey, x, y, z)
+    }
+
+    override fun blockStateAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? {
+        return client.blockStateAtIfCached(worldKey, x, y, z)
+    }
+
+    fun retainLoadedChunks(worldKey: String, chunks: Set<ChunkPos>) {
+        client.retainLoadedChunks(worldKey, chunks)
     }
 }
 
@@ -54,6 +66,8 @@ private object FoliaSharedProtocol {
 
     const val REQUEST_STATE_EMPTY = 0
     const val REQUEST_STATE_READY = 1
+    const val REQUEST_STATE_PROCESSING = 2
+    const val REQUEST_STATE_CANCELLED = 3
 
     const val RESPONSE_STATE_OFFSET = 4
     const val RESPONSE_ID_OFFSET = 8
@@ -74,6 +88,7 @@ private class FoliaSharedMemoryChunkClient {
         private const val BIOME_SECTION_SIZE = 4 * 4 * 4
         private const val BLOCK_INDIRECT_PALETTE_MAX_BITS = 8
         private const val BIOME_INDIRECT_PALETTE_MAX_BITS = 3
+        private const val MAX_PREFETCHES_PER_RETAIN_UPDATE = 16
     }
 
     private val logger = LoggerFactory.getLogger(FoliaSharedMemoryChunkClient::class.java)
@@ -85,9 +100,9 @@ private class FoliaSharedMemoryChunkClient {
     private val threadSlot = ThreadLocal<Int>()
     private val slots = ArrayList<IpcSlot>()
     @Volatile private var slotBusy: AtomicIntegerArray? = null
-    private val decodedChunks = ConcurrentHashMap<ChunkCacheKey, ChunkStateSnapshot>()
+    private val chunkCache = ConcurrentHashMap<ChunkCacheKey, ChunkCacheEntry>()
     private val decodedChunkOrder = ConcurrentLinkedDeque<ChunkCacheKey>()
-    private val decodeTasks = ConcurrentHashMap<ChunkCacheKey, CompletableFuture<ChunkStateSnapshot>>()
+    private val retainedChunkKeys = ConcurrentHashMap.newKeySet<ChunkCacheKey>()
     private val maxCachedChunks: Int = configuredBlockStateCacheSize()
     private val decodeThreadId = AtomicInteger(1)
     private val snapshotDecodeExecutor = Executors.newFixedThreadPool(configuredSnapshotDecodeWorkers()) { runnable ->
@@ -96,15 +111,29 @@ private class FoliaSharedMemoryChunkClient {
             priority = Thread.NORM_PRIORITY
         }
     }
+    private val prefetchThreadId = AtomicInteger(1)
+    private val snapshotPrefetchExecutor: ExecutorService = Executors.newFixedThreadPool(configuredSnapshotPrefetchWorkers()) { runnable ->
+        Thread(runnable, "aerogel-folia-snapshot-prefetch-${prefetchThreadId.getAndIncrement()}").apply {
+            isDaemon = true
+            priority = Thread.NORM_PRIORITY
+        }
+    }
 
     @Volatile
     private var initialized = false
+    private val recoveryInProgress = AtomicBoolean(false)
 
     private data class ChunkCacheKey(
         val worldKey: String,
         val chunkX: Int,
         val chunkZ: Int
     )
+
+    private class ChunkCacheEntry {
+        val snapshot = AtomicReference<ChunkStateSnapshot?>()
+        val decodeTask = AtomicReference<CompletableFuture<ChunkStateSnapshot>?>()
+        val loadTask = AtomicReference<CompletableFuture<ChunkStateSnapshot?>?>()
+    }
 
     private data class ChunkStateSnapshot(
         val minY: Int,
@@ -162,60 +191,54 @@ private class FoliaSharedMemoryChunkClient {
         ensureMapped()
         val slotIndex = acquireSlotIndex()
         val slot = slots[slotIndex]
-        var cleared = false
+        var requestStarted = false
         try {
+            if (context.isCancelled()) {
+                throw java.util.concurrent.CancellationException("Folia chunk request cancelled before submit")
+            }
             val requestId = nextRequestId.getAndIncrement()
             writeRequest(slot, requestId, context)
+            requestStarted = true
 
             val timeoutMillis = configuredTimeoutMillis()
             val timeoutNanos = if (timeoutMillis <= 0L) Long.MAX_VALUE else timeoutMillis * 1_000_000L
             val startNanos = System.nanoTime()
-            var nextWarnAt = startNanos + 15_000_000_000L
 
             while (true) {
+                if (context.isCancelled()) {
+                    cancelRequest(slot)
+                    throw java.util.concurrent.CancellationException(
+                        "Folia chunk request cancelled for ${context.worldKey} ${context.chunkPos.x},${context.chunkPos.z}"
+                    )
+                }
                 val state = slot.responseBuffer.getInt(FoliaSharedProtocol.RESPONSE_STATE_OFFSET)
                 val responseId = slot.responseBuffer.getLong(FoliaSharedProtocol.RESPONSE_ID_OFFSET)
                 if (responseId == requestId) {
                     when (state) {
                         FoliaSharedProtocol.RESPONSE_STATE_SUCCESS -> {
-                            val decoded = decodeSuccessPayload(slot)
-                            scheduleSnapshotDecode(context, decoded.chunkData)
+                            val decoded = decodeSuccessPayload(slot, context.worldKey)
                             clearRequestResponseState(slot)
-                            cleared = true
+                            cacheDecodedChunk(context, decoded.snapshot)
                             return decoded.chunk
                         }
                         FoliaSharedProtocol.RESPONSE_STATE_ERROR -> {
                             val message = decodeErrorPayload(slot)
                             clearRequestResponseState(slot)
-                            cleared = true
                             throw IllegalStateException("Folia chunk bridge error: $message")
                         }
                     }
                 }
                 val now = System.nanoTime()
-                if (now >= nextWarnAt) {
-                    logger.warn(
-                        "Folia chunk request waiting: slot={} requestId={} world={} chunk=({}, {}) elapsedMs={}",
-                        slot.index,
-                        requestId,
-                        context.worldKey,
-                        context.chunkPos.x,
-                        context.chunkPos.z,
-                        (now - startNanos) / 1_000_000L
+                if (timeoutNanos != Long.MAX_VALUE && now - startNanos >= timeoutNanos) {
+                    cancelRequest(slot)
+                    throw ChunkBridgeTimeoutException(
+                        "Folia chunk bridge timeout for ${context.worldKey} ${context.chunkPos.x},${context.chunkPos.z}"
                     )
-                    nextWarnAt = now + 15_000_000_000L
                 }
-                if (timeoutNanos != Long.MAX_VALUE && now - startNanos >= timeoutNanos) break
                 LockSupport.parkNanos(200_000L)
             }
-
-            clearRequestResponseState(slot)
-            cleared = true
-            throw IllegalStateException(
-                "Folia chunk bridge timeout for ${context.worldKey} ${context.chunkPos.x},${context.chunkPos.z}"
-            )
         } finally {
-            if (!cleared) {
+            if (!requestStarted) {
                 runCatching { clearRequestResponseState(slot) }
             }
             releaseSlotIndex(slotIndex)
@@ -224,22 +247,116 @@ private class FoliaSharedMemoryChunkClient {
 
     fun blockStateAt(worldKey: String, x: Int, y: Int, z: Int): Int {
         val chunkKey = ChunkCacheKey(worldKey, x shr 4, z shr 4)
-        var snapshot = decodedChunks[chunkKey]
+        val entry = chunkCache[chunkKey]
+        var snapshot = entry?.snapshot?.get()
         if (snapshot == null) {
-            val task = decodeTasks[chunkKey]
+            val task = entry?.decodeTask?.get()
             if (task != null) {
                 snapshot = runCatching { task.join() }.getOrNull()
             }
         }
+        if (snapshot == null) {
+            snapshot = loadSnapshotOnDemand(chunkKey)
+        }
         snapshot ?: return AIR_STATE_ID
         return snapshot.blockStateAt(x, y, z)
+    }
+
+    fun blockStateAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? {
+        val chunkKey = ChunkCacheKey(worldKey, x shr 4, z shr 4)
+        val entry = chunkCache[chunkKey] ?: return null
+        val snapshot = entry.snapshot.get() ?: return null
+        return snapshot.blockStateAt(x, y, z)
+    }
+
+    fun retainLoadedChunks(worldKey: String, chunks: Set<ChunkPos>) {
+        retainedChunkKeys.removeIf { it.worldKey == worldKey }
+        for (chunk in chunks) {
+            retainedChunkKeys.add(ChunkCacheKey(worldKey, chunk.x, chunk.z))
+        }
+        trimDecodedChunkCache()
+    }
+
+    private fun loadSnapshotOnDemand(chunkKey: ChunkCacheKey): ChunkStateSnapshot? {
+        val entry = chunkCache.computeIfAbsent(chunkKey) { ChunkCacheEntry() }
+        val existing = entry.loadTask.get()
+        if (existing != null) {
+            return runCatching { existing.join() }.getOrNull()
+        }
+
+        val created = CompletableFuture.supplyAsync({
+            runCatching {
+                requestAndAwaitSnapshot(chunkKey)
+            }.onFailure { throwable ->
+                logger.warn(
+                    "Failed to reload block-state snapshot on demand for {} {},{}",
+                    chunkKey.worldKey,
+                    chunkKey.chunkX,
+                    chunkKey.chunkZ,
+                    throwable
+                )
+            }.getOrNull()
+        }, snapshotPrefetchExecutor)
+        val task = if (entry.loadTask.compareAndSet(null, created)) created else entry.loadTask.get() ?: created
+        if (task === created) {
+            task.whenComplete { _, _ ->
+                entry.loadTask.compareAndSet(task, null)
+            }
+        }
+        return runCatching { task.join() }.getOrNull()
+    }
+
+    private fun requestAndAwaitSnapshot(chunkKey: ChunkCacheKey, prefetchNeighbors: Boolean = true): ChunkStateSnapshot? {
+        val entry = chunkCache.computeIfAbsent(chunkKey) { ChunkCacheEntry() }
+        val cached = entry.snapshot.get()
+        if (cached != null) return cached
+        val pendingDecode = entry.decodeTask.get()
+        if (pendingDecode != null) return pendingDecode.join()
+
+        val context = ChunkGenerationContext(
+            worldKey = chunkKey.worldKey,
+            seed = 0L,
+            chunkPos = ChunkPos(chunkKey.chunkX, chunkKey.chunkZ)
+        )
+        requestChunk(context)
+        val snapshot = entry.snapshot.get() ?: entry.decodeTask.get()?.join()
+        if (snapshot != null && prefetchNeighbors) {
+            scheduleNeighborPrefetch(chunkKey)
+        }
+        return snapshot
+    }
+
+    private fun scheduleNeighborPrefetch(center: ChunkCacheKey) {
+        for (dz in -1..1) {
+            for (dx in -1..1) {
+                if (dx == 0 && dz == 0) continue
+                val neighbor = ChunkCacheKey(center.worldKey, center.chunkX + dx, center.chunkZ + dz)
+                prefetchSnapshot(neighbor)
+            }
+        }
+    }
+
+    private fun prefetchSnapshot(chunkKey: ChunkCacheKey) {
+        val entry = chunkCache.computeIfAbsent(chunkKey) { ChunkCacheEntry() }
+        if (entry.snapshot.get() != null) return
+        if (entry.decodeTask.get() != null) return
+        if (entry.loadTask.get() != null) return
+        val created = CompletableFuture.supplyAsync({
+            runCatching { requestAndAwaitSnapshot(chunkKey, prefetchNeighbors = false) }.getOrNull()
+        }, snapshotPrefetchExecutor)
+        val task = if (entry.loadTask.compareAndSet(null, created)) created else entry.loadTask.get() ?: created
+        if (task === created) {
+            task.whenComplete { _, _ ->
+                entry.loadTask.compareAndSet(task, null)
+            }
+        }
     }
 
     private fun configuredTimeoutMillis(): Long {
         return System.getProperty("aerogel.chunk.ipc.timeout-ms")
             ?.toLongOrNull()
             ?.coerceAtLeast(0L)
-            ?: 0L
+            ?: 30_000L
     }
 
     private fun configuredBlockStateCacheSize(): Int {
@@ -254,6 +371,13 @@ private class FoliaSharedMemoryChunkClient {
             ?.toIntOrNull()
             ?.coerceAtLeast(1)
             ?: 4
+    }
+
+    private fun configuredSnapshotPrefetchWorkers(): Int {
+        return System.getProperty("aerogel.chunk.blockstate-prefetch-workers")
+            ?.toIntOrNull()
+            ?.coerceIn(1, 4)
+            ?: 2
     }
 
     private fun ensureMapped() {
@@ -323,6 +447,20 @@ private class FoliaSharedMemoryChunkClient {
 
             slotBusy = AtomicIntegerArray(slots.size)
             initialized = true
+        }
+    }
+
+    private fun resetMappings() {
+        synchronized(this) {
+            if (!initialized && slots.isEmpty()) return
+            for (slot in slots) {
+                runCatching { slot.requestChannel.close() }
+                runCatching { slot.responseChannel.close() }
+            }
+            slots.clear()
+            slotBusy = null
+            threadSlot.remove()
+            initialized = false
         }
     }
 
@@ -450,6 +588,7 @@ private class FoliaSharedMemoryChunkClient {
     }
 
     private fun writeRequest(slot: IpcSlot, requestId: Long, context: ChunkGenerationContext) {
+        clearRequestResponseState(slot)
         val worldBytes = context.worldKey.toByteArray(StandardCharsets.UTF_8)
         val worldSize = min(worldBytes.size, FoliaSharedProtocol.REQUEST_WORLD_MAX_BYTES)
 
@@ -466,12 +605,19 @@ private class FoliaSharedMemoryChunkClient {
         slot.requestBuffer.putInt(FoliaSharedProtocol.REQUEST_STATE_OFFSET, FoliaSharedProtocol.REQUEST_STATE_READY)
     }
 
+    private fun cancelRequest(slot: IpcSlot) {
+        slot.requestBuffer.putInt(FoliaSharedProtocol.REQUEST_STATE_OFFSET, FoliaSharedProtocol.REQUEST_STATE_CANCELLED)
+        slot.responseBuffer.putInt(FoliaSharedProtocol.RESPONSE_STATE_OFFSET, FoliaSharedProtocol.RESPONSE_STATE_EMPTY)
+        slot.responseBuffer.putLong(FoliaSharedProtocol.RESPONSE_ID_OFFSET, 0L)
+        slot.responseBuffer.putInt(FoliaSharedProtocol.RESPONSE_PAYLOAD_LEN_OFFSET, 0)
+    }
+
     private data class DecodedChunkPayload(
         val chunk: GeneratedChunk,
-        val chunkData: ByteArray
+        val snapshot: ChunkStateSnapshot
     )
 
-    private fun decodeSuccessPayload(slot: IpcSlot): DecodedChunkPayload {
+    private fun decodeSuccessPayload(slot: IpcSlot, worldKey: String): DecodedChunkPayload {
         val payloadLength = slot.responseBuffer.getInt(FoliaSharedProtocol.RESPONSE_PAYLOAD_LEN_OFFSET)
         require(payloadLength in 0..(FoliaSharedProtocol.RESPONSE_FILE_SIZE - FoliaSharedProtocol.RESPONSE_PAYLOAD_OFFSET)) {
             "Invalid Folia chunk payload length: $payloadLength"
@@ -495,6 +641,7 @@ private class FoliaSharedMemoryChunkClient {
             require(chunkDataLength >= 0) { "Invalid chunk data length: $chunkDataLength" }
             val chunkData = ByteArray(chunkDataLength)
             input.readFully(chunkData)
+            val snapshot = decodeSnapshotPayload(input, minYForWorld(worldKey))
 
             val skyLightMask = readLongArray(input)
             val blockLightMask = readLongArray(input)
@@ -516,14 +663,39 @@ private class FoliaSharedMemoryChunkClient {
 
             return DecodedChunkPayload(
                 chunk = generated,
-                chunkData = chunkData
+                snapshot = snapshot
             )
         }
     }
 
+    private fun decodeSnapshotPayload(input: DataInputStream, minY: Int): ChunkStateSnapshot {
+        val sectionCount = input.readInt()
+        require(sectionCount >= 0) { "Invalid snapshot section count: $sectionCount" }
+        val sections = Array(sectionCount) {
+            val bitsPerEntry = input.readInt()
+            val paletteSize = input.readInt()
+            require(paletteSize >= 0) { "Invalid snapshot palette size: $paletteSize" }
+            val palette = IntArray(paletteSize) { input.readInt() }
+            val storageSize = input.readInt()
+            require(storageSize >= 0) { "Invalid snapshot storage size: $storageSize" }
+            val storage = LongArray(storageSize) { input.readLong() }
+            if (storage.isEmpty() && palette.size == 1) {
+                SingleSectionState(palette[0])
+            } else {
+                PackedSectionState(
+                    bitsPerEntry = bitsPerEntry.coerceAtLeast(1),
+                    palette = palette,
+                    data = storage
+                )
+            }
+        }
+        return ChunkStateSnapshot(minY = minY, sections = sections)
+    }
+
     private fun scheduleSnapshotDecode(context: ChunkGenerationContext, chunkData: ByteArray) {
         val key = ChunkCacheKey(context.worldKey, context.chunkPos.x, context.chunkPos.z)
-        if (decodedChunks.containsKey(key)) return
+        val entry = chunkCache.computeIfAbsent(key) { ChunkCacheEntry() }
+        if (entry.snapshot.get() != null) return
 
         val task = CompletableFuture.supplyAsync({
             runCatching { decodeChunkStateSnapshot(context.worldKey, chunkData) }
@@ -532,28 +704,72 @@ private class FoliaSharedMemoryChunkClient {
                     ChunkStateSnapshot(minY = minYForWorld(context.worldKey), sections = emptyArray())
                 }
         }, snapshotDecodeExecutor)
-        val existing = decodeTasks.putIfAbsent(key, task)
-        if (existing != null) return
+        if (!entry.decodeTask.compareAndSet(null, task)) return
 
         task.whenComplete { snapshot, _ ->
             if (snapshot != null) {
                 cacheDecodedChunk(context, snapshot)
             }
-            decodeTasks.remove(key, task)
+            entry.decodeTask.compareAndSet(task, null)
         }
+    }
+
+    private fun cacheSnapshotForContext(context: ChunkGenerationContext, chunkData: ByteArray) {
+        val key = ChunkCacheKey(context.worldKey, context.chunkPos.x, context.chunkPos.z)
+        val entry = chunkCache.computeIfAbsent(key) { ChunkCacheEntry() }
+        if (entry.snapshot.get() != null) return
+        if (retainedChunkKeys.contains(key)) {
+            val snapshot = runCatching { decodeChunkStateSnapshot(context.worldKey, chunkData) }
+                .getOrElse { throwable ->
+                    logger.warn("Failed to decode retained chunk block states inline; falling back to async decode", throwable)
+                    scheduleSnapshotDecode(context, chunkData)
+                    return
+                }
+            cacheDecodedChunk(context, snapshot)
+            return
+        }
+        scheduleSnapshotDecode(context, chunkData)
     }
 
     private fun cacheDecodedChunk(context: ChunkGenerationContext, snapshot: ChunkStateSnapshot) {
         val key = ChunkCacheKey(context.worldKey, context.chunkPos.x, context.chunkPos.z)
-        val previous = decodedChunks.put(key, snapshot)
+        val entry = chunkCache.computeIfAbsent(key) { ChunkCacheEntry() }
+        val previous = entry.snapshot.getAndSet(snapshot)
         if (previous == null) {
             decodedChunkOrder.addLast(key)
         }
+        trimDecodedChunkCache()
+    }
 
-        while (decodedChunks.size > maxCachedChunks) {
+    private fun trimDecodedChunkCache() {
+        var attempts = 0
+        while (cachedSnapshotCount() > maxCachedChunks) {
             val oldest = decodedChunkOrder.pollFirst() ?: break
-            decodedChunks.remove(oldest)
+            if (retainedChunkKeys.contains(oldest)) {
+                decodedChunkOrder.addLast(oldest)
+                attempts++
+                if (attempts >= decodedChunkOrder.size.coerceAtLeast(1)) {
+                    break
+                }
+                continue
+            }
+            attempts = 0
+            val entry = chunkCache[oldest] ?: continue
+            entry.snapshot.set(null)
+            if (entry.decodeTask.get() == null && entry.loadTask.get() == null && !retainedChunkKeys.contains(oldest)) {
+                chunkCache.remove(oldest, entry)
+            }
         }
+    }
+
+    private fun cachedSnapshotCount(): Int {
+        var count = 0
+        for (entry in chunkCache.values) {
+            if (entry.snapshot.get() != null) {
+                count++
+            }
+        }
+        return count
     }
 
     private fun decodeChunkStateSnapshot(worldKey: String, chunkData: ByteArray): ChunkStateSnapshot {
@@ -728,4 +944,6 @@ private class FoliaSharedMemoryChunkClient {
         duplicate.position(offset)
         duplicate.get(destination)
     }
+
+    private class ChunkBridgeTimeoutException(message: String) : IllegalStateException(message)
 }

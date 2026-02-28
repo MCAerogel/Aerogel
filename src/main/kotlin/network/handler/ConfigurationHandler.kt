@@ -32,6 +32,7 @@ class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChann
         val join = PlayerSessionManager.prepareJoin(
             ctx = ctx,
             profile = profile,
+            locale = clientSettings?.locale ?: "en_us",
             worldKey = world.key,
             skinPartsMask = skinPartsMask,
             requestedViewDistance = viewDistance,
@@ -49,12 +50,22 @@ class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChann
         ctx.writeAndFlush(PlayPackets.updateViewDistancePacket(session.chunkRadius))
         ctx.writeAndFlush(PlayPackets.updateViewPositionPacket(session.centerChunkX, session.centerChunkZ))
         ctx.writeAndFlush(PlayPackets.spawnPositionPacket(world.key, session.x, session.y, session.z))
-        ctx.writeAndFlush(PlayPackets.playerPositionPacket(session.x, session.y, session.z))
-        ctx.writeAndFlush(PlayPackets.timeUpdatePacket(worldAge = 6000L, timeOfDay = 6000L, tickDayTime = false))
+        ctx.writeAndFlush(
+            PlayPackets.playerPositionPacket(
+                teleportId = 1,
+                x = session.x,
+                y = session.y,
+                z = session.z
+            )
+        )
+        val (worldAge, timeOfDay) = PlayerSessionManager.worldTimeSnapshot(world.key)
+        ctx.writeAndFlush(PlayPackets.timeUpdatePacket(worldAge = worldAge, timeOfDay = timeOfDay, tickDayTime = true))
         val playerTickRate = (20.0 * ServerConfig.playerTimeScale).toFloat()
         ctx.writeAndFlush(PlayPackets.tickingStatePacket(tickRate = playerTickRate, isFrozen = false))
         ctx.writeAndFlush(PlayPackets.tickingStepPacket(tickSteps = 0))
         ctx.writeAndFlush(PlayPackets.gameStateGameModePacket(session.gameMode))
+        ctx.writeAndFlush(PlayPackets.gameStateImmediateRespawnPacket(enabled = false))
+        ctx.writeAndFlush(PlayPackets.setHealthPacket(session.health, session.food, session.saturation))
         ctx.writeAndFlush(PlayPackets.gameStateStartLoadingPacket())
         PlayerSessionManager.finishJoin(join)
         PlayerSessionManager.triggerChunkStream(session.channelId)

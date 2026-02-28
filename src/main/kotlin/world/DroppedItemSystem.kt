@@ -1,6 +1,10 @@
 package org.macaroon3145.world
 
 import org.macaroon3145.network.codec.BlockStateRegistry
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -101,6 +105,7 @@ class DroppedItemSystem(
     private val laneCount = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
     private val workers = Executors.newVirtualThreadPerTaskExecutor()
     private val laneChunks = Array(laneCount) { ConcurrentHashMap<ChunkPos, ChunkState>() }
+    private val dirtyChunksByLane = Array(laneCount) { ConcurrentHashMap.newKeySet<ChunkPos>() }
     private val snapshots = ConcurrentHashMap<Int, DroppedItemSnapshot>()
     private val chunkIndex = ConcurrentHashMap<ChunkPos, MutableSet<Int>>()
     private val collidableStateCache = ConcurrentHashMap<Int, Boolean>()
@@ -145,10 +150,12 @@ class DroppedItemSystem(
         val initial = entity.snapshot()
         if (snapshots.putIfAbsent(entityId, initial) != null) return false
         addToChunkIndex(initial.chunkPos, entityId)
-        laneChunks[laneFor(chunkX, chunkZ)]
+        val lane = laneFor(chunkX, chunkZ)
+        laneChunks[lane]
             .computeIfAbsent(initial.chunkPos) { ChunkState() }
             .inbound
             .add(entity)
+        dirtyChunksByLane[lane].add(initial.chunkPos)
         return true
     }
 
@@ -166,6 +173,7 @@ class DroppedItemSystem(
     fun remove(entityId: Int): DroppedItemSnapshot? {
         val removed = snapshots.remove(entityId) ?: return null
         removeFromChunkIndex(removed.chunkPos, entityId)
+        dirtyChunksByLane[laneFor(removed.chunkPos.x, removed.chunkPos.z)].add(removed.chunkPos)
         return removed
     }
 
@@ -202,24 +210,36 @@ class DroppedItemSystem(
         return if (i == out.size) out else out.copyOf(i)
     }
 
-    fun tick(deltaSeconds: Double, activeSimulationChunks: Set<ChunkPos>? = null): DroppedItemTickEvents {
-        return tickInternal(deltaSeconds, activeSimulationChunks)
+    fun tick(
+        deltaSeconds: Double,
+        activeSimulationChunks: Set<ChunkPos>? = null,
+        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
+    ): DroppedItemTickEvents {
+        return tickInternal(deltaSeconds, activeSimulationChunks, chunkTimeRecorder)
     }
 
-    private fun tickInternal(deltaSeconds: Double, activeSimulationChunks: Set<ChunkPos>?): DroppedItemTickEvents {
+    private fun tickInternal(
+        deltaSeconds: Double,
+        activeSimulationChunks: Set<ChunkPos>?,
+        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)?
+    ): DroppedItemTickEvents {
         if (snapshots.isEmpty()) return DroppedItemTickEvents(emptyList(), emptyList(), emptyList())
         if (deltaSeconds <= 0.0) return DroppedItemTickEvents(emptyList(), emptyList(), emptyList())
         collectPendingUnstuckTargets()
         val tickScale = deltaSeconds * 20.0
 
         if (laneCount == 1) {
-            val lane = processLane(0, deltaSeconds, tickScale, activeSimulationChunks)
+            val lane = processLane(0, deltaSeconds, tickScale, activeSimulationChunks, chunkTimeRecorder)
             return DroppedItemTickEvents(lane.spawned, lane.updated, lane.removed)
         }
 
         val futures = ArrayList<Future<LaneTickResult>>(laneCount)
         for (lane in 0 until laneCount) {
-            futures.add(workers.submit<LaneTickResult> { processLane(lane, deltaSeconds, tickScale, activeSimulationChunks) })
+            futures.add(
+                workers.submit<LaneTickResult> {
+                    processLane(lane, deltaSeconds, tickScale, activeSimulationChunks, chunkTimeRecorder)
+                }
+            )
         }
 
         val spawned = ArrayList<DroppedItemSnapshot>()
@@ -242,17 +262,22 @@ class DroppedItemSystem(
         lane: Int,
         deltaSeconds: Double,
         tickScale: Double,
-        activeSimulationChunks: Set<ChunkPos>?
+        activeSimulationChunks: Set<ChunkPos>?,
+        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)?
     ): LaneTickResult {
         val laneMap = laneChunks[lane]
         if (laneMap.isEmpty()) return LaneTickResult()
 
         val result = LaneTickResult()
         var laneUnstuckTargets = drainLaneUnstuckTargets(lane)
-        for ((chunkPos, chunkState) in laneMap) {
-            if (activeSimulationChunks != null && !activeSimulationChunks.contains(chunkPos)) {
-                continue
-            }
+        val dirtyChunks = dirtyChunksByLane[lane]
+        val chunkPositions = collectLaneChunkPositions(lane, laneMap, dirtyChunks, activeSimulationChunks)
+        if (chunkPositions.isEmpty()) return result
+
+        for (chunkPos in chunkPositions) {
+            val startedAtNanos = System.nanoTime()
+            val chunkState = laneMap[chunkPos] ?: continue
+            val shouldSimulate = activeSimulationChunks == null || activeSimulationChunks.contains(chunkPos)
             val spawnedIds = HashSet<Int>()
             while (true) {
                 val incoming = chunkState.inbound.poll() ?: break
@@ -260,7 +285,11 @@ class DroppedItemSystem(
                 chunkState.entities[incoming.entityId] = incoming
                 spawnedIds.add(incoming.entityId)
             }
-            if (chunkState.entities.isEmpty()) continue
+            if (chunkState.entities.isEmpty()) {
+                laneMap.remove(chunkPos, chunkState)
+                dirtyChunks.remove(chunkPos)
+                continue
+            }
 
             for ((entityId, entity) in chunkState.entities) {
                 if (!snapshots.containsKey(entityId)) {
@@ -281,6 +310,13 @@ class DroppedItemSystem(
                     if (laneUnstuckTargets.isEmpty()) {
                         laneUnstuckTargets = null
                     }
+                }
+
+                if (!shouldSimulate) {
+                    if (spawnedIds.remove(entityId)) {
+                        snapshots[entityId] = entity.snapshot()
+                    }
+                    continue
                 }
 
                 if (entity.sleeping) {
@@ -332,10 +368,12 @@ class DroppedItemSystem(
                     entity.chunkX = newChunkX
                     entity.chunkZ = newChunkZ
                     moveChunkIndex(entityId, oldChunk, newChunk)
-                    laneChunks[laneFor(newChunkX, newChunkZ)]
+                    val targetLane = laneFor(newChunkX, newChunkZ)
+                    laneChunks[targetLane]
                         .computeIfAbsent(newChunk) { ChunkState() }
                         .inbound
                         .add(entity)
+                    dirtyChunksByLane[targetLane].add(newChunk)
                 }
 
                 if (spawnedIds.remove(entityId)) {
@@ -353,9 +391,34 @@ class DroppedItemSystem(
 
             if (chunkState.entities.isEmpty() && chunkState.inbound.isEmpty()) {
                 laneMap.remove(chunkPos, chunkState)
+                dirtyChunks.remove(chunkPos)
+            } else if (!shouldSimulate) {
+                dirtyChunks.remove(chunkPos)
             }
+            chunkTimeRecorder?.invoke(chunkPos, System.nanoTime() - startedAtNanos)
         }
         return result
+    }
+
+    private fun collectLaneChunkPositions(
+        lane: Int,
+        laneMap: ConcurrentHashMap<ChunkPos, ChunkState>,
+        dirtyChunks: MutableSet<ChunkPos>,
+        activeSimulationChunks: Set<ChunkPos>?
+    ): LinkedHashSet<ChunkPos> {
+        val out = LinkedHashSet<ChunkPos>()
+        if (activeSimulationChunks == null) {
+            out.addAll(laneMap.keys)
+            return out
+        }
+        for (chunkPos in activeSimulationChunks) {
+            if (laneFor(chunkPos.x, chunkPos.z) != lane) continue
+            if (laneMap.containsKey(chunkPos)) {
+                out.add(chunkPos)
+            }
+        }
+        out.addAll(dirtyChunks)
+        return out
     }
 
     private fun stepEntity(entity: MutableDroppedItem, deltaSeconds: Double, tickScale: Double) {
@@ -686,50 +749,30 @@ class DroppedItemSystem(
         private const val DEFAULT_PICKUP_DELAY_SECONDS = 2.0
         private const val MAX_AGE_TICKS = 6000.0
         private const val DESPAWN_Y = -128.0
-        private val NON_COLLIDING_BLOCK_KEYS = hashSetOf(
-            "minecraft:air",
-            "minecraft:cave_air",
-            "minecraft:void_air",
-            "minecraft:short_grass",
-            "minecraft:tall_grass",
-            "minecraft:leaf_litter",
-            "minecraft:wildflowers",
-            "minecraft:pink_petals",
-            "minecraft:fern",
-            "minecraft:large_fern",
-            "minecraft:dead_bush",
-            "minecraft:seagrass",
-            "minecraft:tall_seagrass",
-            "minecraft:kelp",
-            "minecraft:kelp_plant",
-            "minecraft:lily_pad",
-            "minecraft:vine",
-            "minecraft:weeping_vines",
-            "minecraft:weeping_vines_plant",
-            "minecraft:twisting_vines",
-            "minecraft:twisting_vines_plant",
-            "minecraft:cave_vines",
-            "minecraft:cave_vines_plant",
-            "minecraft:glow_lichen",
-            "minecraft:sugar_cane",
-            "minecraft:torchflower_crop",
-            "minecraft:pitcher_crop",
-            "minecraft:wheat",
-            "minecraft:carrots",
-            "minecraft:potatoes",
-            "minecraft:beetroots",
-            "minecraft:melon_stem",
-            "minecraft:pumpkin_stem",
-            "minecraft:attached_melon_stem",
-            "minecraft:attached_pumpkin_stem",
-            "minecraft:cocoa",
-            "minecraft:nether_wart",
-            "minecraft:sweet_berry_bush",
-            "minecraft:water",
-            "minecraft:lava",
-            "minecraft:bubble_column",
-            "minecraft:fire",
-            "minecraft:soul_fire"
-        )
+        private val json = Json { ignoreUnknownKeys = true }
+        private val NON_COLLIDING_BLOCK_KEYS = loadBlockTag("dropped_item_non_colliding")
+
+        private fun loadBlockTag(tagName: String): Set<String> {
+            return resolveBlockTag(tagName, HashSet())
+        }
+
+        private fun resolveBlockTag(tagName: String, visited: MutableSet<String>): Set<String> {
+            if (!visited.add(tagName)) return emptySet()
+            val resourcePath = "/data/minecraft/tags/block/$tagName.json"
+            val stream = DroppedItemSystem::class.java.getResourceAsStream(resourcePath) ?: return emptySet()
+            val root = stream.bufferedReader().use {
+                json.parseToJsonElement(it.readText()).jsonObject
+            }
+            val out = LinkedHashSet<String>()
+            for (value in root["values"]?.jsonArray.orEmpty()) {
+                val raw = value.jsonPrimitive.content
+                if (raw.startsWith("#minecraft:")) {
+                    out.addAll(resolveBlockTag(raw.removePrefix("#minecraft:"), visited))
+                } else if (raw.startsWith("minecraft:")) {
+                    out.add(raw)
+                }
+            }
+            return out
+        }
     }
 }

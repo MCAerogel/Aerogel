@@ -15,6 +15,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.security.KeyPairGenerator
 import java.security.SecureRandom
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -39,23 +40,30 @@ class LoginHandler(private val protocolVersion: Int) : SimpleChannelInboundHandl
     private var verifyToken: ByteArray? = null
 
     override fun channelRead0(ctx: ChannelHandlerContext, buf: ByteBuf) {
-        val packetId = NetworkUtils.readVarInt(buf)
-        if (packetId == 0x00) {
-            handleLoginStart(ctx, buf)
-            return
-        }
+        try {
+            val packetId = NetworkUtils.readVarInt(buf)
+            if (packetId == 0x00) {
+                handleLoginStart(ctx, buf)
+                return
+            }
 
-        if (ServerConfig.onlineMode && packetId == 0x01) {
-            handleEncryptionResponse(ctx, buf)
-            return
+            if (ServerConfig.onlineMode && packetId == 0x01) {
+                handleEncryptionResponse(ctx, buf)
+                return
+            }
+        } catch (_: Throwable) {
+            // Malformed login payload from client/proxy: close quietly.
         }
-
         ctx.close()
     }
 
     private fun handleLoginStart(ctx: ChannelHandlerContext, buf: ByteBuf) {
         val username = NetworkUtils.readString(buf)
-        val uuid = NetworkUtils.readUUID(buf)
+        val uuid = if (buf.readableBytes() >= 16) {
+            NetworkUtils.readUUID(buf)
+        } else {
+            UUID.nameUUIDFromBytes("OfflinePlayer:$username".toByteArray(StandardCharsets.UTF_8))
+        }
         if (!ServerConfig.onlineMode) {
             completeLogin(ctx, ConnectionProfile(protocolVersion, username, uuid))
             return
@@ -66,6 +74,11 @@ class LoginHandler(private val protocolVersion: Int) : SimpleChannelInboundHandl
         secureRandom.nextBytes(token)
         verifyToken = token
         ctx.writeAndFlush(createEncryptionRequest(token))
+    }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        // Prevent noisy tail-pipeline warnings on malformed login packets.
+        ctx.close()
     }
 
     private fun handleEncryptionResponse(ctx: ChannelHandlerContext, buf: ByteBuf) {

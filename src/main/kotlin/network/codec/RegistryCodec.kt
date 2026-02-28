@@ -40,4 +40,9 @@ object RegistryCodec {
     fun entryCount(registryId: String): Int? {
         return registries.firstOrNull { it.id == registryId }?.entries?.size
     }
+
+    fun prewarm() {
+        // Ensure registry codec parse happens during startup.
+        registries.size
+    }
 }

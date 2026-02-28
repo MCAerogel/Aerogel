@@ -7,6 +7,7 @@ import org.macaroon3145.world.DroppedItemSnapshot
 import org.macaroon3145.world.World
 import org.slf4j.LoggerFactory
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CancellationException
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -172,7 +173,9 @@ object ChunkStreamingService {
                     if (!generatingChunks.add(coord)) continue
 
                     try {
-                        val generated = world.buildChunk(coord)
+                        val generated = world.buildChunk(coord) {
+                            !completion.isDone && shouldSend()
+                        }
                         pendingPacketTasks.incrementAndGet()
                         packetPool.execute {
                             try {
@@ -207,8 +210,14 @@ object ChunkStreamingService {
                             }
                         }
                     } catch (t: Throwable) {
-                        logger.error("Chunk stream failed for {},{}", coord.x, coord.z, t)
                         generatingChunks.remove(coord)
+                        if (isChunkRequestCancelled(t) || isChunkBridgeTimeout(t)) {
+                            if (!shouldSend() || completion.isDone) {
+                                break
+                            }
+                            continue
+                        }
+                        logger.error("Chunk stream failed for {},{}", coord.x, coord.z, t)
                         failStream(RuntimeException("Chunk stream failed at ${coord.x},${coord.z}", t))
                         break
                     }
@@ -226,6 +235,24 @@ object ChunkStreamingService {
         }
 
         return completion
+    }
+
+    private fun isChunkRequestCancelled(throwable: Throwable): Boolean {
+        var current: Throwable? = throwable
+        while (current != null) {
+            if (current is CancellationException) return true
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun isChunkBridgeTimeout(throwable: Throwable): Boolean {
+        var current: Throwable? = throwable
+        while (current != null) {
+            if (current.javaClass.name.endsWith("ChunkBridgeTimeoutException")) return true
+            current = current.cause
+        }
+        return false
     }
 
     private fun interleaveCoordsForRegionParallelism(coordsInput: List<ChunkPos>): List<ChunkPos> {

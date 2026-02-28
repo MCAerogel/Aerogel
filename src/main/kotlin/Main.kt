@@ -1,6 +1,7 @@
 package org.macaroon3145
 
 import io.netty.bootstrap.ServerBootstrap
+import io.netty.channel.Channel
 import io.netty.channel.ChannelInitializer
 import io.netty.channel.ChannelOption
 import io.netty.channel.EventLoopGroup
@@ -25,11 +26,15 @@ import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.handler.HandshakeHandler
 import org.macaroon3145.network.handler.ChunkStreamingService
 import org.macaroon3145.network.handler.PlayerSessionManager
+import org.macaroon3145.network.codec.BlockStateRegistry
+import org.macaroon3145.network.codec.ItemBlockStateRegistry
+import org.macaroon3145.network.codec.RegistryCodec
 import org.macaroon3145.network.transcoder.MinecraftVarIntFrameDecoder
 import org.macaroon3145.network.transcoder.MinecraftVarIntFrameEncoder
 import org.macaroon3145.perf.GameLoop
 import org.macaroon3145.perf.PerformanceMonitor
 import org.macaroon3145.world.WorldManager
+import org.macaroon3145.world.VanillaMiningRules
 import java.nio.file.Files
 import java.nio.file.Path
 import java.io.BufferedReader
@@ -125,6 +130,7 @@ fun main() {
     ServerConfig.setGameMode(parseGameMode(props.getProperty("default-gamemode")))
     ServerI18n.initialize()
     WorldManager.bootstrap(worldSeeds = worldSeeds, defaultWorld = defaultWorld)
+    warmupPickBlockLookups()
     if (ServerConfig.compressionThreshold >= 0 && ServerConfig.compressionChunkLevel < 0) {
         ServerI18n.log("aerogel.log.warn.chunk_compression_disabled")
     }
@@ -135,11 +141,12 @@ fun main() {
         ServerI18n.punct(": "),
         ServerI18n.style(eventLoops.name, ServerI18n.Color.MAGENTA)
     )
+    var serverChannel: Channel? = null
     DebugConsole.withSpinner(
         progressMessage = ServerI18n.tr("aerogel.log.tcp.preparing", Aerogel.PORT.toString()),
         doneMessage = ServerI18n.tr("aerogel.log.tcp.prepared", Aerogel.PORT.toString())
     ) {
-        ServerBootstrap().group(eventLoops.bossGroup, eventLoops.workerGroup)
+        serverChannel = ServerBootstrap().group(eventLoops.bossGroup, eventLoops.workerGroup)
             .channel(eventLoops.serverChannelClass)
             .childOption(ChannelOption.TCP_NODELAY, true)
             .childOption(ChannelOption.SO_KEEPALIVE, true)
@@ -150,7 +157,10 @@ fun main() {
                     pipeline.addLast("frameEncoder", MinecraftVarIntFrameEncoder())
                     pipeline.addLast("handshakeHandler", HandshakeHandler())
                 }
-            }).bind(Aerogel.PORT).sync()
+            }).bind(Aerogel.PORT).sync().channel()
+    }
+    serverChannel?.let {
+        ServerLifecycle.registerNetworking(it, eventLoops.bossGroup, eventLoops.workerGroup)
     }
     val elapsedNanos = (System.nanoTime() - mainStartNanos) - StartupTiming.interactiveInputNanos()
     val elapsedMillis = elapsedNanos.coerceAtLeast(0L) / 1_000_000.0
@@ -163,6 +173,13 @@ fun main() {
     startConsoleCommandLoop()
     PerformanceMonitor.start()
     GameLoop.start()
+}
+
+private fun warmupPickBlockLookups() {
+    runCatching { ItemBlockStateRegistry.prewarm() }
+    runCatching { BlockStateRegistry.prewarm() }
+    runCatching { RegistryCodec.prewarm() }
+    runCatching { VanillaMiningRules.prewarm() }
 }
 
 private fun resolveWorldSeeds(props: Properties): LinkedHashMap<String, Long> {

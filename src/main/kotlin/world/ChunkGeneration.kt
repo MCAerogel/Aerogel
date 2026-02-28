@@ -9,7 +9,8 @@ data class BlockPos(val x: Int, val y: Int, val z: Int) {
 data class ChunkGenerationContext(
     val worldKey: String,
     val seed: Long,
-    val chunkPos: ChunkPos
+    val chunkPos: ChunkPos,
+    val isCancelled: () -> Boolean = { false }
 )
 
 data class HeightmapData(

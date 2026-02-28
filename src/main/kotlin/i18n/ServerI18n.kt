@@ -57,17 +57,30 @@ object ServerI18n {
     }
 
     private fun activeCatalog(): Map<String, String> {
+        return catalogFor(null)
+    }
+
+    private fun catalogFor(localeTag: String?): Map<String, String> {
         val catalogs = catalogsRef.get()
         if (catalogs.isEmpty()) {
             initialize()
-            return activeCatalog()
+            return catalogFor(localeTag)
         }
-        val lang = Locale.getDefault().language.lowercase(Locale.ROOT)
+        val lang = localeTag
+            ?.substringBefore('_')
+            ?.substringBefore('-')
+            ?.lowercase(Locale.ROOT)
+            ?.takeIf { it.isNotBlank() }
+            ?: Locale.getDefault().language.lowercase(Locale.ROOT)
         return catalogs[lang] ?: catalogs["en"].orEmpty()
     }
 
     fun translate(key: String, args: List<String> = emptyList()): String {
-        val template = activeCatalog()[key] ?: key
+        return translateFor(null, key, args)
+    }
+
+    fun translateFor(localeTag: String?, key: String, args: List<String> = emptyList()): String {
+        val template = catalogFor(localeTag)[key] ?: key
         return try {
             String.format(Locale.getDefault(), template, *args.toTypedArray())
         } catch (_: Throwable) {
@@ -76,6 +89,8 @@ object ServerI18n {
     }
 
     fun tr(key: String, vararg args: String): String = translate(key, args.toList())
+
+    fun trFor(localeTag: String?, key: String, vararg args: String): String = translateFor(localeTag, key, args.toList())
 
     fun log(key: String, vararg args: String) {
         val message = tr(key, *args)

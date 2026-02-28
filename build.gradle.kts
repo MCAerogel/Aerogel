@@ -111,6 +111,11 @@ tasks.named("build") {
 }
 
 val aerogelJarTask = tasks.named<Jar>("aerogelJar")
+val aerogelRunJvmArgs = listOf(
+    "--enable-native-access=ALL-UNNAMED",
+    "-Xms8G",
+    "-Xmx8G"
+)
 
 tasks.register<Exec>("runAerogelJar") {
     group = "application"
@@ -124,7 +129,7 @@ tasks.register<Exec>("runAerogelJar") {
 
     doFirst {
         val jarFile = aerogelJarTask.get().archiveFile.get().asFile
-        commandLine("java", "--enable-native-access=ALL-UNNAMED", "-jar", jarFile.absolutePath)
+        commandLine(listOf("java") + aerogelRunJvmArgs + listOf("-jar", jarFile.absolutePath))
     }
 }
 
@@ -142,39 +147,42 @@ tasks.register<Exec>("runAerogelJarInOsTerminal") {
 
         when {
             os.contains("win") -> {
+                val javaCommand = (listOf("java") + aerogelRunJvmArgs + listOf("-jar", "\"$jarPath\"")).joinToString(" ")
                 // Opens a new cmd window and keeps it open after process exit.
                 commandLine(
                     "cmd", "/c",
                     "start", "\"Aerogel\"",
                     "cmd", "/k",
-                    "java --enable-native-access=ALL-UNNAMED -jar \"$jarPath\""
+                    javaCommand
                 )
             }
             os.contains("mac") -> {
                 val escapedProjectDir = project.projectDir.absolutePath.replace("\"", "\\\"")
                 val escapedJarPath = jarPath.replace("\"", "\\\"")
+                val javaCommand = (listOf("java") + aerogelRunJvmArgs + listOf("-jar", "\"$escapedJarPath\"")).joinToString(" ")
                 commandLine(
                     "osascript", "-e",
-                    "tell application \"Terminal\" to do script \"cd \\\"$escapedProjectDir\\\"; java --enable-native-access=ALL-UNNAMED -jar \\\"$escapedJarPath\\\"\""
+                    "tell application \"Terminal\" to do script \"cd \\\"$escapedProjectDir\\\"; $javaCommand\""
                 )
             }
             else -> {
                 // Linux/Unix: tries common terminal emulators.
                 val escapedProjectDir = project.projectDir.absolutePath.replace("'", "'\"'\"'")
                 val escapedJarPath = jarPath.replace("'", "'\"'\"'")
+                val javaCommand = (listOf("java") + aerogelRunJvmArgs + listOf("-jar", "\"$escapedJarPath\"")).joinToString(" ")
                 val script = """
                     if command -v x-terminal-emulator >/dev/null 2>&1; then
-                      x-terminal-emulator -e sh -lc 'cd "$escapedProjectDir"; java --enable-native-access=ALL-UNNAMED -jar "$escapedJarPath"; exec sh'
+                      x-terminal-emulator -e sh -lc 'cd "$escapedProjectDir"; $javaCommand; exec sh'
                     elif command -v gnome-terminal >/dev/null 2>&1; then
-                      gnome-terminal -- sh -lc 'cd "$escapedProjectDir"; java --enable-native-access=ALL-UNNAMED -jar "$escapedJarPath"; exec sh'
+                      gnome-terminal -- sh -lc 'cd "$escapedProjectDir"; $javaCommand; exec sh'
                     elif command -v konsole >/dev/null 2>&1; then
-                      konsole -e sh -lc 'cd "$escapedProjectDir"; java --enable-native-access=ALL-UNNAMED -jar "$escapedJarPath"; exec sh'
+                      konsole -e sh -lc 'cd "$escapedProjectDir"; $javaCommand; exec sh'
                     elif command -v xfce4-terminal >/dev/null 2>&1; then
-                      xfce4-terminal --command="sh -lc 'cd \"$escapedProjectDir\"; java --enable-native-access=ALL-UNNAMED -jar \"$escapedJarPath\"; exec sh'"
+                      xfce4-terminal --command="sh -lc 'cd \"$escapedProjectDir\"; $javaCommand; exec sh'"
                     elif command -v xterm >/dev/null 2>&1; then
-                      xterm -e sh -lc 'cd "$escapedProjectDir"; java --enable-native-access=ALL-UNNAMED -jar "$escapedJarPath"; exec sh'
+                      xterm -e sh -lc 'cd "$escapedProjectDir"; $javaCommand; exec sh'
                     else
-                      echo "No terminal emulator found. Install one or run: java --enable-native-access=ALL-UNNAMED -jar \"$jarPath\""
+                      echo "No terminal emulator found. Install one or run: java ${aerogelRunJvmArgs.joinToString(" ")} -jar \"$jarPath\""
                       exit 1
                     fi
                 """.trimIndent()

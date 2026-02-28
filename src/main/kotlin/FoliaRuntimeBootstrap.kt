@@ -18,7 +18,9 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Comparator
 import java.util.Locale
+import java.util.Properties
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import java.util.jar.JarEntry
 import java.util.jar.JarFile
 import java.util.jar.JarOutputStream
@@ -35,16 +37,18 @@ private object FoliaRuntimeBootstrap {
     private const val API_BASE = "https://api.papermc.io/v2/projects/folia"
     private val runtimeDir: Path = Path.of(".aerogel-cache/folia/runtime")
     private val jarPath: Path = runtimeDir.resolve("folia-server.jar")
+    private val downloadMetadataPath: Path = runtimeDir.resolve("folia-download.properties")
+    private val runtimeStatePath: Path = runtimeDir.resolve("runtime-state.properties")
     private val worldDirs = listOf("world", "world_nether", "world_the_end")
     private const val embeddedPluginJarEntry = "embedded/AerogelFoliaBridge.jar"
     private const val sidecarPluginFileName = "AerogelFoliaBridge.jar"
     private const val defaultSidecarXmsMb = 512
-    private const val defaultSidecarXmxMb = 2048
+    private const val defaultSidecarXmxMb = 1024
     private const val defaultChunkGcPeriodTicks = 200
-    private val sidecarJvmArgs: List<String> = listOf("-Xms${defaultSidecarXmsMb}M", "-Xmx${defaultSidecarXmxMb}M")
     private val bindHost = "127.0.0.1"
     private const val bindPort = "0"
     private const val FORCED_REGION_GRID_EXPONENT = 0
+    private const val downloadInfoCacheTtlMillis = 6L * 60L * 60L * 1000L
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(20))
@@ -52,14 +56,31 @@ private object FoliaRuntimeBootstrap {
         .build()
 
     private val started = AtomicBoolean(false)
+    private val restartLock = Any()
     @Volatile
     private var process: Process? = null
+
+    fun stop() {
+        val running = process
+        if (running != null && running.isAlive) {
+            running.destroyForcibly()
+            runCatching { running.waitFor() }
+        }
+        process = null
+        started.set(false)
+    }
+
+    fun restart(configuredChunkWorkerThreads: Int) {
+        synchronized(restartLock) {
+            stop()
+            ensureReady(configuredChunkWorkerThreads)
+        }
+    }
 
     fun ensureReady(configuredChunkWorkerThreads: Int) {
         Files.createDirectories(runtimeDir)
         ensureEulaAccepted(runtimeDir)
         installBridgePlugin(runtimeDir)
-        purgeSidecarWorldData(runtimeDir)
         val chunkIpcSlots = computeChunkIpcSlots(configuredChunkWorkerThreads)
         System.setProperty("aerogel.chunk.ipc.slots", chunkIpcSlots.toString())
         val regionGridExponent = FORCED_REGION_GRID_EXPONENT
@@ -74,19 +95,12 @@ private object FoliaRuntimeBootstrap {
             started.set(false)
         }
 
-        if (!Files.isRegularFile(jarPath)) {
-            val downloadInfo = DebugConsole.withSpinner(
-                progressMessage = ServerI18n.tr("aerogel.folia.download.resolve.start", Aerogel.VERSION),
-                doneMessage = ServerI18n.tr("aerogel.folia.download.resolve.done", Aerogel.VERSION)
-            ) {
-                resolveDownloadInfo()
-            }
-            downloadFoliaJar(downloadInfo, jarPath)
-        }
+        ensureCachedFoliaJar()
 
         val javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString()
         prepareSidecarServerProperties(runtimeDir)
         prepareSidecarConfigFiles(runtimeDir, chunkIpcSlots, regionGridExponent)
+        prepareRuntimeStateCache(regionGridExponent)
         prepareIpcDirectory(runtimeDir)
 
         val appArgs = listOf(
@@ -98,6 +112,7 @@ private object FoliaRuntimeBootstrap {
             bindPort
         )
 
+        val sidecarJvmArgs = resolveSidecarJvmArgs()
         val command = ArrayList<String>(4 + sidecarJvmArgs.size + appArgs.size)
         command.add(javaBin)
         command.addAll(sidecarJvmArgs)
@@ -130,7 +145,6 @@ private object FoliaRuntimeBootstrap {
                     // Kill immediately to skip Folia's graceful world shutdown/save sequence.
                     running.destroyForcibly()
                 }
-                purgeSidecarWorldData(runtimeDir)
             }, "aerogel-folia-sidecar-shutdown"))
 
             Thread.sleep(250)
@@ -290,6 +304,66 @@ private object FoliaRuntimeBootstrap {
         )
     }
 
+    private fun ensureCachedFoliaJar() {
+        val cached = readCachedDownloadInfo()
+        val nowMillis = System.currentTimeMillis()
+        val jarExists = Files.isRegularFile(jarPath)
+        val desiredVersion = Aerogel.VERSION
+        val cacheFresh = cached != null &&
+            jarExists &&
+            cached.version == desiredVersion &&
+            (nowMillis - readMetadataTimestamp(downloadMetadataPath) <= downloadInfoCacheTtlMillis)
+        if (cacheFresh) return
+
+        val downloadInfo = DebugConsole.withSpinner(
+            progressMessage = ServerI18n.tr("aerogel.folia.download.resolve.start", desiredVersion),
+            doneMessage = ServerI18n.tr("aerogel.folia.download.resolve.done", desiredVersion)
+        ) {
+            resolveDownloadInfo()
+        }
+
+        val cacheMatchesDownload = cached != null &&
+            jarExists &&
+            cached.version == downloadInfo.version &&
+            cached.build == downloadInfo.build &&
+            cached.fileName == downloadInfo.fileName &&
+            cached.sha256.equals(downloadInfo.sha256, ignoreCase = true)
+        if (cacheMatchesDownload) {
+            writeCachedDownloadInfo(downloadInfo)
+            return
+        }
+
+        if (jarExists) {
+            val actualSha = sha256Hex(jarPath)
+            if (actualSha.equals(downloadInfo.sha256, ignoreCase = true)) {
+                writeCachedDownloadInfo(downloadInfo)
+                return
+            }
+        }
+
+        downloadFoliaJar(downloadInfo, jarPath)
+        writeCachedDownloadInfo(downloadInfo)
+    }
+
+    private fun resolveSidecarJvmArgs(): List<String> {
+        val explicitXms = System.getProperty("aerogel.folia.sidecar.xms")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { "-Xms$it" }
+        val explicitXmx = System.getProperty("aerogel.folia.sidecar.xmx")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { "-Xmx$it" }
+        if (explicitXms != null || explicitXmx != null) {
+            return listOfNotNull(
+                explicitXms ?: "-Xms${defaultSidecarXmsMb}M",
+                explicitXmx ?: "-Xmx${defaultSidecarXmxMb}M"
+            )
+        }
+
+        return listOf("-Xms${defaultSidecarXmsMb}M", "-Xmx${defaultSidecarXmxMb}M")
+    }
+
     private fun downloadFoliaJar(info: FoliaDownloadInfo, targetPath: Path) {
         val url = "$API_BASE/versions/${info.version}/builds/${info.build}/downloads/${info.fileName}"
         DebugConsole.withSpinner(
@@ -352,6 +426,39 @@ private object FoliaRuntimeBootstrap {
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun readCachedDownloadInfo(): FoliaDownloadInfo? {
+        val props = readProperties(downloadMetadataPath) ?: return null
+        val version = props.getProperty("version")?.trim().orEmpty()
+        val build = props.getProperty("build")?.trim()?.toIntOrNull()
+        val fileName = props.getProperty("fileName")?.trim().orEmpty()
+        val sha256 = props.getProperty("sha256")?.trim().orEmpty()
+        if (version.isEmpty() || build == null || fileName.isEmpty() || sha256.isEmpty()) return null
+        return FoliaDownloadInfo(
+            version = version,
+            build = build,
+            fileName = fileName,
+            sha256 = sha256
+        )
+    }
+
+    private fun writeCachedDownloadInfo(info: FoliaDownloadInfo) {
+        writeProperties(
+            downloadMetadataPath,
+            linkedMapOf(
+                "version" to info.version,
+                "build" to info.build.toString(),
+                "fileName" to info.fileName,
+                "sha256" to info.sha256,
+                "resolvedAtMillis" to System.currentTimeMillis().toString()
+            )
+        )
+    }
+
+    private fun readMetadataTimestamp(path: Path): Long {
+        val props = readProperties(path) ?: return 0L
+        return props.getProperty("resolvedAtMillis")?.trim()?.toLongOrNull() ?: 0L
     }
 
     private fun prepareSidecarServerProperties(runtimeDir: Path) {
@@ -444,6 +551,29 @@ private object FoliaRuntimeBootstrap {
         )
     }
 
+    private fun prepareRuntimeStateCache(regionGridExponent: Int) {
+        val currentState = linkedMapOf(
+            "minecraftVersion" to Aerogel.VERSION,
+            "regionGridExponent" to regionGridExponent.toString(),
+            "sidecarLevelSeed" to runtimeStateProperty("aerogel.folia.sidecar.level-seed"),
+            "overworldSeed" to runtimeStateProperty("aerogel.folia.seed.overworld"),
+            "netherSeed" to runtimeStateProperty("aerogel.folia.seed.the_nether"),
+            "endSeed" to runtimeStateProperty("aerogel.folia.seed.the_end")
+        )
+        val existing = readProperties(runtimeStatePath)
+        val hasCachedWorlds = worldDirs.any { Files.exists(runtimeDir.resolve(it)) }
+
+        if (existing != null && !propertiesMatch(existing, currentState)) {
+            purgeSidecarWorldData(runtimeDir)
+        }
+
+        if (existing == null || !propertiesMatch(existing, currentState) || !hasCachedWorlds) {
+            writeProperties(runtimeStatePath, currentState)
+        }
+
+        cleanupTransientRuntimeFiles()
+    }
+
     private fun readExistingConfigVersion(path: Path, fallback: Int): Int {
         if (!Files.isRegularFile(path)) return fallback
         return runCatching {
@@ -523,6 +653,10 @@ private object FoliaRuntimeBootstrap {
             else -> "en-us"
         }
         return "https://www.minecraft.net/$localeSegment/eula"
+    }
+
+    private fun runtimeStateProperty(key: String): String {
+        return System.getProperty(key)?.trim().orEmpty()
     }
 
     private fun compareMcVersion(left: String, right: String): Int {
@@ -631,6 +765,21 @@ private object FoliaRuntimeBootstrap {
         return outputJar.takeIf { Files.isRegularFile(it) }
     }
 
+    private fun cleanupTransientRuntimeFiles() {
+        Files.deleteIfExists(runtimeDir.resolve("folia-sidecar.log"))
+        for (worldDirName in worldDirs) {
+            deleteSessionLocks(runtimeDir.resolve(worldDirName))
+        }
+    }
+
+    private fun deleteSessionLocks(root: Path) {
+        if (!Files.exists(root)) return
+        Files.walk(root).use { stream ->
+            stream.filter { Files.isRegularFile(it) && it.fileName.toString() == "session.lock" }
+                .forEach { Files.deleteIfExists(it) }
+        }
+    }
+
     private fun shouldRebuildDevPluginJar(outputJar: Path, classesDir: Path, resourcesDir: Path): Boolean {
         if (!Files.isRegularFile(outputJar)) return true
         val jarMtime = runCatching { Files.getLastModifiedTime(outputJar).toMillis() }.getOrDefault(0L)
@@ -687,6 +836,31 @@ private object FoliaRuntimeBootstrap {
         }
     }
 
+    private fun readProperties(path: Path): Properties? {
+        if (!Files.isRegularFile(path)) return null
+        return runCatching {
+            Properties().apply {
+                Files.newInputStream(path).use { load(it) }
+            }
+        }.getOrNull()
+    }
+
+    private fun writeProperties(path: Path, values: Map<String, String>) {
+        val props = Properties()
+        for ((key, value) in values) {
+            props.setProperty(key, value)
+        }
+        Files.createDirectories(path.parent ?: Path.of("."))
+        Files.newOutputStream(path).use { props.store(it, null) }
+    }
+
+    private fun propertiesMatch(existing: Properties, expected: Map<String, String>): Boolean {
+        for ((key, expectedValue) in expected) {
+            if ((existing.getProperty(key) ?: "") != expectedValue) return false
+        }
+        return true
+    }
+
     private fun deleteRecursivelyIfExists(path: Path) {
         if (!Files.exists(path)) return
         Files.walk(path).use { stream ->
@@ -697,6 +871,14 @@ private object FoliaRuntimeBootstrap {
     }
 }
 
+fun stopFoliaRuntime() {
+    FoliaRuntimeBootstrap.stop()
+}
+
 fun ensureFoliaRuntimeReady(configuredChunkWorkerThreads: Int) {
     FoliaRuntimeBootstrap.ensureReady(configuredChunkWorkerThreads)
+}
+
+fun restartFoliaRuntime(configuredChunkWorkerThreads: Int) {
+    FoliaRuntimeBootstrap.restart(configuredChunkWorkerThreads)
 }

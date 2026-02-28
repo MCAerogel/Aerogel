@@ -53,4 +53,10 @@ object ItemBlockStateRegistry {
         learnedItemToState[itemId] = stateId
         learnedStateToItem[stateId] = itemId
     }
+
+    fun prewarm() {
+        // Force static mapping parse/build at startup instead of first pick-block.
+        staticItemToState.size
+        staticStateToItem.size
+    }
 }

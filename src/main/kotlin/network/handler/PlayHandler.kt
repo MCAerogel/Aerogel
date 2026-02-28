@@ -6,6 +6,7 @@ import io.netty.channel.SimpleChannelInboundHandler
 import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.NetworkUtils
 import org.macaroon3145.world.BlockPos
+import org.slf4j.LoggerFactory
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
@@ -13,6 +14,12 @@ class PlayHandler(
     private val profile: ConnectionProfile,
     private val session: PlayerSession
 ) : SimpleChannelInboundHandler<ByteBuf>() {
+    private companion object {
+        private val logger = LoggerFactory.getLogger(PlayHandler::class.java)
+        private val placementDebugEnabled: Boolean =
+            System.getProperty("aerogel.debug.placement")?.toBooleanStrictOrNull() ?: false
+    }
+
     @Volatile
     private var clientSkinPartsMask: Int = session.skinPartsMask
     @Volatile
@@ -25,10 +32,13 @@ class PlayHandler(
             0x06 -> handleChatCommand(buf, signed = false)
             0x07 -> handleChatCommand(buf, signed = true)
             0x08 -> handleChatMessage(buf)
+            0x0B -> handleClientStatus(buf)
             0x0E -> handleCommandSuggestion(buf)
+            // Vanilla 1.21.11 C2S Play: PlayPackets.INTERACT (PlayerInteractEntityC2SPacket) = 0x19.
+            0x19 -> handleUseEntity(buf)
             // Serverbound Client Information (play)
             0x0D -> handleClientInformation(buf)
-            0x0B, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20 -> {
+            0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20 -> {
                 if (!handleKeepAliveOrMovement(packetId, buf)) {
                     tryHandleMovementByShape(packetId, buf)
                 }
@@ -96,6 +106,19 @@ class PlayHandler(
         PlayerSessionManager.sendCommandSuggestions(session.channelId, requestId, input)
     }
 
+    private fun handleClientStatus(buf: ByteBuf) {
+        val action = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            return
+        }
+        // Vanilla ClientStatusC2SPacket:
+        // 0 = PERFORM_RESPAWN, 1 = REQUEST_STATS
+        if (action == 0) {
+            PlayerSessionManager.respawnIfDead(session.channelId)
+        }
+    }
+
     private fun handleKeepAliveOrMovement(packetId: Int, buf: ByteBuf): Boolean {
         val readable = buf.readableBytes()
         // 1.21.x/1.21.11: handle both known and shifted IDs by payload shape.
@@ -157,6 +180,7 @@ class PlayHandler(
         buf.readBoolean() // allow server listing
 
         clientSkinPartsMask = skinParts
+        PlayerSessionManager.updateLocale(session.channelId, locale)
         PlayerSessionManager.updateViewDistance(session.channelId, viewDistance)
         ServerI18n.logCustom(
             ServerI18n.label("aerogel.label.client_settings_received"),
@@ -284,6 +308,49 @@ class PlayHandler(
         )
     }
 
+    private fun handleUseEntity(buf: ByteBuf) {
+        val targetEntityId = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            return
+        }
+        val actionType = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            return
+        }
+        when (actionType) {
+            0 -> { // interact
+                try {
+                    NetworkUtils.readVarInt(buf) // hand
+                } catch (_: Throwable) {
+                    return
+                }
+            }
+            2 -> { // interact_at
+                if (buf.readableBytes() < 12) return
+                buf.readFloat()
+                buf.readFloat()
+                buf.readFloat()
+                try {
+                    NetworkUtils.readVarInt(buf) // hand
+                } catch (_: Throwable) {
+                    return
+                }
+            }
+            1 -> {
+                // ATTACK
+            }
+            else -> return
+        }
+        if (buf.readableBytes() >= 1) {
+            buf.readBoolean() // using secondary action
+        }
+        if (actionType == 1) {
+            PlayerSessionManager.handlePlayerAttackEntity(session.channelId, targetEntityId)
+        }
+    }
+
     private fun handlePlayerDigging(buf: ByteBuf) {
         val action = try {
             NetworkUtils.readVarInt(buf)
@@ -294,16 +361,19 @@ class PlayHandler(
         val pos = readBlockPos(buf)
         if (buf.readableBytes() < 1) return
         buf.readUnsignedByte() // face
+        var sequence = -1
         if (buf.readableBytes() > 0) {
             try {
-                NetworkUtils.readVarInt(buf) // sequence (1.19+)
+                sequence = NetworkUtils.readVarInt(buf) // sequence (1.19+)
             } catch (_: Throwable) {
                 // ignore
             }
         }
-        // START_DIGGING or FINISHED_DIGGING
+        // Survival should only break on FINISHED_DIGGING.
+        // Creative still breaks immediately on START_DIGGING.
         if (action == 0 || action == 2) {
-            PlayerSessionManager.breakBlock(session.channelId, pos.x, pos.y, pos.z)
+            PlayerSessionManager.handleBlockDiggingAction(session.channelId, action, pos.x, pos.y, pos.z)
+            PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
             return
         }
         // DROP_ITEM_STACK / DROP_ITEM
@@ -312,12 +382,16 @@ class PlayHandler(
                 channelId = session.channelId,
                 dropStack = action == 3
             )
+            PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
             return
         }
         // SWAP_ITEM_WITH_OFFHAND
         if (action == 6) {
             PlayerSessionManager.swapMainHandWithOffhand(session.channelId)
+            PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
+            return
         }
+        PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
     }
 
     private fun handlePlayerBlockPlacement(buf: ByteBuf) {
@@ -346,15 +420,33 @@ class PlayHandler(
         if (buf.readableBytes() >= 1) {
             buf.readBoolean() // worldBorderHit (1.21.2+)
         }
+        var sequence = -1
         if (buf.readableBytes() > 0) {
             try {
-                NetworkUtils.readVarInt(buf) // sequence
+                sequence = NetworkUtils.readVarInt(buf) // sequence
             } catch (_: Throwable) {
                 // ignore
             }
         }
 
         val target = offsetByFace(clicked, faceId)
+        if (placementDebugEnabled) {
+            logger.info(
+                "Placement packet: player={} clicked=({}, {}, {}) faceId={} target=({}, {}, {}) hand={} cursor=({}, {}, {})",
+                profile.username,
+                clicked.x,
+                clicked.y,
+                clicked.z,
+                faceId,
+                target.x,
+                target.y,
+                target.z,
+                hand,
+                cursorX,
+                cursorY,
+                cursorZ
+            )
+        }
         PlayerSessionManager.placeSelectedBlock(
             channelId = session.channelId,
             x = target.x,
@@ -366,6 +458,7 @@ class PlayHandler(
             cursorY = cursorY,
             cursorZ = cursorZ
         )
+        PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
     }
 
     private fun handleMovePosition(buf: ByteBuf) {
@@ -460,6 +553,7 @@ class PlayHandler(
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
         keepAliveTask?.cancel(false)
+        logger.error("PlayHandler exception for player={} channel={}", session.profile.username, session.channelId, cause)
         PlayerSessionManager.leave(session.channelId)
         ctx.close()
     }

@@ -66,6 +66,23 @@ object BlockStateRegistry {
         out
     }
 
+    private val verticalHalfCounterpartByStateId: Map<Int, Int> by lazy {
+        val out = HashMap<Int, Int>()
+        for ((stateId, parsed) in stateIdToParsed) {
+            val half = parsed.properties["half"] ?: continue
+            val opposite = when (half) {
+                "lower" -> "upper"
+                "upper" -> "lower"
+                else -> null
+            } ?: continue
+            val props = HashMap(parsed.properties)
+            props["half"] = opposite
+            val counterpart = stateId(parsed.blockKey, props) ?: continue
+            out[stateId] = counterpart
+        }
+        out
+    }
+
     private val blockPropertyValues: Map<String, Map<String, Set<String>>> by lazy {
         val valuesByBlock = HashMap<String, HashMap<String, MutableSet<String>>>()
         for (parsed in stateIdToParsed.values) {
@@ -97,8 +114,19 @@ object BlockStateRegistry {
 
     fun parsedState(stateId: Int): ParsedState? = stateIdToParsed[stateId]
 
+    fun verticalHalfCounterpartStateId(stateId: Int): Int? = verticalHalfCounterpartByStateId[stateId]
+
     fun propertyValues(blockKey: String, property: String): Set<String> {
         return blockPropertyValues[blockKey]?.get(property) ?: emptySet()
+    }
+
+    fun prewarm() {
+        // Shift lazy JSON/materialization cost to startup.
+        itemToBlock.size
+        blockToItem.size
+        defaultByBlock.size
+        stateIdToParsed.size
+        verticalHalfCounterpartByStateId.size
     }
 
     private fun parseStateKey(stateKey: String): ParsedState {

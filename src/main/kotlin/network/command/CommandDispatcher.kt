@@ -28,9 +28,12 @@ class CommandDispatcher(
             return CommandDispatcher(
                 mapOf(
                     "op" to OpCommand,
+                    "deop" to DeopCommand,
                     "tp" to TpCommand,
                     "teleport" to TpCommand,
-                    "gamemode" to GamemodeCommand
+                    "gamemode" to GamemodeCommand,
+                    "time" to TimeCommand,
+                    "stop" to StopCommand
                 )
             )
         }

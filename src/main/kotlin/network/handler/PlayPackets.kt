@@ -45,6 +45,7 @@ object PlayPackets {
     private const val TELEPORT_ENTITY_PACKET_ID = 0x23
     private const val MOVE_ENTITY_POS_PACKET_ID = 0x33
     private const val MOVE_ENTITY_POS_ROT_PACKET_ID = 0x34
+    private const val ACK_BLOCK_CHANGED_PACKET_ID = 0x04
     private const val BLOCK_CHANGE_PACKET_ID = 0x08
     // Protocol 774 (MC 1.21.11): WorldEventPacket
     private const val LEVEL_EVENT_PACKET_ID = 0x2D
@@ -61,6 +62,7 @@ object PlayPackets {
     private const val ENTITY_VELOCITY_PACKET_ID = 0x63
     private const val POSITION_PACKET_ID = 0x46
     private const val REMOVE_ENTITIES_PACKET_ID = 0x4B
+    private const val RESPAWN_PACKET_ID = 0x50
     private const val TAKE_ITEM_ENTITY_PACKET_ID = 0x7A
     private const val ENTITY_HEAD_LOOK_PACKET_ID = 0x51
     private const val UPDATE_VIEW_POSITION_PACKET_ID = 0x5C
@@ -68,25 +70,33 @@ object PlayPackets {
     private const val SPAWN_POSITION_PACKET_ID = 0x5F
     private const val TIME_UPDATE_PACKET_ID = 0x6F
     private const val SYSTEM_CHAT_PACKET_ID = 0x77
+    private const val SET_HEALTH_PACKET_ID = 0x66
     private const val SET_HELD_SLOT_PACKET_ID = 0x67
     private const val CONTAINER_SET_SLOT_PACKET_ID = 0x14
     private const val COMMAND_SUGGESTIONS_PACKET_ID = 0x0F
     private const val COMMANDS_PACKET_ID = 0x10
     private const val CUSTOM_PAYLOAD_PACKET_ID = 0x18
+    private const val DAMAGE_EVENT_PACKET_ID = 0x19
     private const val TICKING_STATE_PACKET_ID = 0x7D
     private const val TICKING_STEP_PACKET_ID = 0x7E
+    private const val ENTITY_EVENT_PACKET_ID = 0x22
+    private const val HURT_ANIMATION_PACKET_ID = 0x29
+    private const val SOUND_ENTITY_PACKET_ID = 0x72
 
-    private const val TELEPORT_ID = 1
     private const val SPAWN_X = 0
     private const val SPAWN_Y = 65
     private const val SPAWN_Z = 0
     private const val WORLD_HEIGHT = 384
     private const val FALLBACK_PLAYER_ENTITY_TYPE_ID_1_21_11 = 155
     private const val FALLBACK_ITEM_ENTITY_TYPE_ID_1_21_11 = 71
+    private const val FALLBACK_FALLING_BLOCK_ENTITY_TYPE_ID_1_21_11 = 51
     private const val COMMAND_ARGUMENT_TYPE_GAME_PROFILE_ID_1_21_11 = 7
     private const val COMMAND_ARGUMENT_TYPE_VEC3_ID_1_21_11 = 10
     private const val COMMAND_ARGUMENT_TYPE_GAMEMODE_ID_1_21_11 = 42
+    private const val COMMAND_ARGUMENT_TYPE_TIME_ID_1_21_11 = 43
     private const val COMMAND_ARGUMENT_TYPE_ENTITY_ID_1_21_11 = 6
+    private const val COMMAND_ARGUMENT_TYPE_BRIGADIER_INTEGER_ID_1_21_11 = 3
+    private const val COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11 = 5
     private const val ENTITY_ARGUMENT_FLAG_SINGLE = 0x01
     private const val ENTITY_ARGUMENT_FLAG_PLAYERS_ONLY = 0x02
     // 1.21.11: player model customization is tracked on PlayerLikeEntity before PlayerEntity fields.
@@ -103,6 +113,10 @@ object PlayPackets {
     private val cachedItemEntityTypeId: Int by lazy {
         RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:item")
             ?: FALLBACK_ITEM_ENTITY_TYPE_ID_1_21_11
+    }
+    private val cachedFallingBlockEntityTypeId: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:falling_block")
+            ?: FALLBACK_FALLING_BLOCK_ENTITY_TYPE_ID_1_21_11
     }
 
     fun loginPacket(entityId: Int, worldKey: String, gameMode: Int): ByteArray {
@@ -163,6 +177,7 @@ object PlayPackets {
     }
 
     fun playerPositionPacket(
+        teleportId: Int,
         x: Double,
         y: Double,
         z: Double,
@@ -173,7 +188,7 @@ object PlayPackets {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
         NetworkUtils.writeVarInt(packet, POSITION_PACKET_ID)
-        NetworkUtils.writeVarInt(packet, TELEPORT_ID)
+        NetworkUtils.writeVarInt(packet, teleportId.coerceAtLeast(0))
         out.writeDouble(x)
         out.writeDouble(y)
         out.writeDouble(z)
@@ -209,6 +224,23 @@ object PlayPackets {
         val packet = ByteArrayOutputStream()
         NetworkUtils.writeVarInt(packet, TICKING_STEP_PACKET_ID)
         NetworkUtils.writeVarInt(packet, tickSteps.coerceAtLeast(0))
+        return packet.toByteArray()
+    }
+
+    fun setHealthPacket(health: Float, food: Int, saturation: Float): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, SET_HEALTH_PACKET_ID)
+        out.writeFloat(health.coerceAtLeast(0f))
+        NetworkUtils.writeVarInt(packet, food.coerceAtLeast(0))
+        out.writeFloat(saturation.coerceAtLeast(0f))
+        return packet.toByteArray()
+    }
+
+    fun acknowledgeBlockChangedPacket(sequenceId: Int): ByteArray {
+        val packet = ByteArrayOutputStream()
+        NetworkUtils.writeVarInt(packet, ACK_BLOCK_CHANGED_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, sequenceId.coerceAtLeast(0))
         return packet.toByteArray()
     }
 
@@ -276,6 +308,13 @@ object PlayPackets {
             if (playersOnly) flags = flags or ENTITY_ARGUMENT_FLAG_PLAYERS_ONLY
             return byteArrayOf(flags.toByte())
         }
+        fun brigadierIntegerPayloadNoBounds(): ByteArray = byteArrayOf(0)
+        fun brigadierStringPayloadSingleWord(): ByteArray = byteArrayOf(0)
+        fun timePayload(minTicks: Int): ByteArray {
+            val out = ByteArrayOutputStream()
+            DataOutputStream(out).writeInt(minTicks)
+            return out.toByteArray()
+        }
         fun addLiteral(literal: String, children: IntArray = intArrayOf(), executable: Boolean = false): Int {
             return addNode(
                 CmdNode(
@@ -341,7 +380,7 @@ object PlayPackets {
                 )
                 setNode(
                     literalIndex,
-                    nodes[literalIndex].copy(children = intArrayOf(destinationIndex, locationIndex, targetsIndex))
+                    nodes[literalIndex].copy(children = intArrayOf(targetsIndex, destinationIndex, locationIndex))
                 )
                 setNode(
                     targetsIndex,
@@ -379,10 +418,113 @@ object PlayPackets {
                 rootChildren += literalIndex
             }
 
+            fun addDeopSubtree() {
+                val literalIndex = addLiteral("deop")
+                val targetIndex = addArgument(
+                    name = "targets",
+                    parserTypeId = COMMAND_ARGUMENT_TYPE_GAME_PROFILE_ID_1_21_11,
+                    executable = true
+                )
+                setNode(literalIndex, nodes[literalIndex].copy(children = intArrayOf(targetIndex)))
+                rootChildren += literalIndex
+            }
+
+            fun addStopLiteral() {
+                rootChildren += addLiteral("stop", executable = true)
+            }
+
+            fun addTimeSubtree() {
+                val literalIndex = addLiteral("time")
+                val setLiteralIndex = addLiteral("set")
+                val addLiteralIndex = addLiteral("add")
+                val queryLiteralIndex = addLiteral("query")
+                val setDayLiteralIndex = addLiteral("day", executable = true)
+                val setNoonLiteralIndex = addLiteral("noon", executable = true)
+                val setNightLiteralIndex = addLiteral("night", executable = true)
+                val setMidnightLiteralIndex = addLiteral("midnight", executable = true)
+
+                val setValueIndex = addArgument(
+                    name = "value",
+                    parserTypeId = COMMAND_ARGUMENT_TYPE_TIME_ID_1_21_11,
+                    parserPayload = timePayload(0),
+                    executable = true
+                )
+                val setWorldIndex = addArgument(
+                    name = "world",
+                    parserTypeId = COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11,
+                    parserPayload = brigadierStringPayloadSingleWord(),
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
+                )
+
+                val addValueIndex = addArgument(
+                    name = "value",
+                    parserTypeId = COMMAND_ARGUMENT_TYPE_TIME_ID_1_21_11,
+                    parserPayload = timePayload(0),
+                    executable = true
+                )
+                val addWorldIndex = addArgument(
+                    name = "world",
+                    parserTypeId = COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11,
+                    parserPayload = brigadierStringPayloadSingleWord(),
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
+                )
+
+                val queryDaytimeLiteralIndex = addLiteral("daytime", executable = true)
+                val queryGametimeLiteralIndex = addLiteral("gametime", executable = true)
+                val queryDayLiteralIndex = addLiteral("day", executable = true)
+                val queryWorldIndex = addArgument(
+                    name = "world",
+                    parserTypeId = COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11,
+                    parserPayload = brigadierStringPayloadSingleWord(),
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
+                )
+
+                setNode(literalIndex, nodes[literalIndex].copy(children = intArrayOf(setLiteralIndex, addLiteralIndex, queryLiteralIndex)))
+                setNode(
+                    setLiteralIndex,
+                    nodes[setLiteralIndex].copy(
+                        children = intArrayOf(
+                            setDayLiteralIndex,
+                            setNoonLiteralIndex,
+                            setNightLiteralIndex,
+                            setMidnightLiteralIndex,
+                            setValueIndex
+                        )
+                    )
+                )
+                setNode(addLiteralIndex, nodes[addLiteralIndex].copy(children = intArrayOf(addValueIndex)))
+                setNode(
+                    queryLiteralIndex,
+                    nodes[queryLiteralIndex].copy(
+                        children = intArrayOf(
+                            queryDaytimeLiteralIndex,
+                            queryGametimeLiteralIndex,
+                            queryDayLiteralIndex
+                        )
+                    )
+                )
+                setNode(setValueIndex, nodes[setValueIndex].copy(children = intArrayOf(setWorldIndex)))
+                setNode(setDayLiteralIndex, nodes[setDayLiteralIndex].copy(children = intArrayOf(setWorldIndex)))
+                setNode(setNoonLiteralIndex, nodes[setNoonLiteralIndex].copy(children = intArrayOf(setWorldIndex)))
+                setNode(setNightLiteralIndex, nodes[setNightLiteralIndex].copy(children = intArrayOf(setWorldIndex)))
+                setNode(setMidnightLiteralIndex, nodes[setMidnightLiteralIndex].copy(children = intArrayOf(setWorldIndex)))
+                setNode(addValueIndex, nodes[addValueIndex].copy(children = intArrayOf(addWorldIndex)))
+                setNode(queryDaytimeLiteralIndex, nodes[queryDaytimeLiteralIndex].copy(children = intArrayOf(queryWorldIndex)))
+                setNode(queryGametimeLiteralIndex, nodes[queryGametimeLiteralIndex].copy(children = intArrayOf(queryWorldIndex)))
+                setNode(queryDayLiteralIndex, nodes[queryDayLiteralIndex].copy(children = intArrayOf(queryWorldIndex)))
+                rootChildren += literalIndex
+            }
+
             addTpSubtree("tp")
             addTpSubtree("teleport")
             addGamemodeSubtree()
             addOpSubtree()
+            addDeopSubtree()
+            addStopLiteral()
+            addTimeSubtree()
         }
         setNode(rootIndex, nodes[rootIndex].copy(children = rootChildren.toIntArray()))
 
@@ -527,6 +669,55 @@ object PlayPackets {
         return packet.toByteArray()
     }
 
+    fun entityEventPacket(entityId: Int, eventId: Int): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, ENTITY_EVENT_PACKET_ID)
+        out.writeInt(entityId)
+        out.writeByte(eventId)
+        return packet.toByteArray()
+    }
+
+    fun hurtAnimationPacket(entityId: Int, yaw: Float): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, HURT_ANIMATION_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, entityId)
+        out.writeFloat(yaw)
+        return packet.toByteArray()
+    }
+
+    fun damageEventPacket(entityId: Int, damageTypeId: Int): ByteArray {
+        val packet = ByteArrayOutputStream()
+        NetworkUtils.writeVarInt(packet, DAMAGE_EVENT_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, entityId)
+        NetworkUtils.writeVarInt(packet, damageTypeId)
+        NetworkUtils.writeVarInt(packet, 0)
+        NetworkUtils.writeVarInt(packet, 0)
+        packet.write(0)
+        return packet.toByteArray()
+    }
+
+    fun soundEntityPacket(
+        soundEventId: Int,
+        soundSourceId: Int,
+        entityId: Int,
+        volume: Float,
+        pitch: Float,
+        seed: Long
+    ): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, SOUND_ENTITY_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, soundEventId)
+        NetworkUtils.writeVarInt(packet, soundSourceId)
+        NetworkUtils.writeVarInt(packet, entityId)
+        out.writeFloat(volume)
+        out.writeFloat(pitch)
+        out.writeLong(seed)
+        return packet.toByteArray()
+    }
+
     fun blockChangePacket(x: Int, y: Int, z: Int, blockStateId: Int): ByteArray {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
@@ -661,6 +852,10 @@ object PlayPackets {
 
     fun itemEntityTypeId(): Int {
         return cachedItemEntityTypeId
+    }
+
+    fun fallingBlockEntityTypeId(): Int {
+        return cachedFallingBlockEntityTypeId
     }
 
     fun entityPositionSyncPacket(
@@ -880,6 +1075,47 @@ object PlayPackets {
         NetworkUtils.writeVarInt(packet, GAME_STATE_CHANGE_PACKET_ID)
         out.writeByte(3) // change game mode
         out.writeFloat(gameMode.coerceIn(0, 3).toFloat())
+        return packet.toByteArray()
+    }
+
+    fun gameStateImmediateRespawnPacket(enabled: Boolean): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, GAME_STATE_CHANGE_PACKET_ID)
+        out.writeByte(11)
+        out.writeFloat(if (enabled) 1f else 0f)
+        return packet.toByteArray()
+    }
+
+    fun respawnPacket(
+        worldKey: String,
+        gameMode: Int,
+        previousGameMode: Int = -1,
+        hashedSeed: Long = 0L,
+        isDebug: Boolean = false,
+        isFlat: Boolean = false,
+        portalCooldown: Int = 0,
+        seaLevel: Int = 63,
+        copyDataFlags: Int = 0
+    ): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, RESPAWN_PACKET_ID)
+        val dimensionTypeId = RegistryCodec.entryIndex("minecraft:dimension_type", worldKey)
+            ?: RegistryCodec.entryIndex("dimension_type", worldKey)
+            ?: RegistryCodec.entryIndex("minecraft:dimension_type", "minecraft:overworld")
+            ?: 0
+        NetworkUtils.writeVarInt(packet, dimensionTypeId)
+        NetworkUtils.writeString(packet, worldKey)
+        out.writeLong(hashedSeed)
+        out.writeByte(gameMode.coerceIn(0, 3))
+        out.writeByte(if (previousGameMode in 0..3) previousGameMode else -1)
+        out.writeBoolean(isDebug)
+        out.writeBoolean(isFlat)
+        out.writeBoolean(false) // Optional<GlobalPos> death location: absent
+        NetworkUtils.writeVarInt(packet, portalCooldown.coerceAtLeast(0))
+        NetworkUtils.writeVarInt(packet, seaLevel.coerceAtLeast(0))
+        out.writeByte(copyDataFlags and 0xFF)
         return packet.toByteArray()
     }
 

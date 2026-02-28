@@ -30,7 +30,12 @@ object WorldManager {
             } else {
                 { x, y, z -> lookupGenerator.blockStateAt(worldKey, x, y, z) }
             }
-            registerWorld(worldKey, seed, generator, baseProvider)
+            val cachedProvider: (Int, Int, Int) -> Int? = if (lookupGenerator == null) {
+                { _, _, _ -> null }
+            } else {
+                { x, y, z -> lookupGenerator.blockStateAtIfCached(worldKey, x, y, z) }
+            }
+            registerWorld(worldKey, seed, generator, baseProvider, cachedProvider)
         }
         defaultWorldKey = defaultWorld?.takeIf { worlds.containsKey(it) } ?: "minecraft:overworld"
         prewarmWorldsAsync()
@@ -56,9 +61,10 @@ object WorldManager {
         key: String,
         seed: Long,
         generator: WorldGenerator,
-        baseBlockStateProvider: (Int, Int, Int) -> Int = { _, _, _ -> AIR_STATE_ID }
+        baseBlockStateProvider: (Int, Int, Int) -> Int = { _, _, _ -> AIR_STATE_ID },
+        cachedBlockStateProvider: (Int, Int, Int) -> Int? = { _, _, _ -> null }
     ): World {
-        val world = World(key, seed, generator, baseBlockStateProvider)
+        val world = World(key, seed, generator, baseBlockStateProvider, cachedBlockStateProvider)
         worlds[key] = world
         return world
     }

@@ -1,6 +1,7 @@
 package org.macaroon3145.perf
 
 import org.macaroon3145.config.ServerConfig
+import org.macaroon3145.network.handler.PlayerSessionManager
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.roundToLong
 
@@ -23,6 +24,12 @@ object GameLoop {
             isDaemon = true
             start()
         }
+    }
+
+    fun stop() {
+        running = false
+        loopThread?.interrupt()
+        loopThread = null
     }
 
     private fun runLoop() {
@@ -65,7 +72,8 @@ object GameLoop {
             }
 
             val tickStartNanos = System.nanoTime()
-            TickTime.advanceAndGetDeltaSeconds(tickStartNanos)
+            val deltaSeconds = TickTime.advanceAndGetDeltaSeconds(tickStartNanos)
+            PlayerSessionManager.tick(deltaSeconds)
             val tickEndNanos = System.nanoTime()
             PerformanceMonitor.recordTick(tickStartNanos, tickEndNanos)
 

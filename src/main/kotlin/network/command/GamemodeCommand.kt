@@ -13,21 +13,43 @@ object GamemodeCommand : Command {
 
         val modeToken = args.getOrNull(0)
         if (modeToken.isNullOrEmpty()) {
-            if (sender == null) {
-                context.sendSourceWarnTranslation(null, "command.unknown.argument")
-            } else {
-                context.sendSourceTranslation(sender, "command.unknown.argument")
-            }
+            context.sendSourceTranslationWithContext(
+                sender,
+                "command.unknown.command",
+                "gamemode",
+                errorStart = "gamemode".length
+            )
             return
         }
 
         val mode = parseGamemode(modeToken)
         if (mode == null) {
-            if (sender == null) {
-                context.sendSourceWarnTranslation(null, "argument.gamemode.invalid", PlayPackets.ChatComponent.Text(modeToken))
-            } else {
-                context.sendSourceTranslation(sender, "argument.gamemode.invalid", PlayPackets.ChatComponent.Text(modeToken))
+            val input = buildString {
+                append("gamemode ").append(modeToken)
+                if (args.size > 1) {
+                    append(' ').append(args.drop(1).joinToString(" "))
+                }
             }
+            context.sendSourceTranslationWithContext(
+                sender,
+                "argument.gamemode.invalid",
+                input,
+                errorStart = "gamemode ".length,
+                PlayPackets.ChatComponent.Text(modeToken)
+            )
+            return
+        }
+        if (args.size > 2) {
+            val input = buildString {
+                append("gamemode ").append(args.joinToString(" "))
+            }
+            val targetToken = args[1]
+            context.sendSourceTranslationWithContext(
+                sender,
+                "command.unknown.command",
+                input,
+                errorStart = "gamemode $modeToken $targetToken ".length
+            )
             return
         }
 
@@ -38,7 +60,7 @@ object GamemodeCommand : Command {
             if (sender != null) {
                 listOf(sender)
             } else {
-                context.sendSourceWarnTranslation(null, "permissions.requires.player")
+                context.sendSourceWarnTranslation(null, "aerogel.console.gamemode.requires.target")
                 return
             }
         }
@@ -51,20 +73,29 @@ object GamemodeCommand : Command {
                 context.sendSourceTranslation(
                     sender,
                     "commands.gamemode.success.other",
-                    PlayPackets.ChatComponent.Text(target.profile.username),
+                    context.playerNameComponent(target),
                     modeComponent
                 )
-                context.sendTranslation(target, "gameMode.changed", modeComponent)
+                if (sender == null) {
+                    context.sendTranslationFromTerminal(
+                        target,
+                        "commands.gamemode.success.other",
+                        context.playerNameComponent(target),
+                        modeComponent
+                    )
+                } else {
+                    context.sendTranslation(target, "gameMode.changed", modeComponent)
+                }
             }
         }
     }
 
     private fun parseGamemode(token: String): Int? {
         return when (token.lowercase()) {
-            "0", "s", "survival" -> 0
-            "1", "c", "creative" -> 1
-            "2", "a", "adventure" -> 2
-            "3", "sp", "spectator" -> 3
+            "survival" -> 0
+            "creative" -> 1
+            "adventure" -> 2
+            "spectator" -> 3
             else -> null
         }
     }

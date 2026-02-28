@@ -6,8 +6,12 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
+import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.UUID
+import java.util.concurrent.locks.LockSupport
 
 data class SpawnPoint(
     val x: Double,
@@ -19,7 +23,8 @@ class World(
     val key: String,
     @Volatile var seed: Long,
     @Volatile var generator: WorldGenerator,
-    private val baseBlockStateProvider: (Int, Int, Int) -> Int
+    private val baseBlockStateProvider: (Int, Int, Int) -> Int,
+    private val cachedBlockStateProvider: (Int, Int, Int) -> Int? = { _, _, _ -> null }
 ) {
     data class BlockEntityData(
         val typeId: Int,
@@ -31,11 +36,23 @@ class World(
     private val changedBlocksByChunk = ConcurrentHashMap<ChunkPos, MutableSet<BlockPos>>()
     private val changedBlockEntities = ConcurrentHashMap<BlockPos, BlockEntityData>()
     private val changedBlockEntitiesByChunk = ConcurrentHashMap<ChunkPos, MutableSet<BlockPos>>()
+    private val chunkProcessingProfiler = ChunkProcessingProfiler()
     private val droppedItemSystem = DroppedItemSystem { x, y, z -> blockStateAt(x, y, z) }
-    private val inFlightChunkBuilds = ConcurrentHashMap<ChunkPos, CompletableFuture<GeneratedChunk>>()
+    private val fallingBlockSystem = FallingBlockSystem(
+        blockStateAt = { x, y, z -> blockStateAt(x, y, z) },
+        setBlockState = { x, y, z, stateId -> setBlockState(x, y, z, stateId) },
+        clearBlockEntity = { x, y, z -> setBlockEntity(x, y, z, null) }
+    )
+    private val inFlightChunkBuilds = ConcurrentHashMap<ChunkPos, InFlightChunkBuild>()
     @Volatile private var warmedSeed: Long = Long.MIN_VALUE
     private val warmupFutureRef = AtomicReference<CompletableFuture<Long>?>(null)
     private val cachedSpawnPointRef = AtomicReference<SpawnPoint?>(null)
+
+    private data class InFlightChunkBuild(
+        val future: CompletableFuture<GeneratedChunk>,
+        val activeWaiters: AtomicInteger = AtomicInteger(0),
+        val cancelRequested: AtomicBoolean = AtomicBoolean(false)
+    )
 
     fun registerEntityProcessor(processor: ChunkEntityProcessor) {
         entityProcessors.add(processor)
@@ -88,20 +105,35 @@ class World(
     }
 
     fun buildChunk(chunkPos: ChunkPos): GeneratedChunk {
-        return awaitChunkBuild(buildChunkAsync(chunkPos, directExecutor))
+        return buildChunk(chunkPos) { true }
+    }
+
+    fun buildChunk(chunkPos: ChunkPos, shouldKeepWaiting: () -> Boolean): GeneratedChunk {
+        val build = getOrCreateChunkBuild(chunkPos, directExecutor)
+        build.activeWaiters.incrementAndGet()
+        return try {
+            awaitChunkBuild(build, shouldKeepWaiting)
+        } finally {
+            releaseChunkBuildWaiter(build)
+        }
     }
 
     fun buildChunkAsync(chunkPos: ChunkPos, fallbackExecutor: Executor): CompletableFuture<GeneratedChunk> {
+        return getOrCreateChunkBuild(chunkPos, fallbackExecutor).future
+    }
+
+    private fun getOrCreateChunkBuild(chunkPos: ChunkPos, fallbackExecutor: Executor): InFlightChunkBuild {
         inFlightChunkBuilds[chunkPos]?.let { return it }
 
-        val created = CompletableFuture<GeneratedChunk>()
+        val created = InFlightChunkBuild(CompletableFuture<GeneratedChunk>())
         val existing = inFlightChunkBuilds.putIfAbsent(chunkPos, created)
         if (existing != null) return existing
 
         val context = ChunkGenerationContext(
             worldKey = key,
             seed = seed,
-            chunkPos = chunkPos
+            chunkPos = chunkPos,
+            isCancelled = { created.cancelRequested.get() }
         )
 
         val result = runCatching {
@@ -119,7 +151,7 @@ class World(
                 }
             }
         }.getOrElse { throwable ->
-            created.completeExceptionally(throwable)
+            created.future.completeExceptionally(throwable)
             inFlightChunkBuilds.remove(chunkPos, created)
             when (throwable) {
                 is RuntimeException -> throw throwable
@@ -130,9 +162,9 @@ class World(
 
         result.whenComplete { generated, error ->
             if (error != null) {
-                created.completeExceptionally(error)
+                created.future.completeExceptionally(error)
             } else {
-                created.complete(generated)
+                created.future.complete(generated)
             }
             inFlightChunkBuilds.remove(chunkPos, created)
         }
@@ -140,16 +172,33 @@ class World(
         return created
     }
 
-    private fun awaitChunkBuild(future: CompletableFuture<GeneratedChunk>): GeneratedChunk {
-        return try {
-            future.join()
-        } catch (e: CompletionException) {
-            val cause = e.cause ?: e
-            when (cause) {
-                is RuntimeException -> throw cause
-                is Error -> throw cause
-                else -> throw RuntimeException(cause)
+    private fun awaitChunkBuild(build: InFlightChunkBuild, shouldKeepWaiting: () -> Boolean): GeneratedChunk {
+        while (true) {
+            if (!shouldKeepWaiting()) {
+                throw CancellationException("Chunk build wait cancelled")
             }
+            val future = build.future
+            if (!future.isDone) {
+                LockSupport.parkNanos(200_000L)
+                continue
+            }
+            return try {
+                future.join()
+            } catch (e: CompletionException) {
+                val cause = e.cause ?: e
+                when (cause) {
+                    is RuntimeException -> throw cause
+                    is Error -> throw cause
+                    else -> throw RuntimeException(cause)
+                }
+            }
+        }
+    }
+
+    private fun releaseChunkBuildWaiter(build: InFlightChunkBuild) {
+        val remaining = build.activeWaiters.decrementAndGet()
+        if (remaining <= 0 && !build.future.isDone) {
+            build.cancelRequested.set(true)
         }
     }
 
@@ -159,6 +208,14 @@ class World(
         }
         val pos = BlockPos(x, y, z)
         return changedBlockStates[pos] ?: baseBlockStateProvider(x, y, z)
+    }
+
+    fun blockStateAtIfCached(x: Int, y: Int, z: Int): Int? {
+        if (changedBlockStates.isNotEmpty()) {
+            val changed = changedBlockStates[BlockPos(x, y, z)]
+            if (changed != null) return changed
+        }
+        return cachedBlockStateProvider(x, y, z)
     }
 
     fun setBlockState(x: Int, y: Int, z: Int, stateId: Int) {
@@ -263,6 +320,29 @@ class World(
         return droppedItemSystem.snapshot(entityId)
     }
 
+    fun beginChunkProcessingFrame(): ChunkProcessingProfiler.Frame {
+        return chunkProcessingProfiler.beginFrame()
+    }
+
+    fun recordChunkProcessingNanos(
+        frame: ChunkProcessingProfiler.Frame,
+        chunkPos: ChunkPos,
+        elapsedNanos: Long
+    ) {
+        frame.record(chunkPos, elapsedNanos)
+    }
+
+    fun finishChunkProcessingFrame(
+        frame: ChunkProcessingProfiler.Frame,
+        activeChunks: Set<ChunkPos>
+    ) {
+        chunkProcessingProfiler.finishFrame(frame, activeChunks)
+    }
+
+    fun chunkMspt(chunkX: Int, chunkZ: Int): Double {
+        return chunkProcessingProfiler.mspt(chunkX, chunkZ)
+    }
+
     fun requestDroppedItemUnstuckAtBlock(x: Int, y: Int, z: Int) {
         droppedItemSystem.requestUnstuckForBlock(x, y, z)
     }
@@ -271,8 +351,58 @@ class World(
         return droppedItemSystem.hasEntities()
     }
 
-    fun tickDroppedItems(deltaSeconds: Double, activeSimulationChunks: Set<ChunkPos>? = null): DroppedItemTickEvents {
-        return droppedItemSystem.tick(deltaSeconds, activeSimulationChunks)
+    fun spawnFallingBlock(
+        entityId: Int,
+        blockStateId: Int,
+        x: Double,
+        y: Double,
+        z: Double,
+        vx: Double = 0.0,
+        vy: Double = 0.0,
+        vz: Double = 0.0
+    ): Boolean {
+        return fallingBlockSystem.spawn(
+            entityId = entityId,
+            blockStateId = blockStateId,
+            x = x,
+            y = y,
+            z = z,
+            vx = vx,
+            vy = vy,
+            vz = vz
+        )
+    }
+
+    fun hasFallingBlocks(): Boolean {
+        return fallingBlockSystem.hasEntities()
+    }
+
+    fun fallingBlockSnapshot(entityId: Int): FallingBlockSnapshot? {
+        return fallingBlockSystem.snapshot(entityId)
+    }
+
+    fun fallingBlocksInChunk(chunkX: Int, chunkZ: Int): List<FallingBlockSnapshot> {
+        return fallingBlockSystem.snapshotsInChunk(chunkX, chunkZ)
+    }
+
+    fun fallingBlockEntityIdsInChunk(chunkX: Int, chunkZ: Int): IntArray {
+        return fallingBlockSystem.entityIdsInChunk(chunkX, chunkZ)
+    }
+
+    fun tickFallingBlocks(
+        deltaSeconds: Double,
+        activeSimulationChunks: Set<ChunkPos>? = null,
+        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
+    ): FallingBlockTickEvents {
+        return fallingBlockSystem.tick(deltaSeconds, activeSimulationChunks, chunkTimeRecorder)
+    }
+
+    fun tickDroppedItems(
+        deltaSeconds: Double,
+        activeSimulationChunks: Set<ChunkPos>? = null,
+        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
+    ): DroppedItemTickEvents {
+        return droppedItemSystem.tick(deltaSeconds, activeSimulationChunks, chunkTimeRecorder)
     }
 
     fun spawnPointForPlayer(_playerUuid: UUID): SpawnPoint {

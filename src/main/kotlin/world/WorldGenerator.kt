@@ -16,6 +16,8 @@ interface WarmupWorldGenerator {
 
 interface BlockStateLookupWorldGenerator {
     fun blockStateAt(worldKey: String, x: Int, y: Int, z: Int): Int
+
+    fun blockStateAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? = null
 }
 
 fun interface ChunkEntityProcessor {

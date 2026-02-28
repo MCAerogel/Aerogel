@@ -1,0 +1,24 @@
+{
+  "values": [
+    "#minecraft:replaceable",
+    "#minecraft:flowers",
+    "#minecraft:small_flowers",
+    "#minecraft:crops",
+    "#minecraft:bee_growables",
+    "minecraft:air",
+    "minecraft:cave_air",
+    "minecraft:void_air",
+    "minecraft:water",
+    "minecraft:lava",
+    "minecraft:bubble_column",
+    "minecraft:seagrass",
+    "minecraft:tall_seagrass",
+    "minecraft:kelp",
+    "minecraft:kelp_plant",
+    "minecraft:vine",
+    "minecraft:glow_lichen",
+    "minecraft:fire",
+    "minecraft:soul_fire",
+    "minecraft:snow"
+  ]
+}

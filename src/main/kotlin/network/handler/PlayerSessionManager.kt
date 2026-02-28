@@ -3,8 +3,14 @@ package org.macaroon3145.network.handler
 import io.netty.buffer.Unpooled
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelId
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.DebugConsole
+import org.macaroon3145.ServerLifecycle
 import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.command.CommandContext
 import org.macaroon3145.network.command.CommandDispatcher
@@ -18,21 +24,33 @@ import org.macaroon3145.network.packet.PlayerSample
 import org.macaroon3145.world.BlockPos
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.DroppedItemSnapshot
+import org.macaroon3145.world.FallingBlockSnapshot
+import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
+import org.macaroon3145.world.VanillaMiningRules
 import org.macaroon3145.world.WorldManager
+import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
 import java.util.ArrayList
 import java.util.HashSet
 import java.io.ByteArrayOutputStream
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.roundToLong
+import org.slf4j.LoggerFactory
 
 data class DroppedItemTrackerState(
     var encodedX4096: Long,
@@ -49,6 +67,7 @@ data class DroppedItemTrackerState(
 data class PlayerSession(
     val channelId: ChannelId,
     val profile: ConnectionProfile,
+    @Volatile var locale: String,
     val worldKey: String,
     val entityId: Int,
     val skinPartsMask: Int,
@@ -56,12 +75,21 @@ data class PlayerSession(
     @Volatile var x: Double,
     @Volatile var y: Double,
     @Volatile var z: Double,
+    @Volatile var velocityX: Double,
+    @Volatile var velocityY: Double,
+    @Volatile var velocityZ: Double,
+    @Volatile var lastHorizontalMovementSq: Double,
     @Volatile var encodedX4096: Long,
     @Volatile var encodedY4096: Long,
     @Volatile var encodedZ4096: Long,
     @Volatile var yaw: Float,
     @Volatile var pitch: Float,
     @Volatile var onGround: Boolean,
+    @Volatile var health: Float,
+    @Volatile var food: Int,
+    @Volatile var saturation: Float,
+    @Volatile var fallDistance: Double,
+    @Volatile var dead: Boolean,
     @Volatile var sneaking: Boolean,
     @Volatile var sprinting: Boolean,
     @Volatile var swimming: Boolean,
@@ -85,13 +113,18 @@ data class PlayerSession(
     @Volatile var chunkRadius: Int,
     @Volatile var centerChunkX: Int,
     @Volatile var centerChunkZ: Int,
+    val targetChunks: MutableSet<ChunkPos>,
     val loadedChunks: MutableSet<ChunkPos>,
     val visibleDroppedItemEntityIds: MutableSet<Int>,
     val droppedItemTrackerStates: MutableMap<Int, DroppedItemTrackerState>,
+    val visibleFallingBlockEntityIds: MutableSet<Int>,
+    val fallingBlockTrackerStates: MutableMap<Int, DroppedItemTrackerState>,
     val generatingChunks: MutableSet<ChunkPos>,
     val chunkStreamVersion: AtomicInteger,
+    val nextTeleportId: AtomicInteger,
     val chunkStreamInFlight: AtomicBoolean,
-    val pendingChunkTarget: AtomicReference<ChunkStreamTarget?>
+    val pendingChunkTarget: AtomicReference<ChunkStreamTarget?>,
+    @Volatile var lastChunkMsptActionBarAtNanos: Long
 )
 
 data class ChunkStreamTarget(
@@ -101,6 +134,12 @@ data class ChunkStreamTarget(
     val radius: Int
 )
 
+private data class WorldTimeState(
+    var worldAgeTicks: Double,
+    var timeOfDayTicks: Double,
+    var broadcastAccumulatorSeconds: Double
+)
+
 data class CommandSuggestionWindow(
     val start: Int,
     val length: Int,
@@ -108,9 +147,12 @@ data class CommandSuggestionWindow(
 )
 
 object PlayerSessionManager {
+    private val logger = LoggerFactory.getLogger(PlayerSessionManager::class.java)
+    private val gamemodeCompletionCandidates = listOf("survival", "creative", "adventure", "spectator")
     private val nextEntityId = AtomicInteger(1)
     private val sessions = ConcurrentHashMap<ChannelId, PlayerSession>()
     private val contexts = ConcurrentHashMap<ChannelId, ChannelHandlerContext>()
+    private val worldTimes = ConcurrentHashMap<String, WorldTimeState>()
     private val droppedItemDispatchRunning = AtomicBoolean(false)
     private val commandExecutor = Executors.newFixedThreadPool(2) { runnable ->
         Thread(runnable, "aerogel-command-worker").apply {
@@ -118,6 +160,9 @@ object PlayerSessionManager {
             priority = Thread.NORM_PRIORITY - 1
         }
     }
+    private val operatorFilePath: Path = Path.of("op.txt")
+    private val operatorFileLock = Any()
+    private val persistedOperatorUuids = ConcurrentHashMap.newKeySet<UUID>()
     private val operatorUuids = ConcurrentHashMap.newKeySet<java.util.UUID>()
     private val commandDispatcher = CommandDispatcher.default()
     private val commandContext = object : CommandContext {
@@ -131,6 +176,13 @@ object PlayerSessionManager {
             PlayerSessionManager.sendSystemTranslation(target, key, color = "red", *args)
         override fun sendUnknownCommandWithContext(target: PlayerSession?, input: String) =
             PlayerSessionManager.sendUnknownCommandWithContext(target, input)
+        override fun sendSourceTranslationWithContext(
+            target: PlayerSession?,
+            key: String,
+            input: String,
+            errorStart: Int,
+            vararg args: PlayPackets.ChatComponent
+        ) = PlayerSessionManager.sendSourceTranslationWithContext(target, key, input, errorStart, *args)
         override fun sendSourceTranslation(target: PlayerSession?, key: String, vararg args: PlayPackets.ChatComponent) {
             if (target == null) {
                 val renderedArgs = args.map { ServerI18n.componentToText(it) }
@@ -158,6 +210,14 @@ object PlayerSessionManager {
         override fun sendTranslationFromTerminal(target: PlayerSession, key: String, vararg args: PlayPackets.ChatComponent) {
             PlayerSessionManager.sendTerminalSourcedTranslation(target, key, *args)
         }
+        override fun sendAdminTranslation(
+            target: PlayerSession,
+            source: PlayPackets.ChatComponent,
+            key: String,
+            vararg args: PlayPackets.ChatComponent
+        ) {
+            PlayerSessionManager.sendAdminSourcedTranslation(target, source, key, *args)
+        }
         override fun sourceWorldKey(target: PlayerSession?): String = target?.worldKey ?: (WorldManager.defaultWorld().key)
         override fun sourceX(target: PlayerSession?): Double = target?.x ?: 0.0
         override fun sourceY(target: PlayerSession?): Double = target?.y ?: 64.0
@@ -165,20 +225,57 @@ object PlayerSessionManager {
         override fun onlinePlayers(): List<PlayerSession> = sessions.values.toList()
         override fun onlinePlayersInWorld(worldKey: String): List<PlayerSession> = PlayerSessionManager.onlinePlayersInWorld(worldKey)
         override fun findOnlinePlayer(name: String): PlayerSession? = PlayerSessionManager.findOnlinePlayer(name)
+        override fun findOnlinePlayer(uuid: UUID): PlayerSession? = PlayerSessionManager.findOnlinePlayer(uuid)
         override fun isOperator(session: PlayerSession?): Boolean = PlayerSessionManager.isOperator(session)
         override fun canUseOpCommand(sender: PlayerSession?): Boolean = PlayerSessionManager.canRunOpCommand(sender)
         override fun grantOperator(target: PlayerSession): Boolean = PlayerSessionManager.grantOperatorAndRefreshCommands(target)
+        override fun revokeOperator(uuid: UUID): Boolean = PlayerSessionManager.revokeOperatorAndRefreshCommands(uuid)
+        override fun playerNameComponent(target: PlayerSession): PlayPackets.ChatComponent = playerNameComponent(target.profile)
         override fun teleport(target: PlayerSession, x: Double, y: Double, z: Double, yaw: Float?, pitch: Float?) =
             PlayerSessionManager.teleportPlayer(target, x, y, z, yaw, pitch)
         override fun setGamemode(target: PlayerSession, mode: Int) = PlayerSessionManager.setPlayerGamemode(target, mode)
+        override fun worldKeys(): List<String> = WorldManager.allWorlds().map { it.key }.sortedWith(String.CASE_INSENSITIVE_ORDER)
+        override fun worldTimeSnapshot(worldKey: String): Pair<Long, Long>? = PlayerSessionManager.worldTimeSnapshotOrNull(worldKey)
+        override fun setWorldTime(worldKey: String, timeOfDayTicks: Long): Pair<Long, Long>? =
+            PlayerSessionManager.setWorldTimeAndBroadcast(worldKey, timeOfDayTicks)
+        override fun addWorldTime(worldKey: String, deltaTicks: Long): Pair<Long, Long>? =
+            PlayerSessionManager.addWorldTimeAndBroadcast(worldKey, deltaTicks)
+        override fun stopServer(): Boolean = ServerLifecycle.stopServer()
     }
     @Volatile
     private var droppedItemDispatchThread: Thread? = null
+    private val itemKeyById: List<String> by lazy {
+        val resource = PlayerSessionManager::class.java.classLoader
+            .getResourceAsStream("item-id-map-1.21.11.json")
+            ?: return@lazy emptyList()
+        val root = resource.bufferedReader().use { json.parseToJsonElement(it.readText()).jsonObject }
+        val entries = root["entries"]?.jsonObject ?: return@lazy emptyList()
+        val maxId = entries.values.maxOfOrNull { it.jsonPrimitive.intOrNull ?: -1 } ?: -1
+        if (maxId < 0) return@lazy emptyList()
+        val out = MutableList(maxId + 1) { "" }
+        for ((itemKey, idElement) in entries) {
+            val itemId = idElement.jsonPrimitive.intOrNull ?: continue
+            if (itemId !in out.indices) continue
+            out[itemId] = itemKey
+        }
+        out
+    }
     private val creativeNoBreakItemIds: Set<Int> by lazy {
         val itemRegistry = RegistryCodec.allRegistries().firstOrNull { it.id == "minecraft:item" } ?: return@lazy emptySet()
         itemRegistry.entries.withIndex()
             .filter { (_, entry) -> entry.key.endsWith("_sword") }
             .mapTo(HashSet()) { it.index }
+    }
+
+    private data class PickedBlockData(
+        val stateId: Int,
+        val itemId: Int,
+        val blockEntityTypeId: Int,
+        val blockEntityNbtPayload: ByteArray?
+    )
+
+    init {
+        loadPersistedOperators()
     }
 
     data class JoinResult(
@@ -207,6 +304,7 @@ object PlayerSessionManager {
     fun prepareJoin(
         ctx: ChannelHandlerContext,
         profile: ConnectionProfile,
+        locale: String,
         worldKey: String,
         skinPartsMask: Int,
         requestedViewDistance: Int,
@@ -220,6 +318,7 @@ object PlayerSessionManager {
         val session = PlayerSession(
             channelId = ctx.channel().id(),
             profile = profile,
+            locale = locale,
             worldKey = worldKey,
             entityId = allocateEntityId(),
             skinPartsMask = skinPartsMask,
@@ -227,12 +326,21 @@ object PlayerSessionManager {
             x = spawnX,
             y = spawnY,
             z = spawnZ,
+            velocityX = 0.0,
+            velocityY = 0.0,
+            velocityZ = 0.0,
+            lastHorizontalMovementSq = 0.0,
             encodedX4096 = encodeRelativePosition4096(spawnX),
             encodedY4096 = encodeRelativePosition4096(spawnY),
             encodedZ4096 = encodeRelativePosition4096(spawnZ),
             yaw = 0f,
             pitch = 0f,
             onGround = true,
+            health = MAX_PLAYER_HEALTH,
+            food = DEFAULT_PLAYER_FOOD,
+            saturation = DEFAULT_PLAYER_SATURATION,
+            fallDistance = 0.0,
+            dead = false,
             sneaking = false,
             sprinting = false,
             swimming = false,
@@ -256,14 +364,22 @@ object PlayerSessionManager {
             chunkRadius = effectiveRadius,
             centerChunkX = spawnChunkX,
             centerChunkZ = spawnChunkZ,
+            targetChunks = ConcurrentHashMap.newKeySet(),
             loadedChunks = ConcurrentHashMap.newKeySet(),
             visibleDroppedItemEntityIds = ConcurrentHashMap.newKeySet(),
             droppedItemTrackerStates = ConcurrentHashMap(),
+            visibleFallingBlockEntityIds = ConcurrentHashMap.newKeySet(),
+            fallingBlockTrackerStates = ConcurrentHashMap(),
             generatingChunks = ConcurrentHashMap.newKeySet(),
             chunkStreamVersion = AtomicInteger(0),
+            nextTeleportId = AtomicInteger(2),
             chunkStreamInFlight = AtomicBoolean(false),
-            pendingChunkTarget = AtomicReference(null)
+            pendingChunkTarget = AtomicReference(null),
+            lastChunkMsptActionBarAtNanos = 0L
         )
+        if (persistedOperatorUuids.contains(session.profile.uuid)) {
+            operatorUuids.add(profile.uuid)
+        }
 
         val existing = sessions.values.filter { it.worldKey == worldKey && it.channelId != session.channelId }
         sessions[session.channelId] = session
@@ -358,7 +474,96 @@ object PlayerSessionManager {
     }
 
     fun tick(deltaSeconds: Double) {
-        // Dropped-item processing runs in its own async dispatch thread.
+        if (deltaSeconds <= 0.0) return
+        advanceAndBroadcastWorldTime(deltaSeconds)
+    }
+
+    fun worldTimeSnapshot(worldKey: String): Pair<Long, Long> {
+        val state = worldTimes.computeIfAbsent(worldKey) {
+            WorldTimeState(
+                worldAgeTicks = INITIAL_WORLD_TIME_TICKS,
+                timeOfDayTicks = INITIAL_WORLD_TIME_TICKS,
+                broadcastAccumulatorSeconds = 0.0
+            )
+        }
+        synchronized(state) {
+            return state.worldAgeTicks.toLong() to state.timeOfDayTicks.toLong()
+        }
+    }
+
+    private fun worldTimeSnapshotOrNull(worldKey: String): Pair<Long, Long>? {
+        if (WorldManager.world(worldKey) == null) return null
+        val state = worldTimes.computeIfAbsent(worldKey) {
+            WorldTimeState(
+                worldAgeTicks = INITIAL_WORLD_TIME_TICKS,
+                timeOfDayTicks = INITIAL_WORLD_TIME_TICKS,
+                broadcastAccumulatorSeconds = 0.0
+            )
+        }
+        synchronized(state) {
+            return state.worldAgeTicks.toLong() to state.timeOfDayTicks.toLong()
+        }
+    }
+
+    private fun setWorldTimeAndBroadcast(worldKey: String, timeOfDayTicks: Long): Pair<Long, Long>? {
+        if (WorldManager.world(worldKey) == null) return null
+        val state = worldTimes.computeIfAbsent(worldKey) {
+            WorldTimeState(
+                worldAgeTicks = INITIAL_WORLD_TIME_TICKS,
+                timeOfDayTicks = INITIAL_WORLD_TIME_TICKS,
+                broadcastAccumulatorSeconds = 0.0
+            )
+        }
+        val worldAge: Long
+        val timeOfDay: Long
+        synchronized(state) {
+            state.timeOfDayTicks = normalizeTimeOfDayTicks(timeOfDayTicks.toDouble())
+            state.broadcastAccumulatorSeconds = 0.0
+            worldAge = state.worldAgeTicks.toLong()
+            timeOfDay = state.timeOfDayTicks.toLong()
+        }
+        broadcastWorldTimePacket(worldKey, worldAge, timeOfDay)
+        return worldAge to timeOfDay
+    }
+
+    private fun addWorldTimeAndBroadcast(worldKey: String, deltaTicks: Long): Pair<Long, Long>? {
+        if (WorldManager.world(worldKey) == null) return null
+        val state = worldTimes.computeIfAbsent(worldKey) {
+            WorldTimeState(
+                worldAgeTicks = INITIAL_WORLD_TIME_TICKS,
+                timeOfDayTicks = INITIAL_WORLD_TIME_TICKS,
+                broadcastAccumulatorSeconds = 0.0
+            )
+        }
+        val worldAge: Long
+        val timeOfDay: Long
+        synchronized(state) {
+            state.worldAgeTicks = (state.worldAgeTicks + deltaTicks).coerceAtLeast(0.0)
+            state.timeOfDayTicks = normalizeTimeOfDayTicks(state.timeOfDayTicks + deltaTicks)
+            state.broadcastAccumulatorSeconds = 0.0
+            worldAge = state.worldAgeTicks.toLong()
+            timeOfDay = state.timeOfDayTicks.toLong()
+        }
+        broadcastWorldTimePacket(worldKey, worldAge, timeOfDay)
+        return worldAge to timeOfDay
+    }
+
+    private fun normalizeTimeOfDayTicks(rawTicks: Double): Double {
+        var normalized = rawTicks % MINECRAFT_DAY_TICKS
+        if (normalized < 0.0) {
+            normalized += MINECRAFT_DAY_TICKS
+        }
+        return normalized
+    }
+
+    private fun broadcastWorldTimePacket(worldKey: String, worldAge: Long, timeOfDay: Long) {
+        val packet = PlayPackets.timeUpdatePacket(worldAge = worldAge, timeOfDay = timeOfDay, tickDayTime = true)
+        for ((id, session) in sessions) {
+            if (session.worldKey != worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.writeAndFlush(packet)
+        }
     }
 
     private fun drainDroppedItemEvents(deltaSeconds: Double) {
@@ -378,27 +583,54 @@ object PlayerSessionManager {
                 .computeIfAbsent(session.worldKey) { ArrayList() }
                 .add(session)
         }
+        updateRetainedBaseWorldChunks(sessionsByWorld)
 
-        val ready = ArrayList<Pair<org.macaroon3145.world.World, org.macaroon3145.world.DroppedItemTickEvents>>()
+        data class WorldPhysicsEvents(
+            val world: org.macaroon3145.world.World,
+            val droppedItems: org.macaroon3145.world.DroppedItemTickEvents,
+            val fallingBlocks: org.macaroon3145.world.FallingBlockTickEvents
+        )
+        val ready = ArrayList<WorldPhysicsEvents>()
         for (world in worlds) {
-            if (!world.hasDroppedItems()) continue
             val worldSessions = sessionsByWorld[world.key]
             if (worldSessions.isNullOrEmpty()) continue
             val activeSimulationChunks = collectActiveSimulationChunks(worldSessions)
             if (activeSimulationChunks.isEmpty()) continue
-            val events = world.tickDroppedItems(physicsDeltaSeconds, activeSimulationChunks)
-            ready.add(world to events)
+            val chunkProcessingFrame = world.beginChunkProcessingFrame()
+            val droppedEvents = if (world.hasDroppedItems()) {
+                world.tickDroppedItems(
+                    physicsDeltaSeconds,
+                    activeSimulationChunks
+                ) { chunkPos, elapsedNanos ->
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                }
+            } else {
+                org.macaroon3145.world.DroppedItemTickEvents(emptyList(), emptyList(), emptyList())
+            }
+            val fallingEvents = if (world.hasFallingBlocks()) {
+                world.tickFallingBlocks(
+                    physicsDeltaSeconds,
+                    activeSimulationChunks
+                ) { chunkPos, elapsedNanos ->
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                }
+            } else {
+                org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+            }
+            world.finishChunkProcessingFrame(chunkProcessingFrame, activeSimulationChunks)
+            ready.add(WorldPhysicsEvents(world, droppedEvents, fallingEvents))
         }
-        if (ready.isEmpty()) return
-
-        for ((world, events) in ready) {
+        for (physics in ready) {
+            val world = physics.world
+            val droppedEvents = physics.droppedItems
+            val fallingEvents = physics.fallingBlocks
             val worldSessions = sessionsByWorld[world.key] ?: continue
             if (worldSessions.isEmpty()) continue
 
             val outboundByContext = HashMap<ChannelHandlerContext, MutableList<ByteArray>>()
             val pickedRemovals = collectDroppedItemPickups(world, worldSessions, outboundByContext)
 
-            for (removed in events.removed) {
+            for (removed in droppedEvents.removed) {
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
                     if (!session.visibleDroppedItemEntityIds.remove(removed.entityId)) continue
@@ -428,7 +660,7 @@ object PlayerSessionManager {
                 }
             }
 
-            for (snapshot in events.spawned) {
+            for (snapshot in droppedEvents.spawned) {
                 val current = world.droppedItemSnapshot(snapshot.entityId) ?: continue
                 syncDroppedItemSnapshot(
                     snapshot = current,
@@ -438,9 +670,48 @@ object PlayerSessionManager {
                     deltaSeconds = deltaSeconds
                 )
             }
-            for (snapshot in events.updated) {
+            for (snapshot in droppedEvents.updated) {
                 val current = world.droppedItemSnapshot(snapshot.entityId) ?: continue
                 syncDroppedItemSnapshot(
+                    snapshot = current,
+                    worldSessions = worldSessions,
+                    outboundByContext = outboundByContext,
+                    sendPositionUpdate = true,
+                    deltaSeconds = deltaSeconds
+                )
+            }
+            for (removed in fallingEvents.removed) {
+                val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
+                for (session in worldSessions) {
+                    if (!session.visibleFallingBlockEntityIds.remove(removed.entityId)) continue
+                    session.fallingBlockTrackerStates.remove(removed.entityId)
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+                }
+            }
+            for (landed in fallingEvents.landed) {
+                val packet = PlayPackets.blockChangePacket(landed.blockX, landed.blockY, landed.blockZ, landed.blockStateId)
+                for (session in worldSessions) {
+                    if (!session.loadedChunks.contains(landed.chunkPos)) continue
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+                }
+            }
+            for (snapshot in fallingEvents.spawned) {
+                val current = world.fallingBlockSnapshot(snapshot.entityId) ?: continue
+                syncFallingBlockSnapshot(
+                    snapshot = current,
+                    worldSessions = worldSessions,
+                    outboundByContext = outboundByContext,
+                    sendPositionUpdate = false,
+                    deltaSeconds = deltaSeconds
+                )
+            }
+            for (snapshot in fallingEvents.updated) {
+                val current = world.fallingBlockSnapshot(snapshot.entityId) ?: continue
+                syncFallingBlockSnapshot(
                     snapshot = current,
                     worldSessions = worldSessions,
                     outboundByContext = outboundByContext,
@@ -461,6 +732,27 @@ object PlayerSessionManager {
                 }
             }
         }
+    }
+
+    private fun updateRetainedBaseWorldChunks(sessionsByWorld: Map<String, List<PlayerSession>>) {
+        for ((worldKey, worldSessions) in sessionsByWorld) {
+            val retained = HashSet<ChunkPos>()
+            for (session in worldSessions) {
+                retained.addAll(session.targetChunks)
+                retained.addAll(session.loadedChunks)
+            }
+            FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, retained)
+        }
+    }
+
+    private fun updateRetainedBaseWorldChunksForWorld(worldKey: String) {
+        val retained = HashSet<ChunkPos>()
+        for (session in sessions.values) {
+            if (session.worldKey != worldKey) continue
+            retained.addAll(session.targetChunks)
+            retained.addAll(session.loadedChunks)
+        }
+        FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, retained)
     }
 
     private fun collectActiveSimulationChunks(worldSessions: List<PlayerSession>): Set<ChunkPos> {
@@ -495,7 +787,6 @@ object PlayerSessionManager {
         var uncapped = false
         var nextDeadline = System.nanoTime()
         var lastTickNanos = System.nanoTime()
-        var targetDeltaSeconds = tickIntervalNanos / 1_000_000_000.0
         while (droppedItemDispatchRunning.get()) {
             val configuredMaxTps = ServerConfig.maxTps
             if (configuredMaxTps != lastConfiguredMaxTps) {
@@ -507,7 +798,6 @@ object PlayerSessionManager {
                     tickIntervalNanos = (1_000_000_000.0 / configuredMaxTps)
                         .roundToLong()
                         .coerceAtLeast(1L)
-                    targetDeltaSeconds = tickIntervalNanos / 1_000_000_000.0
                     nextDeadline = System.nanoTime() + tickIntervalNanos
                 }
             }
@@ -533,18 +823,10 @@ object PlayerSessionManager {
                 .coerceAtMost(MAX_DROPPED_ITEM_DELTA_SECONDS)
             lastTickNanos = now
             try {
-                val steps = if (uncapped) {
-                    1
-                } else {
-                    kotlin.math.ceil(deltaSeconds / targetDeltaSeconds)
-                        .toInt()
-                        .coerceAtLeast(1)
-                        .coerceAtMost(MAX_DROPPED_ITEM_CATCH_UP_TICKS)
-                }
-                val stepDelta = (deltaSeconds / steps).coerceAtMost(MAX_DROPPED_ITEM_DELTA_SECONDS)
-                repeat(steps) {
-                    drainDroppedItemEvents(stepDelta)
-                }
+                // Keep physics packet cadence stable: avoid bursty back-to-back substep dispatch
+                // that can amplify client-side arrival jitter under catch-up.
+                drainDroppedItemEvents(deltaSeconds)
+                maybeSendChunkMsptActionBar(now)
             } catch (_: Throwable) {
                 // Keep dispatcher alive even if one cycle fails.
             }
@@ -555,6 +837,37 @@ object PlayerSessionManager {
                     nextDeadline = System.nanoTime() + tickIntervalNanos
                 }
             }
+        }
+    }
+
+    private fun advanceAndBroadcastWorldTime(deltaSeconds: Double) {
+        val worlds = WorldManager.allWorlds()
+        if (worlds.isEmpty()) return
+        val tickDelta = deltaSeconds * MINECRAFT_TICKS_PER_SECOND
+        for (world in worlds) {
+            val state = worldTimes.computeIfAbsent(world.key) {
+                WorldTimeState(
+                    worldAgeTicks = INITIAL_WORLD_TIME_TICKS,
+                    timeOfDayTicks = INITIAL_WORLD_TIME_TICKS,
+                    broadcastAccumulatorSeconds = 0.0
+                )
+            }
+            var shouldBroadcast = false
+            var worldAge = 0L
+            var timeOfDay = 0L
+            synchronized(state) {
+                state.worldAgeTicks += tickDelta
+                state.timeOfDayTicks = normalizeTimeOfDayTicks(state.timeOfDayTicks + tickDelta)
+                state.broadcastAccumulatorSeconds += deltaSeconds
+                if (state.broadcastAccumulatorSeconds >= WORLD_TIME_BROADCAST_INTERVAL_SECONDS) {
+                    state.broadcastAccumulatorSeconds -= WORLD_TIME_BROADCAST_INTERVAL_SECONDS
+                    shouldBroadcast = true
+                    worldAge = state.worldAgeTicks.toLong()
+                    timeOfDay = state.timeOfDayTicks.toLong()
+                }
+            }
+            if (!shouldBroadcast) continue
+            broadcastWorldTimePacket(world.key, worldAge, timeOfDay)
         }
     }
 
@@ -589,12 +902,24 @@ object PlayerSessionManager {
         val session = sessions[channelId] ?: return
         val ctx = contexts[channelId]
         val world = WorldManager.world(session.worldKey)
+        val previousX = session.x
+        val previousY = session.y
+        val previousZ = session.z
+        val wasOnGround = session.onGround
+        val deltaY = y - previousY
+        val deltaX = x - previousX
+        val deltaZ = z - previousZ
+        session.velocityX = deltaX
+        session.velocityY = deltaY
+        session.velocityZ = deltaZ
+        session.lastHorizontalMovementSq = deltaX * deltaX + deltaZ * deltaZ
         session.x = x
         session.y = y
         session.z = z
         session.yaw = yaw
         session.pitch = pitch
         session.onGround = onGround
+        updateFallDistance(session, wasOnGround, onGround, deltaY)
 
         val encodedX = encodeRelativePosition4096(x)
         val encodedY = encodeRelativePosition4096(y)
@@ -664,11 +989,453 @@ object PlayerSessionManager {
         val currentChunkX = ChunkStreamingService.chunkXFromBlockX(x)
         val currentChunkZ = ChunkStreamingService.chunkZFromBlockZ(z)
         if (currentChunkX != session.centerChunkX || currentChunkZ != session.centerChunkZ) {
+            session.centerChunkX = currentChunkX
+            session.centerChunkZ = currentChunkZ
             if (ctx != null && world != null) {
                 requestChunkStream(session, ctx, world, currentChunkX, currentChunkZ, session.chunkRadius)
             }
-            session.centerChunkX = currentChunkX
-            session.centerChunkZ = currentChunkZ
+        }
+
+        if (!session.dead && session.gameMode == GAME_MODE_SURVIVAL && wasOnGround != onGround && onGround) {
+            applyLandingDamage(session)
+        }
+    }
+
+    private fun updateFallDistance(session: PlayerSession, wasOnGround: Boolean, onGround: Boolean, deltaY: Double) {
+        if (session.gameMode != GAME_MODE_SURVIVAL || session.dead) {
+            session.fallDistance = 0.0
+            return
+        }
+        if (onGround) {
+            if (wasOnGround) {
+                session.fallDistance = 0.0
+            }
+            return
+        }
+        when {
+            deltaY < 0.0 -> session.fallDistance += -deltaY
+            deltaY > 0.0 -> session.fallDistance = 0.0
+            wasOnGround -> session.fallDistance = 0.0
+        }
+    }
+
+    private fun applyLandingDamage(session: PlayerSession) {
+        val accumulatedFallDistance = session.fallDistance
+        session.fallDistance = 0.0
+        val damage = ceil(accumulatedFallDistance - SAFE_FALL_DISTANCE_BLOCKS).toInt()
+        if (damage > 0) {
+            damagePlayer(
+                session = session,
+                amount = damage.toFloat(),
+                damageTypeId = FALL_DAMAGE_TYPE_ID,
+                hurtSoundId = PLAYER_SMALL_FALL_SOUND_ID,
+                bigHurtSoundId = PLAYER_BIG_FALL_SOUND_ID,
+                deathMessage = PlayPackets.ChatComponent.Translate(
+                    key = "death.fell.accident.generic",
+                    args = listOf(playerNameComponent(session.profile))
+                )
+            )
+        }
+    }
+
+    fun handlePlayerAttackEntity(attackerChannelId: ChannelId, targetEntityId: Int) {
+        val attacker = sessions[attackerChannelId] ?: return
+        if (attacker.dead) return
+        if (attacker.gameMode == GAME_MODE_SPECTATOR) return
+
+        val target = sessions.values.firstOrNull { it.entityId == targetEntityId } ?: return
+        if (target.channelId == attackerChannelId) return
+        if (target.worldKey != attacker.worldKey) return
+        if (target.dead) return
+        if (target.gameMode == GAME_MODE_SPECTATOR) return
+        if (target.gameMode == GAME_MODE_CREATIVE) return
+
+        val dx = attacker.x - target.x
+        val dy = attacker.y - target.y
+        val dz = attacker.z - target.z
+        val distanceSq = dx * dx + dy * dy + dz * dz
+        if (distanceSq > MAX_PLAYER_MELEE_REACH_SQ) return
+
+        val attackStrengthScale = 1.0f
+        val strongAttack = attackStrengthScale > VANILLA_STRONG_ATTACK_THRESHOLD
+        val knockbackAttack = attacker.sprinting && strongAttack
+        val criticalAttack = strongAttack && canCriticalAttack(attacker, target)
+        val sweepAttack = canSweepAttack(attacker, strongAttack, criticalAttack, knockbackAttack)
+        var damage = meleeAttackDamage(attacker).coerceAtLeast(1.0f)
+        if (criticalAttack) {
+            damage *= VANILLA_CRITICAL_DAMAGE_MULTIPLIER
+        }
+
+        damagePlayer(
+            session = target,
+            amount = damage,
+            damageTypeId = PLAYER_ATTACK_DAMAGE_TYPE_ID,
+            hurtSoundId = PLAYER_HURT_SOUND_ID,
+            bigHurtSoundId = PLAYER_HURT_SOUND_ID,
+            deathMessage = PlayPackets.ChatComponent.Translate(
+                key = "death.attack.player",
+                args = listOf(
+                    playerNameComponent(target.profile),
+                    playerNameComponent(attacker.profile)
+                )
+            )
+        )
+
+        val knockbackStrength = BASE_PLAYER_KNOCKBACK + if (knockbackAttack) SPRINT_KNOCKBACK_BONUS else 0.0
+        applyVanillaKnockback(attacker, target, knockbackStrength)
+        if (knockbackAttack) {
+            attacker.sprinting = false
+            updateAndBroadcastPlayerState(attacker.channelId, sprinting = false)
+            broadcastAttackSound(attacker, PLAYER_ATTACK_KNOCKBACK_SOUND_ID)
+        } else if (criticalAttack) {
+            broadcastAttackSound(attacker, PLAYER_ATTACK_CRIT_SOUND_ID)
+        } else if (sweepAttack) {
+            // Vanilla does not play strong/weak when sweep triggers.
+        } else if (strongAttack) {
+            broadcastAttackSound(attacker, PLAYER_ATTACK_STRONG_SOUND_ID)
+        } else {
+            broadcastAttackSound(attacker, PLAYER_ATTACK_WEAK_SOUND_ID)
+        }
+
+        if (sweepAttack) {
+            broadcastAttackSound(attacker, PLAYER_ATTACK_SWEEP_SOUND_ID)
+            applySweepAttack(attacker, target, damageTypeId = PLAYER_ATTACK_DAMAGE_TYPE_ID)
+        }
+    }
+
+    private fun meleeAttackDamage(attacker: PlayerSession): Float {
+        val heldItemId = attacker.hotbarItemIds[attacker.selectedHotbarSlot.coerceIn(0, 8)]
+        val heldItemKey = heldItemKey(heldItemId) ?: return BASE_UNARMED_DAMAGE
+        return vanillaAttackDamageByItemKey(heldItemKey)
+    }
+
+    private fun heldItemKey(itemId: Int): String? {
+        if (itemId < 0) return null
+        val key = itemKeyById.getOrNull(itemId) ?: return null
+        return key.ifEmpty { null }
+    }
+
+    private fun vanillaAttackDamageByItemKey(itemKey: String): Float {
+        val key = itemKey.substringAfter("minecraft:")
+        return when {
+            key.endsWith("_sword") -> when {
+                key.startsWith("wooden_") || key.startsWith("golden_") -> 4.0f
+                key.startsWith("stone_") -> 5.0f
+                key.startsWith("iron_") -> 6.0f
+                key.startsWith("diamond_") -> 7.0f
+                key.startsWith("netherite_") -> 8.0f
+                else -> 4.0f
+            }
+            key.endsWith("_axe") -> when {
+                key.startsWith("wooden_") || key.startsWith("golden_") -> 7.0f
+                key.startsWith("stone_") -> 9.0f
+                key.startsWith("iron_") -> 9.0f
+                key.startsWith("diamond_") -> 9.0f
+                key.startsWith("netherite_") -> 10.0f
+                else -> 7.0f
+            }
+            key.endsWith("_pickaxe") -> when {
+                key.startsWith("wooden_") || key.startsWith("golden_") -> 2.0f
+                key.startsWith("stone_") -> 3.0f
+                key.startsWith("iron_") -> 4.0f
+                key.startsWith("diamond_") -> 5.0f
+                key.startsWith("netherite_") -> 6.0f
+                else -> 2.0f
+            }
+            key.endsWith("_shovel") -> when {
+                key.startsWith("wooden_") || key.startsWith("golden_") -> 2.5f
+                key.startsWith("stone_") -> 3.5f
+                key.startsWith("iron_") -> 4.5f
+                key.startsWith("diamond_") -> 5.5f
+                key.startsWith("netherite_") -> 6.5f
+                else -> 2.5f
+            }
+            key.endsWith("_hoe") -> when {
+                key.startsWith("wooden_") || key.startsWith("golden_") -> 1.0f
+                key.startsWith("stone_") -> 1.0f
+                key.startsWith("iron_") -> 1.0f
+                key.startsWith("diamond_") -> 1.0f
+                key.startsWith("netherite_") -> 1.0f
+                else -> 1.0f
+            }
+            key == "trident" -> 9.0f
+            else -> BASE_UNARMED_DAMAGE
+        }
+    }
+
+    private fun canCriticalAttack(attacker: PlayerSession, target: PlayerSession): Boolean {
+        return attacker.fallDistance > 0.0 &&
+            !attacker.onGround &&
+            !attacker.sprinting &&
+            !attacker.dead &&
+            !target.dead
+    }
+
+    private fun canSweepAttack(
+        attacker: PlayerSession,
+        strongAttack: Boolean,
+        criticalAttack: Boolean,
+        knockbackAttack: Boolean
+    ): Boolean {
+        if (!strongAttack || criticalAttack || knockbackAttack) return false
+        if (!attacker.onGround) return false
+        if (attacker.lastHorizontalMovementSq >= (PLAYER_SWEEP_SPEED_THRESHOLD * PLAYER_SWEEP_SPEED_THRESHOLD)) return false
+        val heldItemId = attacker.hotbarItemIds[attacker.selectedHotbarSlot.coerceIn(0, 8)]
+        val heldItemKey = heldItemKey(heldItemId) ?: return false
+        return heldItemKey.endsWith("_sword")
+    }
+
+    private fun applyVanillaKnockback(attacker: PlayerSession, target: PlayerSession, strength: Double) {
+        if (strength <= 0.0) return
+
+        // Do not use packet-to-packet position delta as knockback base velocity.
+        // It over-amplifies knockback under jitter and low packet rates.
+        val horizontalBaseX = 0.0
+        val horizontalBaseY = 0.0
+        val horizontalBaseZ = 0.0
+        val yawRad = Math.toRadians(attacker.yaw.toDouble())
+        val knockDirX = sin(yawRad)
+        val knockDirZ = -cos(yawRad)
+        val norm = kotlin.math.sqrt((knockDirX * knockDirX) + (knockDirZ * knockDirZ))
+        if (norm <= 1.0e-6) return
+
+        val normalizedX = knockDirX / norm
+        val normalizedZ = knockDirZ / norm
+        val nextVx = (horizontalBaseX * 0.5) - (normalizedX * strength)
+        val nextVz = (horizontalBaseZ * 0.5) - (normalizedZ * strength)
+        val nextVy = if (target.onGround) {
+            minOf(0.4, (horizontalBaseY * 0.5) + strength)
+        } else {
+            horizontalBaseY
+        }
+
+        target.velocityX = nextVx
+        target.velocityY = nextVy
+        target.velocityZ = nextVz
+        broadcastEntityVelocity(target, nextVx, nextVy, nextVz)
+    }
+
+    private fun applySweepAttack(attacker: PlayerSession, primaryTarget: PlayerSession, damageTypeId: Int) {
+        val sweepDamage = VANILLA_SWEEP_BASE_DAMAGE
+        if (sweepDamage <= 0f) return
+        for (other in sessions.values) {
+            if (other.channelId == attacker.channelId || other.channelId == primaryTarget.channelId) continue
+            if (other.worldKey != attacker.worldKey) continue
+            if (other.dead) continue
+            if (other.gameMode == GAME_MODE_SPECTATOR || other.gameMode == GAME_MODE_CREATIVE) continue
+
+            val dx = other.x - primaryTarget.x
+            val dy = other.y - primaryTarget.y
+            val dz = other.z - primaryTarget.z
+            if (dx * dx + dy * dy + dz * dz > VANILLA_SWEEP_MAX_DISTANCE_SQ) continue
+
+            damagePlayer(
+                session = other,
+                amount = sweepDamage,
+                damageTypeId = damageTypeId,
+                hurtSoundId = PLAYER_HURT_SOUND_ID,
+                bigHurtSoundId = PLAYER_HURT_SOUND_ID,
+                deathMessage = PlayPackets.ChatComponent.Translate(
+                    key = "death.attack.player",
+                    args = listOf(
+                        playerNameComponent(other.profile),
+                        playerNameComponent(attacker.profile)
+                    )
+                )
+            )
+            applyVanillaKnockback(attacker, other, VANILLA_SWEEP_KNOCKBACK)
+        }
+    }
+
+    private fun broadcastEntityVelocity(session: PlayerSession, vx: Double, vy: Double, vz: Double) {
+        val velocityPacket = PlayPackets.entityVelocityPacket(
+            entityId = session.entityId,
+            vx = vx,
+            vy = vy,
+            vz = vz
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != session.worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(velocityPacket)
+            ctx.flush()
+        }
+    }
+
+    private fun broadcastAttackSound(attacker: PlayerSession, soundEventId: Int?) {
+        if (soundEventId == null) return
+        val packet = PlayPackets.soundEntityPacket(
+            soundEventId = soundEventId,
+            soundSourceId = PLAYERS_SOUND_SOURCE_ID,
+            entityId = attacker.entityId,
+            volume = 1.0f,
+            pitch = 1.0f,
+            seed = ThreadLocalRandom.current().nextLong()
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != attacker.worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
+    private fun damagePlayer(
+        session: PlayerSession,
+        amount: Float,
+        damageTypeId: Int,
+        hurtSoundId: Int?,
+        bigHurtSoundId: Int?,
+        deathMessage: PlayPackets.ChatComponent
+    ) {
+        if (session.dead || amount <= 0f) return
+        if (session.gameMode == GAME_MODE_SPECTATOR || session.gameMode == GAME_MODE_CREATIVE) return
+        val nextHealth = (session.health - amount).coerceAtLeast(0f)
+        if (nextHealth == session.health) return
+        session.health = nextHealth
+        broadcastDamageFeedback(session, amount, damageTypeId, hurtSoundId, bigHurtSoundId)
+        sendHealthPacket(session)
+        if (nextHealth <= 0f) {
+            handlePlayerDeath(session, deathMessage)
+        }
+    }
+
+    private fun broadcastDamageFeedback(
+        session: PlayerSession,
+        amount: Float,
+        damageTypeId: Int,
+        hurtSoundId: Int?,
+        bigHurtSoundId: Int?
+    ) {
+        val hurtAnimationPacket = PlayPackets.hurtAnimationPacket(session.entityId, session.yaw)
+        val damageEventPacket = PlayPackets.damageEventPacket(session.entityId, damageTypeId)
+        val fallSoundId = if (amount >= BIG_FALL_SOUND_DAMAGE_THRESHOLD) {
+            bigHurtSoundId ?: PLAYER_HURT_SOUND_ID
+        } else {
+            hurtSoundId ?: PLAYER_HURT_SOUND_ID
+        }
+        val fallSoundPacket = fallSoundId?.let { soundEventId ->
+            PlayPackets.soundEntityPacket(
+                soundEventId = soundEventId,
+                soundSourceId = PLAYERS_SOUND_SOURCE_ID,
+                entityId = session.entityId,
+                volume = 1.0f,
+                pitch = 1.0f,
+                seed = ThreadLocalRandom.current().nextLong()
+            )
+        }
+        for ((id, other) in sessions) {
+            if (other.worldKey != session.worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(hurtAnimationPacket)
+            ctx.write(damageEventPacket)
+            if (fallSoundPacket != null) {
+                ctx.write(fallSoundPacket)
+            }
+            ctx.flush()
+        }
+    }
+
+    private fun handlePlayerDeath(session: PlayerSession, deathMessage: PlayPackets.ChatComponent) {
+        if (session.dead) return
+        session.dead = true
+        session.fallDistance = 0.0
+        broadcastDeathAnimation(session)
+        broadcastSystemMessage(session.worldKey, deathMessage)
+    }
+
+    private fun broadcastDeathAnimation(session: PlayerSession) {
+        val deathAnimationPacket = PlayPackets.entityEventPacket(
+            entityId = session.entityId,
+            eventId = ENTITY_EVENT_DEATH_ANIMATION
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != session.worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(deathAnimationPacket)
+            ctx.flush()
+        }
+    }
+
+    private fun respawnPlayer(session: PlayerSession) {
+        val world = WorldManager.world(session.worldKey) ?: WorldManager.defaultWorld()
+        val spawn = FoliaSidecarSpawnPointProvider.spawnPointFor(world.key)
+            ?: world.spawnPointForPlayer(session.profile.uuid)
+        val ctx = contexts[session.channelId]
+        session.dead = false
+        session.health = MAX_PLAYER_HEALTH
+        session.food = DEFAULT_PLAYER_FOOD
+        session.saturation = DEFAULT_PLAYER_SATURATION
+        session.fallDistance = 0.0
+        session.sneaking = false
+        session.sprinting = false
+        session.swimming = false
+        if (ctx != null && ctx.channel().isActive) {
+            ctx.write(
+                PlayPackets.respawnPacket(
+                    worldKey = session.worldKey,
+                    gameMode = session.gameMode,
+                    previousGameMode = session.gameMode,
+                    seaLevel = 63,
+                    copyDataFlags = 0
+                )
+            )
+            ctx.write(PlayPackets.gameStateStartLoadingPacket())
+            resetRespawningSessionChunkView(session, ctx)
+            val spawnChunkX = ChunkStreamingService.chunkXFromBlockX(spawn.x)
+            val spawnChunkZ = ChunkStreamingService.chunkZFromBlockZ(spawn.z)
+            session.centerChunkX = spawnChunkX
+            session.centerChunkZ = spawnChunkZ
+            requestChunkStream(session, ctx, world, spawnChunkX, spawnChunkZ, session.chunkRadius)
+        }
+        teleportPlayer(session, spawn.x, spawn.y, spawn.z, 0f, 0f)
+        if (ctx != null && ctx.channel().isActive) {
+            ctx.write(PlayPackets.spawnPositionPacket(session.worldKey, spawn.x, spawn.y, spawn.z))
+            ctx.flush()
+        }
+        sendHealthPacket(session)
+        updateAndBroadcastPlayerState(session.channelId, sneaking = false, sprinting = false, swimming = false)
+    }
+
+    private fun resetRespawningSessionChunkView(session: PlayerSession, ctx: ChannelHandlerContext) {
+        session.pendingChunkTarget.set(null)
+        session.targetChunks.clear()
+        session.generatingChunks.clear()
+        session.visibleDroppedItemEntityIds.clear()
+        session.droppedItemTrackerStates.clear()
+        session.visibleFallingBlockEntityIds.clear()
+        session.fallingBlockTrackerStates.clear()
+        val toUnload = ArrayList<ChunkPos>(session.loadedChunks)
+        session.loadedChunks.clear()
+        for (pos in toUnload) {
+            ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
+        }
+        updateRetainedBaseWorldChunksForWorld(session.worldKey)
+    }
+
+    fun respawnIfDead(channelId: ChannelId) {
+        val session = sessions[channelId] ?: return
+        if (!session.dead) return
+        respawnPlayer(session)
+    }
+
+    private fun nextTeleportId(session: PlayerSession): Int {
+        val next = session.nextTeleportId.getAndIncrement()
+        return if (next > 0) next else session.nextTeleportId.updateAndGet { current ->
+            if (current <= 0) 2 else current
+        } - 1
+    }
+
+    private fun sendHealthPacket(session: PlayerSession) {
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        ctx.executor().execute {
+            if (!ctx.channel().isActive) return@execute
+            ctx.writeAndFlush(PlayPackets.setHealthPacket(session.health, session.food, session.saturation))
         }
     }
 
@@ -739,6 +1506,17 @@ object PlayerSessionManager {
         ServerI18n.log("aerogel.log.info.player.left", removed.profile.username)
     }
 
+    fun shutdown() {
+        droppedItemDispatchRunning.set(false)
+        droppedItemDispatchThread?.interrupt()
+        droppedItemDispatchThread = null
+        for ((_, ctx) in contexts) {
+            runCatching { ctx.close() }
+        }
+        contexts.clear()
+        sessions.clear()
+    }
+
     fun broadcastChat(channelId: ChannelId, message: String) {
         val sender = sessions[channelId] ?: return
         val clean = message.trim()
@@ -781,7 +1559,7 @@ object PlayerSessionManager {
         val sender = sessions[channelId] ?: return
         val ctx = contexts[channelId] ?: return
         if (!ctx.channel().isActive) return
-        val window = inGameCommandSuggestions(input, includeOperatorCommands = isOperator(sender))
+        val window = inGameCommandSuggestions(sender, input, includeOperatorCommands = isOperator(sender))
         val packet = PlayPackets.commandSuggestionsPacket(
             requestId = requestId,
             start = window.start,
@@ -791,7 +1569,12 @@ object PlayerSessionManager {
         ctx.writeAndFlush(packet)
     }
 
-    fun inGameCommandSuggestions(input: String, includeOperatorCommands: Boolean): CommandSuggestionWindow {
+    fun updateLocale(channelId: ChannelId, locale: String) {
+        val session = sessions[channelId] ?: return
+        session.locale = locale
+    }
+
+    fun inGameCommandSuggestions(sender: PlayerSession?, input: String, includeOperatorCommands: Boolean): CommandSuggestionWindow {
         val commandNames = if (includeOperatorCommands) {
             commandDispatcher.commandNames().sortedWith(String.CASE_INSENSITIVE_ORDER)
         } else {
@@ -849,10 +1632,27 @@ object PlayerSessionManager {
             )
         }
         return CommandSuggestionWindow(
-            start = activeArgStart + if (hasSlash) 1 else 0,
-            length = if (trailingWhitespace) 0 else normalized.length - activeArgStart,
-            suggestions = commandArgumentCompletions(commandName, providedArgs, activeArgIndex, activeArgPrefix)
+            start = (activeArgStart + if (hasSlash) 1 else 0) +
+                if (shouldAppendTimeSetUnitSuffix(commandName, providedArgs, activeArgIndex, activeArgPrefix)) activeArgPrefix.length else 0,
+            length = if (shouldAppendTimeSetUnitSuffix(commandName, providedArgs, activeArgIndex, activeArgPrefix)) {
+                0
+            } else {
+                if (trailingWhitespace) 0 else normalized.length - activeArgStart
+            },
+            suggestions = commandArgumentCompletions(sender, commandName, providedArgs, activeArgIndex, activeArgPrefix)
         )
+    }
+
+    private fun shouldAppendTimeSetUnitSuffix(
+        commandName: String,
+        providedArgs: List<String>,
+        activeArgIndex: Int,
+        activeArgPrefix: String
+    ): Boolean {
+        if (commandName != "time") return false
+        if (activeArgIndex != 1) return false
+        if (providedArgs.getOrNull(0)?.lowercase() != "set") return false
+        return activeArgPrefix.matches(Regex("^\\d+$"))
     }
 
     fun consoleCommandCompletions(input: String): List<String> {
@@ -883,10 +1683,11 @@ object PlayerSessionManager {
         val providedArgs = if (tokens.size > 1) tokens.drop(1) else emptyList()
         val activeArgIndex = if (trailingWhitespace) providedArgs.size else providedArgs.size - 1
         val activeArgPrefix = if (trailingWhitespace) "" else providedArgs.lastOrNull().orEmpty()
-        return commandArgumentCompletions(commandName, providedArgs, activeArgIndex, activeArgPrefix)
+        return commandArgumentCompletions(null, commandName, providedArgs, activeArgIndex, activeArgPrefix)
     }
 
     private fun commandArgumentCompletions(
+        sender: PlayerSession?,
         commandName: String,
         providedArgs: List<String>,
         activeArgIndex: Int,
@@ -903,12 +1704,108 @@ object PlayerSessionManager {
             } else {
                 emptyList()
             }
-            "tp", "teleport" -> tpCommandCompletions(providedArgs, activeArgIndex, activeArgPrefix)
+            "deop" -> if (activeArgIndex == 0) {
+                val onlineOperators = sessions.values.asSequence()
+                    .filter { isOperator(it) }
+                    .toList()
+                val onlineCandidateUuids = onlineOperators.asSequence()
+                    .map { it.profile.uuid }
+                    .toSet()
+                val onlineCandidates = onlineOperators.asSequence()
+                    .map { it.profile.username }
+                    .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+                    .distinct()
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .toList()
+                val offlineUuidCandidates = persistedOperatorUuids.asSequence()
+                    .filterNot { it in onlineCandidateUuids }
+                    .map(UUID::toString)
+                    .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .toList()
+                (onlineCandidates + offlineUuidCandidates).distinct()
+            } else {
+                emptyList()
+            }
+            "gamemode" -> gamemodeCommandCompletions(activeArgIndex, activeArgPrefix)
+            "tp", "teleport" -> tpCommandCompletions(sender, providedArgs, activeArgIndex, activeArgPrefix)
+            "time" -> timeCommandCompletions(providedArgs, activeArgIndex, activeArgPrefix)
+            else -> emptyList()
+        }
+    }
+
+    private fun timeCommandCompletions(
+        providedArgs: List<String>,
+        activeArgIndex: Int,
+        activeArgPrefix: String
+    ): List<String> {
+        val subcommands = listOf("add", "set", "query")
+        val queryKinds = listOf("daytime", "gametime", "day")
+        val setValueAliases = listOf("day", "night", "midnight", "noon")
+        val worldKeys = WorldManager.allWorlds()
+            .asSequence()
+            .map { it.key.substringAfter(':', it.key) }
+            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+            .toList()
+        val subcommand = providedArgs.getOrNull(0)?.lowercase()
+        val raw = when (activeArgIndex) {
+            0 -> subcommands
+            1 -> when (subcommand) {
+                "set" -> timeSetValueCompletions(activeArgPrefix, setValueAliases)
+                "add" -> listOf("1000", "6000", "12000")
+                "query" -> queryKinds
+                else -> emptyList()
+            }
+            2 -> if (subcommand in subcommands) worldKeys else emptyList()
+            else -> emptyList()
+        }
+        val appendUnitSuffix = shouldAppendTimeSetUnitSuffix(
+            "time",
+            providedArgs,
+            activeArgIndex,
+            activeArgPrefix
+        )
+        val filtered = if (appendUnitSuffix) {
+            // Suffix suggestions (d/s/t) are appended at token end; do not prefix-filter with numeric input.
+            raw
+        } else {
+            raw.asSequence()
+                .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+                .toList()
+        }
+        return filtered.asSequence().distinct().toList()
+    }
+
+    private fun timeSetValueCompletions(activeArgPrefix: String, aliases: List<String>): List<String> {
+        val trimmed = activeArgPrefix.trim()
+        if (trimmed.matches(Regex("^\\d+$"))) {
+            return listOf("d", "s", "t")
+        }
+        val base = ArrayList<String>(aliases.size)
+        base.addAll(aliases)
+        return base
+    }
+
+    private fun gamemodeCommandCompletions(
+        activeArgIndex: Int,
+        activeArgPrefix: String
+    ): List<String> {
+        return when (activeArgIndex) {
+            0 -> gamemodeCompletionCandidates.asSequence()
+                .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+                .toList()
+            1 -> sessions.values.asSequence()
+                .map { it.profile.username }
+                .distinct()
+                .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+                .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                .toList()
             else -> emptyList()
         }
     }
 
     private fun tpCommandCompletions(
+        sender: PlayerSession?,
         providedArgs: List<String>,
         activeArgIndex: Int,
         activeArgPrefix: String
@@ -922,18 +1819,73 @@ object PlayerSessionManager {
         val targetCandidates = (playerCandidates + selectorCandidates)
             .distinct()
             .sortedWith(String.CASE_INSENSITIVE_ORDER)
-        val coordinateCandidates = listOf("-100", "0", "64", "100")
+        val coordinateCandidates = tpCoordinateCandidates(sender, providedArgs, activeArgIndex, activeArgPrefix)
 
         val raw = when (activeArgIndex) {
-            0 -> targetCandidates
-            1 -> (targetCandidates + coordinateCandidates)
-            2, 3 -> coordinateCandidates
+            0 -> coordinateCandidates + targetCandidates
+            1 -> {
+                if (providedArgs.firstOrNull()?.let(::looksLikeCoordinateToken) == true) {
+                    coordinateCandidates
+                } else {
+                    coordinateCandidates + targetCandidates
+                }
+            }
+            2 -> coordinateCandidates
             else -> emptyList()
         }
         return raw.asSequence()
             .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
             .distinct()
             .toList()
+    }
+
+    private fun tpCoordinateCandidates(
+        sender: PlayerSession?,
+        providedArgs: List<String>,
+        activeArgIndex: Int,
+        activeArgPrefix: String
+    ): List<String> {
+        val x = formatTpCompletionCoord(sender?.x ?: 0.0)
+        val y = formatTpCompletionCoord(sender?.y ?: 64.0)
+        val z = formatTpCompletionCoord(sender?.z ?: 0.0)
+        val coordinateStartArgIndex = when {
+            providedArgs.isEmpty() -> 0
+            providedArgs.firstOrNull()?.let(::looksLikeCoordinateToken) == true -> 0
+            else -> 1
+        }
+        val coordinateComponentIndex = activeArgIndex - coordinateStartArgIndex
+        if (coordinateComponentIndex !in 0..2) return emptyList()
+        val coordinateTokens = providedArgs.drop(coordinateStartArgIndex)
+        val currentRelativeToken = activeArgPrefix.takeIf { it.startsWith("~") } ?: "~"
+        val shouldSuggestRelative = activeArgPrefix.startsWith("~") || coordinateTokens.any { it.startsWith("~") }
+
+        return if (shouldSuggestRelative) {
+            listOf(currentRelativeToken)
+        } else {
+            when (coordinateComponentIndex) {
+                0 -> listOf(x, "$x $y", "$x $y $z")
+                1 -> listOf(y, "$y $z")
+                else -> listOf(z)
+            }
+        }
+    }
+
+    private fun looksLikeCoordinateToken(token: String): Boolean {
+        if (token.isEmpty()) return false
+        if (token == "~") return true
+        if (token.startsWith("~")) return token.substring(1).toDoubleOrNull() != null
+        if (token.startsWith("^")) return token.substring(1).isEmpty() || token.substring(1).toDoubleOrNull() != null
+        return token.toDoubleOrNull() != null
+    }
+
+    private fun formatTpCompletionCoord(value: Double): String {
+        val rounded = kotlin.math.round(value * 1000.0) / 1000.0
+        val whole = rounded.toLong().toDouble() == rounded
+        return if (whole) {
+            rounded.toLong().toString()
+        } else {
+            java.lang.Double.toString(rounded)
+        }
     }
 
     private fun selectorCandidates(prefix: String): List<String> {
@@ -971,6 +1923,7 @@ object PlayerSessionManager {
     private fun grantOperatorAndRefreshCommands(target: PlayerSession): Boolean {
         val granted = operatorUuids.add(target.profile.uuid)
         if (granted) {
+            addPersistedOperator(target.profile.uuid)
             val ctx = contexts[target.channelId]
             if (ctx != null && ctx.channel().isActive) {
                 ctx.executor().execute {
@@ -983,13 +1936,78 @@ object PlayerSessionManager {
         return granted
     }
 
+    private fun revokeOperatorAndRefreshCommands(uuid: UUID): Boolean {
+        val target = sessions.values.firstOrNull { it.profile.uuid == uuid }
+        val removedPersisted = removePersistedOperator(uuid)
+        val removedActive = operatorUuids.remove(uuid)
+        if (removedActive && target != null) {
+            val ctx = contexts[target.channelId]
+            if (ctx != null && ctx.channel().isActive) {
+                ctx.executor().execute {
+                    if (ctx.channel().isActive) {
+                        ctx.writeAndFlush(PlayPackets.commandsPacket(includeOperatorCommands = false))
+                    }
+                }
+            }
+        }
+        return removedPersisted || removedActive
+    }
+
     private fun isOperator(session: PlayerSession?): Boolean {
         if (session == null) return true
         return operatorUuids.contains(session.profile.uuid)
     }
 
+    private fun loadPersistedOperators() {
+        synchronized(operatorFileLock) {
+            persistedOperatorUuids.clear()
+            if (!Files.exists(operatorFilePath)) return
+            try {
+                Files.readAllLines(operatorFilePath).asSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .mapNotNull { runCatching { UUID.fromString(it) }.getOrNull() }
+                    .forEach { persistedOperatorUuids.add(it) }
+            } catch (t: Throwable) {
+                logger.warn("Failed to load persisted operators from {}", operatorFilePath.toAbsolutePath(), t)
+            }
+        }
+    }
+
+    private fun addPersistedOperator(uuid: UUID) {
+        if (persistedOperatorUuids.add(uuid)) {
+            savePersistedOperators()
+        }
+    }
+
+    private fun removePersistedOperator(uuid: UUID): Boolean {
+        val removed = persistedOperatorUuids.remove(uuid)
+        if (removed) {
+            savePersistedOperators()
+        }
+        return removed
+    }
+
+    private fun savePersistedOperators() {
+        synchronized(operatorFileLock) {
+            try {
+                val uuidLines = persistedOperatorUuids.asSequence()
+                    .map(UUID::toString)
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .toList()
+                Files.write(operatorFilePath, uuidLines, Charsets.UTF_8)
+            } catch (t: Throwable) {
+                logger.warn("Failed to save persisted operators to {}", operatorFilePath.toAbsolutePath(), t)
+            }
+        }
+    }
+
     private fun findOnlinePlayer(name: String): PlayerSession? {
         return sessions.values.firstOrNull { it.profile.username.equals(name, ignoreCase = true) }
+    }
+
+    private fun findOnlinePlayer(uuid: UUID): PlayerSession? {
+        return sessions.values.firstOrNull { it.profile.uuid == uuid }
     }
 
     private fun onlinePlayersInWorld(worldKey: String): List<PlayerSession> {
@@ -1038,11 +2056,28 @@ object PlayerSessionManager {
         if (selfCtx != null && selfCtx.channel().isActive) {
             selfCtx.executor().execute {
                 if (selfCtx.channel().isActive) {
+                    val teleportId = nextTeleportId(target)
                     val packet = if (hasRotation) {
-                        PlayPackets.playerPositionPacket(x, clampedY, z, yaw = nextYaw, pitch = nextPitch, relativeFlags = 0)
+                        PlayPackets.playerPositionPacket(
+                            teleportId = teleportId,
+                            x = x,
+                            y = clampedY,
+                            z = z,
+                            yaw = nextYaw,
+                            pitch = nextPitch,
+                            relativeFlags = 0
+                        )
                     } else {
                         // Keep client yaw/pitch unchanged by using relative-rotation flags with zero deltas.
-                        PlayPackets.playerPositionPacket(x, clampedY, z, yaw = 0f, pitch = 0f, relativeFlags = 0x18)
+                        PlayPackets.playerPositionPacket(
+                            teleportId = teleportId,
+                            x = x,
+                            y = clampedY,
+                            z = z,
+                            yaw = 0f,
+                            pitch = 0f,
+                            relativeFlags = 0x18
+                        )
                     }
                     selfCtx.writeAndFlush(packet)
                 }
@@ -1067,6 +2102,34 @@ object PlayerSessionManager {
         ctx.executor().execute {
             if (ctx.channel().isActive) {
                 ctx.writeAndFlush(packet)
+            }
+        }
+    }
+
+    private fun maybeSendChunkMsptActionBar(nowNanos: Long) {
+        for (session in sessions.values) {
+            if (nowNanos - session.lastChunkMsptActionBarAtNanos < CHUNK_MSPT_ACTION_BAR_INTERVAL_NANOS) continue
+            val ctx = contexts[session.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+            val world = WorldManager.world(session.worldKey) ?: continue
+            val mspt = world.chunkMspt(session.centerChunkX, session.centerChunkZ)
+            val packet = PlayPackets.systemChatPacket(
+                PlayPackets.ChatComponent.Text(
+                    String.format(
+                        Locale.ROOT,
+                        "Chunk (%d, %d) MSPT: %.3f ms",
+                        session.centerChunkX,
+                        session.centerChunkZ,
+                        mspt
+                    )
+                ),
+                overlay = true
+            )
+            session.lastChunkMsptActionBarAtNanos = nowNanos
+            ctx.executor().execute {
+                if (ctx.channel().isActive) {
+                    ctx.writeAndFlush(packet)
+                }
             }
         }
     }
@@ -1113,7 +2176,19 @@ object PlayerSessionManager {
         key: String,
         vararg args: PlayPackets.ChatComponent
     ) {
-        val source = PlayPackets.ChatComponent.Text(ServerI18n.tr("aerogel.console.source.terminal"), italic = true)
+        val source = PlayPackets.ChatComponent.Text(
+            ServerI18n.trFor(session.locale, "aerogel.console.source.terminal"),
+            italic = true
+        )
+        sendAdminSourcedTranslation(session, source, key, *args)
+    }
+
+    private fun sendAdminSourcedTranslation(
+        session: PlayerSession,
+        source: PlayPackets.ChatComponent,
+        key: String,
+        vararg args: PlayPackets.ChatComponent
+    ) {
         val message = PlayPackets.ChatComponent.Translate(key = key, args = args.toList(), italic = true)
         val packetComponent = PlayPackets.ChatComponent.Translate(
             key = "chat.type.admin",
@@ -1142,6 +2217,59 @@ object PlayerSessionManager {
                     key = "command.context.here",
                     color = "red",
                     underlined = false
+                )
+            )
+        )
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        val packet = PlayPackets.systemChatPacket(pointer)
+        ctx.executor().execute {
+            if (ctx.channel().isActive) {
+                ctx.writeAndFlush(packet)
+            }
+        }
+    }
+
+    private fun sendSourceTranslationWithContext(
+        session: PlayerSession?,
+        key: String,
+        input: String,
+        errorStart: Int,
+        vararg args: PlayPackets.ChatComponent
+    ) {
+        if (session == null) {
+            if (key == "command.unknown.command") {
+                ServerI18n.log(
+                    "aerogel.log.console.prefixed_error",
+                    ServerI18n.translate("aerogel.console.command.unknown_or_incomplete")
+                )
+                return
+            }
+            val renderedArgs = args.map { ServerI18n.componentToText(it) }
+            ServerI18n.log("aerogel.log.console.prefixed_error", ServerI18n.translate(key, renderedArgs))
+            return
+        }
+
+        sendSystemTranslation(session, key, color = "red", *args)
+
+        val safeStart = errorStart.coerceIn(0, input.length)
+        val validPrefix = input.substring(0, safeStart)
+        val invalidSuffix = input.substring(safeStart)
+        val pointer = PlayPackets.ChatComponent.Text(
+            text = validPrefix,
+            color = if (validPrefix.isEmpty()) null else "gray",
+            extra = listOf(
+                PlayPackets.ChatComponent.Text(
+                    text = invalidSuffix,
+                    color = "red",
+                    underlined = true,
+                    extra = listOf(
+                        PlayPackets.ChatComponent.Translate(
+                            key = "command.context.here",
+                            color = "red",
+                            underlined = false
+                        )
+                    )
                 )
             )
         )
@@ -1188,62 +2316,81 @@ object PlayerSessionManager {
         val ctx = contexts[channelId] ?: return
         // Pick-block pending state must only live for the next matching creative slot update.
         session.pendingPickedBlockStateId = 0
-        val stateId = world.blockStateAt(x, y, z)
-        if (stateId == 0) return
+
+        val cached = resolvePickedBlockData(world, x, y, z, cachedOnly = true)
+        if (cached == null) return
+        applyPickedBlockData(session, ctx, cached)
+    }
+
+    private fun resolvePickedBlockData(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        cachedOnly: Boolean
+    ): PickedBlockData? {
+        val stateId = if (cachedOnly) {
+            world.blockStateAtIfCached(x, y, z) ?: return null
+        } else {
+            world.blockStateAt(x, y, z)
+        }
+        if (stateId == 0) return null
         val pickedStateId = normalizePickedBlockStateId(stateId)
         val pickedItemId = itemIdForState(pickedStateId)
-        if (pickedItemId < 0) return
+        if (pickedItemId < 0) return null
 
         val blockEntity = world.blockEntityAt(x, y, z)
         val pickedTypeId = blockEntity?.typeId ?: -1
-        val pickedNbt = blockEntity?.nbtPayload?.copyOf()
-
-        // Creative pick-block behavior:
-        // 1) If same block state (+block entity payload) already exists in hotbar, just switch held slot.
-        // 2) Otherwise place item into currently selected hotbar slot and sync that slot to client.
-        val existingSlot = findHotbarSlotForPick(
-            session = session,
+        val pickedNbt = blockEntity?.nbtPayload
+        return PickedBlockData(
             stateId = pickedStateId,
             itemId = pickedItemId,
             blockEntityTypeId = pickedTypeId,
             blockEntityNbtPayload = pickedNbt
         )
+    }
+
+    private fun applyPickedBlockData(session: PlayerSession, ctx: ChannelHandlerContext, picked: PickedBlockData) {
+        val existingSlot = findHotbarSlotForPick(
+            session = session,
+            stateId = picked.stateId,
+            itemId = picked.itemId,
+            blockEntityTypeId = picked.blockEntityTypeId,
+            blockEntityNbtPayload = picked.blockEntityNbtPayload
+        )
 
         if (existingSlot >= 0) {
-            // Vanilla creative pick-block behavior:
-            // If same block already exists in hotbar, switch held slot to it.
             session.selectedHotbarSlot = existingSlot
-            session.selectedBlockStateId = pickedStateId
+            session.selectedBlockStateId = picked.stateId
             if (ctx.channel().isActive) {
                 ctx.writeAndFlush(PlayPackets.setHeldSlotPacket(existingSlot))
             }
             broadcastHeldItemEquipment(session)
             return
         }
+
         val previousSelected = session.selectedHotbarSlot.coerceIn(0, 8)
         val targetSlot = findPickInsertHotbarSlot(session, previousSelected)
         session.selectedHotbarSlot = targetSlot
-        session.pendingPickedBlockStateId = pickedStateId
-        session.hotbarBlockStateIds[targetSlot] = pickedStateId
-        session.selectedBlockStateId = pickedStateId
-        session.hotbarBlockEntityTypeIds[targetSlot] = pickedTypeId
-        session.hotbarBlockEntityNbtPayloads[targetSlot] = pickedNbt
-        session.hotbarItemIds[targetSlot] = pickedItemId
+        session.pendingPickedBlockStateId = picked.stateId
+        session.hotbarBlockStateIds[targetSlot] = picked.stateId
+        session.selectedBlockStateId = picked.stateId
+        session.hotbarBlockEntityTypeIds[targetSlot] = picked.blockEntityTypeId
+        session.hotbarBlockEntityNbtPayloads[targetSlot] = picked.blockEntityNbtPayload
+        session.hotbarItemIds[targetSlot] = picked.itemId
         session.hotbarItemCounts[targetSlot] = 1
 
-        val itemId = session.hotbarItemIds[targetSlot]
-        if (ctx.channel().isActive && itemId >= 0) {
+        if (ctx.channel().isActive && picked.itemId >= 0) {
             if (targetSlot != previousSelected) {
                 ctx.write(PlayPackets.setHeldSlotPacket(targetSlot))
             }
             val inventoryStateId = nextInventoryStateId(session)
-            // Creative inventory indexing: hotbar 0..8 => slots 36..44.
             ctx.writeAndFlush(
                 PlayPackets.containerSetSlotPacket(
                     containerId = 0,
                     stateId = inventoryStateId,
                     slot = 36 + targetSlot,
-                    encodedItemStack = encodedItemStack(itemId)
+                    encodedItemStack = encodedItemStack(picked.itemId)
                 )
             )
         }
@@ -1260,6 +2407,20 @@ object PlayerSessionManager {
             0
         }
         broadcastHeldItemEquipment(session)
+    }
+
+    fun handleBlockDiggingAction(channelId: ChannelId, action: Int, x: Int, y: Int, z: Int) {
+        val session = sessions[channelId] ?: return
+        val world = WorldManager.world(session.worldKey)
+        val shouldBreak = when (session.gameMode) {
+            GAME_MODE_CREATIVE -> action == 0 || action == 2
+            GAME_MODE_SURVIVAL -> {
+                action == 2 || (action == 0 && world != null && isInstantBreakBlock(world.blockStateAt(x, y, z)))
+            }
+            else -> false
+        }
+        if (!shouldBreak) return
+        breakBlock(channelId, x, y, z)
     }
 
     fun applyCreativeSlot(channelId: ChannelId, slot: Int, encodedItemStack: ByteArray) {
@@ -1412,43 +2573,112 @@ object PlayerSessionManager {
         cursorZ: Float
     ) {
         val session = sessions[channelId] ?: return
-        if (session.gameMode != 1) return
+        if (!canPlaceBlocks(session)) {
+            if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                logger.info("Placement drop: player={} reason=game_mode mode={}", session.profile.username, session.gameMode)
+            }
+            return
+        }
         val world = WorldManager.world(session.worldKey) ?: return
         if (!isChunkLoadedForSession(session, x, z)) {
+            if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                logger.info(
+                    "Placement drop: player={} reason=chunk_not_loaded pos=({}, {}, {})",
+                    session.profile.username, x, y, z
+                )
+            }
             resyncBlockToPlayer(session, x, y, z, world.blockStateAt(x, y, z))
             return
         }
         // Reject placement into occupied space to keep server-authoritative collision rules sane.
         // (simple rule for now: only place into air)
-        if (world.blockStateAt(x, y, z) != 0) return
+        if (world.blockStateAt(x, y, z) != 0) {
+            if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                logger.info(
+                    "Placement drop: player={} reason=target_not_air pos=({}, {}, {}) stateId={}",
+                    session.profile.username, x, y, z, world.blockStateAt(x, y, z)
+                )
+            }
+            return
+        }
         // Do not allow placing into the player's own collision box.
-        if (isPlacementBlockedByPlayer(session, x, y, z)) return
+        if (isPlacementBlockedByPlayer(session, x, y, z)) {
+            if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                logger.info(
+                    "Placement drop: player={} reason=player_collision pos=({}, {}, {})",
+                    session.profile.username, x, y, z
+                )
+            }
+            return
+        }
 
         val offhand = hand == 1
         val slot = session.selectedHotbarSlot.coerceIn(0, 8)
         val selectedItemId = if (offhand) session.offhandItemId else session.hotbarItemIds[slot]
         val selectedItemCount = if (offhand) session.offhandItemCount else session.hotbarItemCounts[slot]
-        if (selectedItemCount <= 0 || selectedItemId < 0) return
+        if (selectedItemCount <= 0 || selectedItemId < 0) {
+            if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                logger.info(
+                    "Placement drop: player={} reason=empty_hand offhand={} slot={} itemId={} count={}",
+                    session.profile.username, offhand, slot, selectedItemId, selectedItemCount
+                )
+            }
+            return
+        }
         val baseStateId = if (offhand) {
             itemBlockStateId(selectedItemId)
         } else {
-            session.hotbarBlockStateIds[slot]
+            val fromItem = itemBlockStateId(selectedItemId)
+            if (fromItem > 0) fromItem else session.hotbarBlockStateIds[slot]
         }
-        if (baseStateId <= 0) return
-        val blockStateId = resolvePlacementState(
+        if (baseStateId <= 0) {
+            if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                logger.info(
+                    "Placement drop: player={} reason=no_block_state itemId={} offhand={} slot={}",
+                    session.profile.username, selectedItemId, offhand, slot
+                )
+            }
+            return
+        }
+        val blockStateId = normalizePrimaryPlacementStateId(resolvePlacementState(
             baseStateId = baseStateId,
             faceId = faceId,
             cursorX = cursorX,
             cursorY = cursorY,
             cursorZ = cursorZ,
             playerYaw = session.yaw
-        )
-        val upperStateId = twoBlockUpperStateId(blockStateId)
-        if (upperStateId > 0) {
-            val upperY = y + 1
-            if (upperY > 319) return
-            if (world.blockStateAt(x, upperY, z) != 0) return
-            if (isPlacementBlockedByPlayer(session, x, upperY, z)) return
+        ))
+        val pairedPlacement = pairedPlacementFor(world, x, y, z, blockStateId)
+        val logPlacementDebug = shouldLogPlacementDebug(blockStateId)
+        if (logPlacementDebug) {
+            logger.info(
+                "Placement debug pre: player={} itemId={} offhand={} pos=({}, {}, {}) baseStateId={} resolvedStateId={} paired={}",
+                session.profile.username,
+                selectedItemId,
+                offhand,
+                x,
+                y,
+                z,
+                baseStateId,
+                blockStateId,
+                pairedPlacement?.let { "(${it.x},${it.y},${it.z}) stateId=${it.stateId}" } ?: "none"
+            )
+        }
+        if (pairedPlacement != null) {
+            val pairedCurrentState = world.blockStateAt(pairedPlacement.x, pairedPlacement.y, pairedPlacement.z)
+            if (pairedCurrentState != 0) {
+                if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                    logger.info(
+                        "Placement drop: player={} reason=paired_not_air paired=({}, {}, {}) stateId={}",
+                        session.profile.username,
+                        pairedPlacement.x,
+                        pairedPlacement.y,
+                        pairedPlacement.z,
+                        pairedCurrentState
+                    )
+                }
+                return
+            }
         }
         setBlockAndBroadcast(
             session = session,
@@ -1459,14 +2689,31 @@ object PlayerSessionManager {
             blockEntityTypeId = if (offhand) -1 else session.hotbarBlockEntityTypeIds[slot],
             blockEntityNbtPayload = if (offhand) null else session.hotbarBlockEntityNbtPayloads[slot]
         )
-        if (upperStateId > 0) {
+        if (pairedPlacement != null) {
             setBlockAndBroadcast(
                 session = session,
-                x = x,
-                y = y + 1,
-                z = z,
-                stateId = upperStateId
+                x = pairedPlacement.x,
+                y = pairedPlacement.y,
+                z = pairedPlacement.z,
+                stateId = pairedPlacement.stateId
             )
+        }
+        if (logPlacementDebug) {
+            val lowerAfter = world.blockStateAt(x, y, z)
+            val upperAfter = pairedPlacement?.let { world.blockStateAt(it.x, it.y, it.z) }
+            logger.info(
+                "Placement debug post: player={} pos=({}, {}, {}) lowerAfter={} upperAfter={} paired={}",
+                session.profile.username,
+                x,
+                y,
+                z,
+                lowerAfter,
+                upperAfter?.toString() ?: "n/a",
+                pairedPlacement?.let { "(${it.x},${it.y},${it.z})" } ?: "none"
+            )
+        }
+        if (session.gameMode != GAME_MODE_CREATIVE) {
+            consumePlacedItem(session, hand)
         }
     }
 
@@ -2345,6 +3592,313 @@ object PlayerSessionManager {
         }
     }
 
+    private fun syncFallingBlockSnapshot(
+        snapshot: FallingBlockSnapshot,
+        worldSessions: List<PlayerSession>,
+        outboundByContext: MutableMap<ChannelHandlerContext, MutableList<ByteArray>>,
+        sendPositionUpdate: Boolean,
+        deltaSeconds: Double
+    ) {
+        val chunkPos = snapshot.chunkPos
+        var removePacket: ByteArray? = null
+        val (syncVx, syncVy, syncVz) = fallingBlockNetworkVelocity(snapshot)
+        for (session in worldSessions) {
+            val shouldBeVisible = session.loadedChunks.contains(chunkPos)
+            val ctx = contexts[session.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+
+            if (shouldBeVisible) {
+                if (session.visibleFallingBlockEntityIds.add(snapshot.entityId)) {
+                    queueFallingBlockSpawnPackets(
+                        outboundByContext = outboundByContext,
+                        ctx = ctx,
+                        session = session,
+                        snapshot = snapshot,
+                        syncVx = syncVx,
+                        syncVy = syncVy,
+                        syncVz = syncVz
+                    )
+                    continue
+                }
+                if (sendPositionUpdate) {
+                    val movementPackets = fallingBlockMovementPackets(
+                        session = session,
+                        snapshot = snapshot,
+                        syncVx = syncVx,
+                        syncVy = syncVy,
+                        syncVz = syncVz,
+                        deltaSeconds = deltaSeconds
+                    )
+                    for (packet in movementPackets) {
+                        enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+                    }
+                }
+                continue
+            }
+
+            if (session.visibleFallingBlockEntityIds.remove(snapshot.entityId)) {
+                session.fallingBlockTrackerStates.remove(snapshot.entityId)
+                val packet = removePacket ?: PlayPackets.removeEntitiesPacket(intArrayOf(snapshot.entityId)).also {
+                    removePacket = it
+                }
+                enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+            }
+        }
+    }
+
+    private fun queueFallingBlockSpawnPackets(
+        outboundByContext: MutableMap<ChannelHandlerContext, MutableList<ByteArray>>,
+        ctx: ChannelHandlerContext,
+        session: PlayerSession,
+        snapshot: FallingBlockSnapshot,
+        syncVx: Double,
+        syncVy: Double,
+        syncVz: Double
+    ) {
+        enqueueDroppedItemPacket(
+            outboundByContext,
+            ctx,
+            PlayPackets.addEntityPacket(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                entityTypeId = PlayPackets.fallingBlockEntityTypeId(),
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                yaw = 0f,
+                pitch = 0f,
+                objectData = snapshot.blockStateId
+            )
+        )
+        enqueueDroppedItemPacket(
+            outboundByContext,
+            ctx,
+            PlayPackets.entityVelocityPacket(
+                entityId = snapshot.entityId,
+                vx = syncVx,
+                vy = syncVy,
+                vz = syncVz
+            )
+        )
+        session.fallingBlockTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(
+            snapshot = DroppedItemSnapshot(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                itemId = 0,
+                itemCount = 1,
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                vx = syncVx,
+                vy = syncVy,
+                vz = syncVz,
+                pickupDelaySeconds = 0.0,
+                onGround = snapshot.onGround,
+                chunkPos = snapshot.chunkPos
+            ),
+            syncVx = syncVx,
+            syncVy = syncVy,
+            syncVz = syncVz
+        )
+    }
+
+    private fun fallingBlockMovementPackets(
+        session: PlayerSession,
+        snapshot: FallingBlockSnapshot,
+        syncVx: Double,
+        syncVy: Double,
+        syncVz: Double,
+        deltaSeconds: Double
+    ): List<ByteArray> {
+        val state = session.fallingBlockTrackerStates.computeIfAbsent(snapshot.entityId) {
+            newDroppedItemTrackerState(
+                snapshot = DroppedItemSnapshot(
+                    entityId = snapshot.entityId,
+                    uuid = snapshot.uuid,
+                    itemId = 0,
+                    itemCount = 1,
+                    x = snapshot.x,
+                    y = snapshot.y,
+                    z = snapshot.z,
+                    vx = syncVx,
+                    vy = syncVy,
+                    vz = syncVz,
+                    pickupDelaySeconds = 0.0,
+                    onGround = snapshot.onGround,
+                    chunkPos = snapshot.chunkPos
+                ),
+                syncVx = syncVx,
+                syncVy = syncVy,
+                syncVz = syncVz
+            )
+        }
+        state.secondsSinceHardSync = (state.secondsSinceHardSync + deltaSeconds).coerceAtMost(120.0)
+        val playerTimeScale = ServerConfig.playerTimeScale
+        val encodedX = encodeDroppedItemPosition4096(snapshot.x)
+        val encodedY = encodeDroppedItemPosition4096(snapshot.y)
+        val encodedZ = encodeDroppedItemPosition4096(snapshot.z)
+        val dx = encodedX - state.encodedX4096
+        val dy = encodedY - state.encodedY4096
+        val dz = encodedZ - state.encodedZ4096
+        val hasPositionDelta = dx != 0L || dy != 0L || dz != 0L
+        val onGroundChanged = state.lastOnGround != snapshot.onGround
+
+        val packets = ArrayList<ByteArray>(2)
+        state.relativeMoveAccumulatorSeconds =
+            (state.relativeMoveAccumulatorSeconds + deltaSeconds).coerceAtMost(MAX_DROPPED_ITEM_RELATIVE_MOVE_ACCUMULATOR_SECONDS)
+        val relativeMoveIntervalSeconds = effectiveDroppedItemRelativeMoveIntervalSeconds(playerTimeScale)
+        val relativeMoveDue = state.relativeMoveAccumulatorSeconds >= relativeMoveIntervalSeconds
+        val shouldEmitMovement = hasPositionDelta || onGroundChanged
+        var movementPacketSent = false
+
+        if (shouldEmitMovement) {
+            val requiresHardSync =
+                dx < Short.MIN_VALUE.toLong() || dx > Short.MAX_VALUE.toLong() ||
+                    dy < Short.MIN_VALUE.toLong() || dy > Short.MAX_VALUE.toLong() ||
+                    dz < Short.MIN_VALUE.toLong() || dz > Short.MAX_VALUE.toLong() ||
+                    state.secondsSinceHardSync >= MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC
+            if (requiresHardSync || relativeMoveDue || onGroundChanged) {
+                if (requiresHardSync) {
+                    packets.add(
+                        PlayPackets.entityPositionSyncPacket(
+                            entityId = snapshot.entityId,
+                            x = snapshot.x,
+                            y = snapshot.y,
+                            z = snapshot.z,
+                            vx = syncVx,
+                            vy = syncVy,
+                            vz = syncVz,
+                            yaw = 0f,
+                            pitch = 0f,
+                            onGround = snapshot.onGround
+                        )
+                    )
+                    state.secondsSinceHardSync = 0.0
+                } else {
+                    packets.add(
+                        PlayPackets.entityRelativeMovePacket(
+                            entityId = snapshot.entityId,
+                            deltaX = dx.toInt(),
+                            deltaY = dy.toInt(),
+                            deltaZ = dz.toInt(),
+                            onGround = snapshot.onGround
+                        )
+                    )
+                }
+                state.encodedX4096 = encodedX
+                state.encodedY4096 = encodedY
+                state.encodedZ4096 = encodedZ
+                state.lastOnGround = snapshot.onGround
+                state.relativeMoveAccumulatorSeconds = if (relativeMoveDue) {
+                    (state.relativeMoveAccumulatorSeconds - relativeMoveIntervalSeconds).coerceAtLeast(0.0)
+                } else {
+                    state.relativeMoveAccumulatorSeconds
+                }
+                movementPacketSent = true
+            }
+        }
+
+        val hadVelocity =
+            abs(state.lastVx) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                abs(state.lastVy) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                abs(state.lastVz) > DROPPED_ITEM_VELOCITY_EPSILON
+        if (movementPacketSent || onGroundChanged) {
+            val hasVelocity =
+                abs(syncVx) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                    abs(syncVy) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                    abs(syncVz) > DROPPED_ITEM_VELOCITY_EPSILON
+            if (hasVelocity) {
+                packets.add(PlayPackets.entityVelocityPacket(snapshot.entityId, syncVx, syncVy, syncVz))
+                state.lastVx = syncVx
+                state.lastVy = syncVy
+                state.lastVz = syncVz
+            } else if (hadVelocity) {
+                packets.add(PlayPackets.entityVelocityPacket(snapshot.entityId, 0.0, 0.0, 0.0))
+                state.lastVx = 0.0
+                state.lastVy = 0.0
+                state.lastVz = 0.0
+            }
+        }
+        return packets
+    }
+
+    private fun fallingBlockNetworkVelocity(snapshot: FallingBlockSnapshot): Triple<Double, Double, Double> {
+        val effectiveTickScale = droppedItemNetworkVelocityTimeScale(ServerConfig.timeScale)
+        val vx = sanitizeDroppedItemNetworkVelocity(snapshot.vx * effectiveTickScale)
+        val vy = if (snapshot.onGround) 0.0 else sanitizeDroppedItemNetworkVelocity(snapshot.vy * effectiveTickScale)
+        val vz = sanitizeDroppedItemNetworkVelocity(snapshot.vz * effectiveTickScale)
+        return Triple(vx, vy, vz)
+    }
+
+    private fun writeFallingBlockSpawnPackets(session: PlayerSession, ctx: ChannelHandlerContext, snapshot: FallingBlockSnapshot) {
+        val (syncVx, syncVy, syncVz) = fallingBlockNetworkVelocity(snapshot)
+        ctx.write(
+            PlayPackets.addEntityPacket(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                entityTypeId = PlayPackets.fallingBlockEntityTypeId(),
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                yaw = 0f,
+                pitch = 0f,
+                objectData = snapshot.blockStateId
+            )
+        )
+        ctx.write(PlayPackets.entityVelocityPacket(snapshot.entityId, syncVx, syncVy, syncVz))
+        session.fallingBlockTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(
+            snapshot = DroppedItemSnapshot(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                itemId = 0,
+                itemCount = 1,
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                vx = syncVx,
+                vy = syncVy,
+                vz = syncVz,
+                pickupDelaySeconds = 0.0,
+                onGround = snapshot.onGround,
+                chunkPos = snapshot.chunkPos
+            ),
+            syncVx = syncVx,
+            syncVy = syncVy,
+            syncVz = syncVz
+        )
+    }
+
+    private fun sendFallingBlocksForChunk(
+        session: PlayerSession,
+        ctx: ChannelHandlerContext,
+        snapshots: List<FallingBlockSnapshot>
+    ) {
+        if (snapshots.isEmpty()) return
+        for (snapshot in snapshots) {
+            if (!session.visibleFallingBlockEntityIds.add(snapshot.entityId)) continue
+            writeFallingBlockSpawnPackets(session, ctx, snapshot)
+        }
+    }
+
+    private fun hideFallingBlocksForChunk(
+        session: PlayerSession,
+        ctx: ChannelHandlerContext,
+        chunkPos: ChunkPos,
+        entityIds: IntArray
+    ) {
+        if (entityIds.isEmpty()) return
+        val toRemove = ArrayList<Int>(entityIds.size)
+        for (id in entityIds) {
+            if (session.visibleFallingBlockEntityIds.remove(id)) {
+                session.fallingBlockTrackerStates.remove(id)
+                toRemove.add(id)
+            }
+        }
+        if (toRemove.isNotEmpty()) {
+            ctx.write(PlayPackets.removeEntitiesPacket(toRemove.toIntArray()))
+        }
+    }
+
     private fun resolvePlacementState(
         baseStateId: Int,
         faceId: Int,
@@ -2444,7 +3998,7 @@ object PlayerSessionManager {
             resyncBlockToPlayer(session, x, y, z, world.blockStateAt(x, y, z))
             return
         }
-        if (session.gameMode == 1) {
+        if (session.gameMode == GAME_MODE_CREATIVE) {
             val slot = session.selectedHotbarSlot.coerceIn(0, 8)
             val itemId = session.hotbarItemIds[slot]
             if (creativeNoBreakItemIds.contains(itemId)) {
@@ -2453,11 +4007,54 @@ object PlayerSessionManager {
             }
         }
         val stateId = world.blockStateAt(x, y, z)
-        val paired = twoBlockPairedPos(world, x, y, z, stateId)
-        setBlockAndBroadcast(session, x, y, z, 0)
-        if (paired != null) {
-            setBlockAndBroadcast(session, paired.x, paired.y, paired.z, 0)
+        if (stateId == 0) return
+        val directPairRemovals = LinkedHashSet<BlockPos>(2)
+        collectDirectVerticalPairRemovals(world, x, y, z, stateId, directPairRemovals)
+        val heldItemId = session.hotbarItemIds[session.selectedHotbarSlot.coerceIn(0, 8)]
+        val drops = if (session.gameMode == GAME_MODE_SURVIVAL) {
+            resolveBlockDrops(world, stateId, heldItemId, x, y, z)
+        } else {
+            emptyList()
         }
+        val removedPositions = LinkedHashSet<BlockPos>(directPairRemovals.size + 4)
+        for (pos in directPairRemovals) {
+            setBlockAndBroadcast(session, pos.x, pos.y, pos.z, 0)
+            removedPositions.add(pos)
+        }
+        val additionallyRemoved = LinkedHashSet<BlockPos>()
+        breakImmediateOrphanVerticalPairs(session, world, removedPositions, heldItemId, additionallyRemoved)
+        breakDependentBlocks(session, world, removedPositions, heldItemId, additionallyRemoved)
+        if (additionallyRemoved.isNotEmpty()) {
+            removedPositions.addAll(additionallyRemoved)
+        }
+        resyncRemovedBlocksToBreaker(session, world, removedPositions)
+        if (drops.isNotEmpty()) {
+            spawnBrokenBlockDrops(session, x, y, z, drops)
+        }
+    }
+
+    private fun resolveBlockDrops(
+        world: org.macaroon3145.world.World,
+        stateId: Int,
+        heldItemId: Int,
+        x: Int,
+        y: Int,
+        z: Int
+    ): List<org.macaroon3145.world.VanillaDrop> {
+        return runCatching {
+            VanillaMiningRules.resolveDrops(world, stateId, heldItemId, x, y, z)
+        }.onFailure { throwable ->
+            logger.error(
+                "Failed to resolve survival block drops for block at {} {} {} in {} (stateId={}, heldItemId={})",
+                x,
+                y,
+                z,
+                world.key,
+                stateId,
+                heldItemId,
+                throwable
+            )
+        }.getOrDefault(emptyList())
     }
 
     fun updateCommandBlock(
@@ -2501,6 +4098,56 @@ object PlayerSessionManager {
         val ctx = contexts[session.channelId] ?: return
         if (!ctx.channel().isActive) return
         ctx.writeAndFlush(PlayPackets.blockChangePacket(x, y, z, stateId))
+    }
+
+    fun acknowledgeBlockChangedSequence(channelId: ChannelId, sequence: Int) {
+        if (sequence < 0) return
+        val ctx = contexts[channelId] ?: return
+        if (!ctx.channel().isActive) return
+        val packet = PlayPackets.acknowledgeBlockChangedPacket(sequence)
+        ctx.executor().execute {
+            if (ctx.channel().isActive) {
+                ctx.writeAndFlush(packet)
+            }
+        }
+    }
+
+    private fun resyncRemovedBlocksToBreaker(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        removedPositions: Collection<BlockPos>
+    ) {
+        if (removedPositions.isEmpty()) return
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        ctx.executor().execute {
+            if (!ctx.channel().isActive) return@execute
+            for (pos in removedPositions) {
+                ctx.write(PlayPackets.blockChangePacket(pos.x, pos.y, pos.z, world.blockStateAt(pos.x, pos.y, pos.z)))
+            }
+            ctx.flush()
+        }
+        ctx.executor().schedule({
+            if (!ctx.channel().isActive) return@schedule
+            for (pos in removedPositions) {
+                ctx.write(PlayPackets.blockChangePacket(pos.x, pos.y, pos.z, world.blockStateAt(pos.x, pos.y, pos.z)))
+            }
+            ctx.flush()
+        }, 50L, TimeUnit.MILLISECONDS)
+        ctx.executor().schedule({
+            if (!ctx.channel().isActive) return@schedule
+            for (pos in removedPositions) {
+                ctx.write(PlayPackets.blockChangePacket(pos.x, pos.y, pos.z, world.blockStateAt(pos.x, pos.y, pos.z)))
+            }
+            ctx.flush()
+        }, 250L, TimeUnit.MILLISECONDS)
+        ctx.executor().schedule({
+            if (!ctx.channel().isActive) return@schedule
+            for (pos in removedPositions) {
+                ctx.write(PlayPackets.blockChangePacket(pos.x, pos.y, pos.z, world.blockStateAt(pos.x, pos.y, pos.z)))
+            }
+            ctx.flush()
+        }, 1000L, TimeUnit.MILLISECONDS)
     }
 
     private fun setBlockAndBroadcast(
@@ -2563,6 +4210,75 @@ object PlayerSessionManager {
             }
             ctx.flush()
         }
+        triggerFallingBlocksNear(session, world, x, y, z)
+    }
+
+    private fun triggerFallingBlocksNear(session: PlayerSession, world: org.macaroon3145.world.World, x: Int, y: Int, z: Int) {
+        triggerFallingBlockColumnFrom(session, world, x, y, z)
+        if (y + 1 <= 319) {
+            triggerFallingBlockColumnFrom(session, world, x, y + 1, z)
+        }
+    }
+
+    private fun triggerFallingBlockColumnFrom(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        x: Int,
+        startY: Int,
+        z: Int
+    ) {
+        val maxY = (startY + MAX_FALLING_BLOCK_COLUMN_SCAN).coerceAtMost(319)
+        var currentY = startY.coerceAtLeast(-64)
+        while (currentY <= maxY) {
+            val stateId = world.blockStateAt(x, currentY, z)
+            if (stateId == 0) {
+                currentY++
+                continue
+            }
+            if (!isFallingGravityBlockState(stateId)) break
+            if (!canFallingBlockPassThrough(world.blockStateAt(x, currentY - 1, z))) break
+            if (!startFallingBlockEntity(session, world, x, currentY, z, stateId)) break
+            currentY++
+        }
+    }
+
+    private fun startFallingBlockEntity(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): Boolean {
+        val entityId = allocateEntityId()
+        world.setBlockState(x, y, z, 0)
+        world.setBlockEntity(x, y, z, null)
+        val spawned = world.spawnFallingBlock(
+            entityId = entityId,
+            blockStateId = stateId,
+            x = x + 0.5,
+            y = y.toDouble(),
+            z = z + 0.5
+        )
+        if (!spawned) {
+            world.setBlockState(x, y, z, stateId)
+            return false
+        }
+        val chunk = ChunkPos(x shr 4, z shr 4)
+        val clearPacket = PlayPackets.blockChangePacket(x, y, z, 0)
+        val snapshot = world.fallingBlockSnapshot(entityId) ?: return false
+        for ((id, other) in sessions) {
+            if (other.worldKey != session.worldKey) continue
+            if (!other.loadedChunks.contains(chunk)) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(clearPacket)
+            if (other.visibleFallingBlockEntityIds.add(entityId)) {
+                writeFallingBlockSpawnPackets(other, ctx, snapshot)
+            }
+            ctx.flush()
+        }
+        return true
     }
 
     fun broadcastGameMode(gameMode: Int) {
@@ -2733,27 +4449,154 @@ object PlayerSessionManager {
             ?: -1
     }
 
+    private fun canPlaceBlocks(session: PlayerSession): Boolean {
+        return session.gameMode == GAME_MODE_SURVIVAL || session.gameMode == GAME_MODE_CREATIVE
+    }
+
+    private fun consumePlacedItem(session: PlayerSession, hand: Int) {
+        val ctx = contexts[session.channelId]
+        if (hand == 1) {
+            if (session.offhandItemCount <= 0 || session.offhandItemId < 0) return
+            session.offhandItemCount -= 1
+            if (session.offhandItemCount <= 0) {
+                session.offhandItemId = -1
+                session.offhandItemCount = 0
+            }
+            if (ctx != null && ctx.channel().isActive) {
+                val encoded = if (session.offhandItemId >= 0 && session.offhandItemCount > 0) {
+                    encodedItemStack(session.offhandItemId, session.offhandItemCount)
+                } else {
+                    emptyItemStack()
+                }
+                ctx.writeAndFlush(
+                    PlayPackets.containerSetSlotPacket(
+                        containerId = 0,
+                        stateId = nextInventoryStateId(session),
+                        slot = 45,
+                        encodedItemStack = encoded
+                    )
+                )
+            }
+            broadcastHeldItemEquipment(session)
+            return
+        }
+
+        val slot = session.selectedHotbarSlot.coerceIn(0, 8)
+        if (session.hotbarItemCounts[slot] <= 0 || session.hotbarItemIds[slot] < 0) return
+        session.hotbarItemCounts[slot] -= 1
+        if (session.hotbarItemCounts[slot] <= 0) {
+            session.hotbarItemIds[slot] = -1
+            session.hotbarItemCounts[slot] = 0
+            session.hotbarBlockStateIds[slot] = 0
+            session.hotbarBlockEntityTypeIds[slot] = -1
+            session.hotbarBlockEntityNbtPayloads[slot] = null
+        }
+        session.selectedBlockStateId = if (session.hotbarItemCounts[slot] > 0) {
+            session.hotbarBlockStateIds[slot]
+        } else {
+            0
+        }
+
+        if (ctx != null && ctx.channel().isActive) {
+            val encoded = if (session.hotbarItemIds[slot] >= 0 && session.hotbarItemCounts[slot] > 0) {
+                encodedItemStack(session.hotbarItemIds[slot], session.hotbarItemCounts[slot])
+            } else {
+                emptyItemStack()
+            }
+            ctx.writeAndFlush(
+                PlayPackets.containerSetSlotPacket(
+                    containerId = 0,
+                    stateId = nextInventoryStateId(session),
+                    slot = 36 + slot,
+                    encodedItemStack = encoded
+                )
+            )
+        }
+        broadcastHeldItemEquipment(session)
+    }
+
+    private fun spawnBrokenBlockDrops(session: PlayerSession, x: Int, y: Int, z: Int, drops: List<org.macaroon3145.world.VanillaDrop>) {
+        val world = WorldManager.world(session.worldKey) ?: return
+        for (drop in drops) {
+            if (drop.itemId < 0 || drop.count <= 0) continue
+            val random = ThreadLocalRandom.current()
+            world.spawnDroppedItem(
+                entityId = allocateEntityId(),
+                itemId = drop.itemId,
+                itemCount = drop.count,
+                x = x + 0.5,
+                y = y + 0.375,
+                z = z + 0.5,
+                vx = random.nextDouble(BLOCK_DROP_HORIZONTAL_SPEED_MIN, BLOCK_DROP_HORIZONTAL_SPEED_MAX),
+                vy = BLOCK_DROP_VERTICAL_SPEED,
+                vz = random.nextDouble(BLOCK_DROP_HORIZONTAL_SPEED_MIN, BLOCK_DROP_HORIZONTAL_SPEED_MAX),
+                pickupDelaySeconds = BLOCK_DROP_PICKUP_DELAY_SECONDS
+            )
+        }
+    }
+
     private fun twoBlockUpperStateId(stateId: Int): Int {
         val parsed = BlockStateRegistry.parsedState(stateId) ?: return 0
-        if (parsed.blockKey !in TWO_BLOCK_PLANT_KEYS) return 0
         if (parsed.properties["half"] != "lower") return 0
-        val props = HashMap(parsed.properties)
-        props["half"] = "upper"
-        return BlockStateRegistry.stateId(parsed.blockKey, props) ?: 0
+        return verticalHalfCounterpartStateId(stateId) ?: 0
     }
 
     private fun lowerHalfStateId(stateId: Int): Int? {
         val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
-        if (parsed.blockKey !in TWO_BLOCK_PLANT_KEYS) return null
         if (parsed.properties["half"] != "upper") return null
+        return verticalHalfCounterpartStateId(stateId)
+    }
+
+    private fun verticalHalfCounterpartStateId(stateId: Int): Int? {
+        BlockStateRegistry.verticalHalfCounterpartStateId(stateId)?.let { return it }
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
+        val half = parsed.properties["half"] ?: return null
+        val opposite = when (half) {
+            "lower" -> "upper"
+            "upper" -> "lower"
+            else -> return null
+        }
         val props = HashMap(parsed.properties)
-        props["half"] = "lower"
+        props["half"] = opposite
         return BlockStateRegistry.stateId(parsed.blockKey, props)
     }
 
     private fun normalizePickedBlockStateId(stateId: Int): Int {
         if (stateId <= 0) return stateId
         return lowerHalfStateId(stateId) ?: stateId
+    }
+
+    private fun shouldLogPlacementDebug(stateId: Int): Boolean {
+        if (!PLACEMENT_DEBUG_LOG_ENABLED) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        val half = parsed.properties["half"]
+        val part = parsed.properties["part"]
+        return half == "lower" || half == "upper" || part == "foot" || part == "head"
+    }
+
+    private fun normalizePrimaryPlacementStateId(stateId: Int): Int {
+        if (stateId <= 0) return stateId
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return stateId
+        val props = HashMap(parsed.properties)
+        var changed = false
+
+        if (props["half"] == "upper") {
+            val lowerProps = HashMap(props)
+            lowerProps["half"] = "lower"
+            val lowerStateId = BlockStateRegistry.stateId(parsed.blockKey, lowerProps)
+            if (lowerStateId != null && verticalHalfCounterpartStateId(lowerStateId) != null) {
+                props["half"] = "lower"
+                changed = true
+            }
+        }
+
+        if (parsed.blockKey in BED_BLOCK_KEYS && props["part"] != "foot") {
+            props["part"] = "foot"
+            changed = true
+        }
+
+        if (!changed) return stateId
+        return BlockStateRegistry.stateId(parsed.blockKey, props) ?: stateId
     }
 
     private fun twoBlockPairedPos(
@@ -2763,22 +4606,505 @@ object PlayerSessionManager {
         z: Int,
         stateId: Int
     ): BlockPos? {
-        if (stateId <= 0) return null
+        return verticalPair(world, x, y, z, stateId)?.secondary
+    }
+
+    private fun verticallyPairedBlockPos(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): BlockPos? {
+        val counterpartStateId = verticalHalfCounterpartStateId(stateId) ?: return null
         val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
-        if (parsed.blockKey !in TWO_BLOCK_PLANT_KEYS) return null
         val half = parsed.properties["half"] ?: return null
-        val pairedY = when (half) {
-            "lower" -> y + 1
+        if (half != "lower" && half != "upper") return null
+        val pairedY = if (half == "lower") y + 1 else y - 1
+        if (pairedY !in -64..319) return null
+        val pairedStateId = world.blockStateAt(x, pairedY, z)
+        if (pairedStateId != counterpartStateId) return null
+        return BlockPos(x, pairedY, z)
+    }
+
+    private fun collectDirectVerticalPairRemovals(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int,
+        out: MutableCollection<BlockPos>
+    ) {
+        bedPair(world, x, y, z, stateId)?.let {
+            out.add(it.primary)
+            out.add(it.secondary)
+            return
+        }
+        verticalPair(world, x, y, z, stateId)?.let {
+            out.add(it.primary)
+            out.add(it.secondary)
+            return
+        }
+        out.add(BlockPos(x, y, z))
+    }
+
+    private fun bedPairedPos(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): BlockPos? {
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
+        if (parsed.blockKey !in BED_BLOCK_KEYS) return null
+        val part = parsed.properties["part"] ?: return null
+        val facing = parsed.properties["facing"] ?: return null
+        val (dx, dz) = horizontalFacingOffset(facing) ?: return null
+        val pairedX: Int
+        val pairedZ: Int
+        val expectedPart: String
+        when (part) {
+            "foot" -> {
+                pairedX = x + dx
+                pairedZ = z + dz
+                expectedPart = "head"
+            }
+            "head" -> {
+                pairedX = x - dx
+                pairedZ = z - dz
+                expectedPart = "foot"
+            }
+            else -> return null
+        }
+        val pairedStateId = world.blockStateAt(pairedX, y, pairedZ)
+        val paired = BlockStateRegistry.parsedState(pairedStateId) ?: return null
+        if (paired.blockKey != parsed.blockKey) return null
+        if (paired.properties["part"] != expectedPart) return null
+        return BlockPos(pairedX, y, pairedZ)
+    }
+
+    private data class BlockPair(
+        val primary: BlockPos,
+        val secondary: BlockPos
+    )
+
+    private fun verticalPair(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): BlockPair? {
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
+        val half = parsed.properties["half"] ?: return null
+        val lowerY = when (half) {
+            "lower" -> y
             "upper" -> y - 1
             else -> return null
         }
-        if (pairedY !in -64..319) return null
-        val pairedStateId = world.blockStateAt(x, pairedY, z)
-        val paired = BlockStateRegistry.parsedState(pairedStateId) ?: return null
-        if (paired.blockKey != parsed.blockKey) return null
-        val expectedHalf = if (half == "lower") "upper" else "lower"
-        if (paired.properties["half"] != expectedHalf) return null
-        return BlockPos(x, pairedY, z)
+        val upperY = lowerY + 1
+        if (lowerY !in -64..319 || upperY !in -64..319) return null
+        val lowerStateId = world.blockStateAt(x, lowerY, z)
+        val upperStateId = world.blockStateAt(x, upperY, z)
+        val lower = BlockStateRegistry.parsedState(lowerStateId) ?: return null
+        val upper = BlockStateRegistry.parsedState(upperStateId) ?: return null
+        if (lower.blockKey != parsed.blockKey || upper.blockKey != parsed.blockKey) return null
+        if (lower.properties["half"] != "lower" || upper.properties["half"] != "upper") return null
+        return BlockPair(BlockPos(x, lowerY, z), BlockPos(x, upperY, z))
+    }
+
+    private fun bedPair(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): BlockPair? {
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
+        if (parsed.blockKey !in BED_BLOCK_KEYS) return null
+        val part = parsed.properties["part"] ?: return null
+        val facing = parsed.properties["facing"] ?: return null
+        val (dx, dz) = horizontalFacingOffset(facing) ?: return null
+        val footX: Int
+        val footZ: Int
+        val headX: Int
+        val headZ: Int
+        when (part) {
+            "foot" -> {
+                footX = x
+                footZ = z
+                headX = x + dx
+                headZ = z + dz
+            }
+            "head" -> {
+                footX = x - dx
+                footZ = z - dz
+                headX = x
+                headZ = z
+            }
+            else -> return null
+        }
+        val footStateId = world.blockStateAt(footX, y, footZ)
+        val headStateId = world.blockStateAt(headX, y, headZ)
+        val foot = BlockStateRegistry.parsedState(footStateId) ?: return null
+        val head = BlockStateRegistry.parsedState(headStateId) ?: return null
+        if (foot.blockKey != parsed.blockKey || head.blockKey != parsed.blockKey) return null
+        if (foot.properties["part"] != "foot" || head.properties["part"] != "head") return null
+        return BlockPair(BlockPos(footX, y, footZ), BlockPos(headX, y, headZ))
+    }
+
+    private data class PairedPlacement(
+        val x: Int,
+        val y: Int,
+        val z: Int,
+        val stateId: Int
+    )
+
+    private fun pairedPlacementFor(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): PairedPlacement? {
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
+        if (parsed.properties["half"] == "lower") {
+            val upperY = y + 1
+            if (upperY !in -64..319) return null
+            val upperStateId = twoBlockUpperStateId(stateId)
+            if (upperStateId > 0) {
+                return PairedPlacement(x, upperY, z, upperStateId)
+            }
+        }
+
+        if (parsed.blockKey in BED_BLOCK_KEYS && parsed.properties["part"] == "foot") {
+            val facing = parsed.properties["facing"] ?: return null
+            val (dx, dz) = horizontalFacingOffset(facing) ?: return null
+            val props = HashMap(parsed.properties)
+            props["part"] = "head"
+            val headStateId = BlockStateRegistry.stateId(parsed.blockKey, props) ?: return null
+            return PairedPlacement(x + dx, y, z + dz, headStateId)
+        }
+
+        return null
+    }
+
+    private fun breakDependentBlocks(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        removedPositions: Collection<BlockPos>,
+        heldItemId: Int,
+        additionallyRemoved: MutableSet<BlockPos>
+    ) {
+        if (removedPositions.isEmpty()) return
+        val pending = ArrayDeque<BlockPos>()
+        val enqueued = HashSet<BlockPos>()
+        val dependents = ArrayList<BlockPos>(2)
+        for (removed in removedPositions) {
+            enqueueDependentChecks(removed, pending, enqueued)
+        }
+        while (pending.isNotEmpty()) {
+            val pos = pending.removeFirst()
+            val stateId = world.blockStateAt(pos.x, pos.y, pos.z)
+            if (stateId == 0) continue
+            dependents.clear()
+            appendDependentBlocksToBreak(world, pos.x, pos.y, pos.z, stateId, dependents)
+            if (dependents.isEmpty()) continue
+            for (dependent in dependents) {
+                val dependentStateId = world.blockStateAt(dependent.x, dependent.y, dependent.z)
+                if (dependentStateId == 0) continue
+                val drops = if (session.gameMode == GAME_MODE_SURVIVAL || session.gameMode == GAME_MODE_CREATIVE) {
+                    runCatching {
+                        VanillaMiningRules.resolveDrops(
+                            world,
+                            dependentStateId,
+                            heldItemId,
+                            dependent.x,
+                            dependent.y,
+                            dependent.z
+                        )
+                    }.onFailure { throwable ->
+                        logger.error(
+                            "Failed to resolve dependent block drops for block at {} {} {} in {} (stateId={}, heldItemId={})",
+                            dependent.x,
+                            dependent.y,
+                            dependent.z,
+                            session.worldKey,
+                            dependentStateId,
+                            heldItemId,
+                            throwable
+                        )
+                    }.getOrDefault(emptyList())
+                } else {
+                    emptyList()
+                }
+                setBlockAndBroadcast(session, dependent.x, dependent.y, dependent.z, 0)
+                additionallyRemoved.add(dependent)
+                if (drops.isNotEmpty()) {
+                    spawnBrokenBlockDrops(session, dependent.x, dependent.y, dependent.z, drops)
+                }
+                enqueueDependentChecks(dependent, pending, enqueued)
+            }
+        }
+    }
+
+    private fun breakImmediateOrphanVerticalPairs(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        removedPositions: Collection<BlockPos>,
+        heldItemId: Int,
+        additionallyRemoved: MutableSet<BlockPos>
+    ) {
+        for (removed in removedPositions) {
+            breakOrphanVerticalPairAt(session, world, BlockPos(removed.x, removed.y + 1, removed.z), heldItemId, additionallyRemoved)
+            breakOrphanVerticalPairAt(session, world, BlockPos(removed.x, removed.y - 1, removed.z), heldItemId, additionallyRemoved)
+        }
+    }
+
+    private fun breakOrphanVerticalPairAt(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        pos: BlockPos,
+        heldItemId: Int,
+        additionallyRemoved: MutableSet<BlockPos>
+    ) {
+        if (pos.y !in -64..319) return
+        val stateId = world.blockStateAt(pos.x, pos.y, pos.z)
+        if (stateId == 0) return
+        if (!isBrokenVerticalPairBlock(world, pos.x, pos.y, pos.z, stateId)) return
+        val drops = if (session.gameMode == GAME_MODE_SURVIVAL || session.gameMode == GAME_MODE_CREATIVE) {
+            runCatching {
+                VanillaMiningRules.resolveDrops(world, stateId, heldItemId, pos.x, pos.y, pos.z)
+            }.onFailure { throwable ->
+                logger.error(
+                    "Failed to resolve orphan vertical pair drops for block at {} {} {} in {} (stateId={}, heldItemId={})",
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    session.worldKey,
+                    stateId,
+                    heldItemId,
+                    throwable
+                )
+            }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+        setBlockAndBroadcast(session, pos.x, pos.y, pos.z, 0)
+        additionallyRemoved.add(pos)
+        if (drops.isNotEmpty()) {
+            spawnBrokenBlockDrops(session, pos.x, pos.y, pos.z, drops)
+        }
+    }
+
+    private fun isBrokenVerticalPairBlock(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): Boolean {
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        val half = parsed.properties["half"] ?: return false
+        if (half != "lower" && half != "upper") return false
+        return verticallyPairedBlockPos(world, x, y, z, stateId) == null
+    }
+
+    private fun enqueueDependentChecks(
+        center: BlockPos,
+        pending: ArrayDeque<BlockPos>,
+        enqueued: MutableSet<BlockPos>
+    ) {
+        enqueueDependentCheck(center.x, center.y + 1, center.z, pending, enqueued)
+        enqueueDependentCheck(center.x, center.y - 1, center.z, pending, enqueued)
+        enqueueDependentCheck(center.x + 1, center.y, center.z, pending, enqueued)
+        enqueueDependentCheck(center.x - 1, center.y, center.z, pending, enqueued)
+        enqueueDependentCheck(center.x, center.y, center.z + 1, pending, enqueued)
+        enqueueDependentCheck(center.x, center.y, center.z - 1, pending, enqueued)
+    }
+
+    private fun enqueueDependentCheck(
+        x: Int,
+        y: Int,
+        z: Int,
+        pending: ArrayDeque<BlockPos>,
+        enqueued: MutableSet<BlockPos>
+    ) {
+        if (y !in -64..319) return
+        val candidate = BlockPos(x, y, z)
+        if (enqueued.add(candidate)) {
+            pending.addLast(candidate)
+        }
+    }
+
+    private fun appendDependentBlocksToBreak(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int,
+        out: MutableList<BlockPos>
+    ) {
+        if (!shouldBreakForMissingSupport(world, x, y, z, stateId)) return
+        val primary = BlockPos(x, y, z)
+        out.add(primary)
+        val pair = verticallyPairedBlockPos(world, x, y, z, stateId)
+        if (pair != null && pair != primary) {
+            out.add(pair)
+        }
+    }
+
+    private fun shouldBreakForMissingSupport(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): Boolean {
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        val blockKey = parsed.blockKey
+        val half = parsed.properties["half"]
+        if ((half == "lower" || half == "upper") &&
+            verticalHalfCounterpartStateId(stateId) != null &&
+            verticallyPairedBlockPos(world, x, y, z, stateId) == null
+        ) {
+            return true
+        }
+
+        if (half != "upper" && requiresSupportBelow(blockKey)) {
+            val belowStateId = world.blockStateAt(x, y - 1, z)
+            if (!isValidBelowSupportFor(blockKey, belowStateId)) {
+                return true
+            }
+        }
+
+        val face = parsed.properties["face"]
+        val facing = parsed.properties["facing"]
+        if (face != null && facing != null) {
+            val attached = when (face) {
+                "floor" -> BlockPos(x, y - 1, z)
+                "ceiling" -> BlockPos(x, y + 1, z)
+                "wall" -> attachedSupportPos(x, y, z, facing) ?: return true
+                else -> null
+            }
+            if (attached != null && !isSupportBlock(world.blockStateAt(attached.x, attached.y, attached.z))) {
+                return true
+            }
+        }
+
+        if (blockKey in WALL_MOUNTED_BLOCK_KEYS) {
+            val attached = attachedSupportPos(x, y, z, facing ?: return true) ?: return true
+            if (!isSupportBlock(world.blockStateAt(attached.x, attached.y, attached.z))) {
+                return true
+            }
+        }
+
+        if (blockKey == "minecraft:vine") {
+            if (!vineHasAnySupport(world, x, y, z, parsed.properties)) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private fun requiresSupportBelow(blockKey: String): Boolean {
+        return blockKey in BELOW_SUPPORT_BREAK_KEYS ||
+            blockKey.endsWith("_sapling") ||
+            blockKey.endsWith("_tulip") ||
+            blockKey.endsWith("_orchid") ||
+            blockKey.endsWith("_daisy") ||
+            blockKey.endsWith("_bluet") ||
+            blockKey.endsWith("_mushroom") ||
+            blockKey.endsWith("_bush") ||
+            blockKey.endsWith("_fungus")
+    }
+
+    private fun isValidBelowSupportFor(blockKey: String, belowStateId: Int): Boolean {
+        val below = BlockStateRegistry.parsedState(belowStateId)
+        val belowBlockKey = below?.blockKey
+        if (blockKey in CROPS_REQUIRING_FARMLAND) {
+            return belowBlockKey == "minecraft:farmland"
+        }
+        if (blockKey in GRASS_DECORATION_SUPPORT_KEYS) {
+            return belowBlockKey in GRASS_LIKE_SUPPORT_KEYS
+        }
+        return isSupportBlock(belowStateId)
+    }
+
+    private fun isSupportBlock(stateId: Int): Boolean {
+        if (stateId == 0) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return true
+        return parsed.blockKey !in NON_SUPPORT_BLOCK_KEYS
+    }
+
+    private fun isInstantBreakBlock(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        return parsed.blockKey in INSTANT_BREAK_BLOCK_KEYS
+    }
+
+    private fun isFallingGravityBlockState(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        return fallingGravityStateCache.computeIfAbsent(stateId) { id ->
+            val blockKey = BlockStateRegistry.parsedState(id)?.blockKey ?: return@computeIfAbsent false
+            blockKey in FALLING_BLOCK_KEYS
+        }
+    }
+
+    private fun canFallingBlockPassThrough(stateId: Int): Boolean {
+        if (stateId == 0) return true
+        return fallingPassThroughStateCache.computeIfAbsent(stateId) { id ->
+            val blockKey = BlockStateRegistry.parsedState(id)?.blockKey ?: return@computeIfAbsent false
+            blockKey in FALLING_BLOCK_PASS_THROUGH_KEYS
+        }
+    }
+
+    private fun attachedSupportPos(x: Int, y: Int, z: Int, facing: String): BlockPos? {
+        return when (facing) {
+            "north" -> BlockPos(x, y, z + 1)
+            "south" -> BlockPos(x, y, z - 1)
+            "east" -> BlockPos(x - 1, y, z)
+            "west" -> BlockPos(x + 1, y, z)
+            "up" -> BlockPos(x, y - 1, z)
+            "down" -> BlockPos(x, y + 1, z)
+            else -> null
+        }
+    }
+
+    private fun horizontalFacingOffset(facing: String): Pair<Int, Int>? {
+        return when (facing) {
+            "north" -> 0 to -1
+            "south" -> 0 to 1
+            "east" -> 1 to 0
+            "west" -> -1 to 0
+            else -> null
+        }
+    }
+
+    private fun vineHasAnySupport(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        properties: Map<String, String>
+    ): Boolean {
+        if (properties["up"] == "true" && isSupportBlock(world.blockStateAt(x, y + 1, z))) {
+            return true
+        }
+        if (properties["north"] == "true" && isSupportBlock(world.blockStateAt(x, y, z - 1))) {
+            return true
+        }
+        if (properties["south"] == "true" && isSupportBlock(world.blockStateAt(x, y, z + 1))) {
+            return true
+        }
+        if (properties["east"] == "true" && isSupportBlock(world.blockStateAt(x + 1, y, z))) {
+            return true
+        }
+        if (properties["west"] == "true" && isSupportBlock(world.blockStateAt(x - 1, y, z))) {
+            return true
+        }
+        return false
     }
 
     private fun encodedItemStack(itemId: Int, count: Int = 1): ByteArray {
@@ -2999,9 +5325,30 @@ object PlayerSessionManager {
     private const val MAX_DROPPED_ITEM_LAG_TICKS_BEFORE_RESYNC = 10L
     private const val DROPPED_ITEM_COARSE_PARK_THRESHOLD_NANOS = 2_000_000L
     private const val DROPPED_ITEM_COARSE_PARK_GUARD_NANOS = 100_000L
+    private const val CHUNK_MSPT_ACTION_BAR_INTERVAL_NANOS = 50_000_000L
+    private const val GAME_MODE_SURVIVAL = 0
+    private const val GAME_MODE_CREATIVE = 1
     private const val GAME_MODE_SPECTATOR = 3
+    private const val MAX_PLAYER_HEALTH = 20f
+    private const val DEFAULT_PLAYER_FOOD = 20
+    private const val DEFAULT_PLAYER_SATURATION = 5f
+    private const val MINECRAFT_TICKS_PER_SECOND = 20.0
+    private const val MINECRAFT_DAY_TICKS = 24_000.0
+    private const val INITIAL_WORLD_TIME_TICKS = 0.0
+    private const val WORLD_TIME_BROADCAST_INTERVAL_SECONDS = 1.0
+    private const val MAX_FALLING_BLOCK_COLUMN_SCAN = 32
+    private const val SAFE_FALL_DISTANCE_BLOCKS = 3.0
     private const val MAX_HOTBAR_STACK_SIZE = 64
     private const val PLAYER_DROPPED_ITEM_PICKUP_DELAY_SECONDS = 2.0
+    private const val BLOCK_DROP_PICKUP_DELAY_SECONDS = 0.5
+    private const val BLOCK_DROP_HORIZONTAL_SPEED_MIN = -0.1
+    private const val BLOCK_DROP_HORIZONTAL_SPEED_MAX = 0.1
+    private const val BLOCK_DROP_VERTICAL_SPEED = 0.2
+    private const val PLAYERS_SOUND_SOURCE_ID = 7
+    private const val BIG_FALL_SOUND_DAMAGE_THRESHOLD = 5.0f
+    private const val FALL_DAMAGE_TYPE_ID_FALLBACK = 17
+    private val PLACEMENT_DEBUG_LOG_ENABLED: Boolean =
+        System.getProperty("aerogel.debug.placement")?.toBooleanStrictOrNull() ?: false
     private const val PLAYER_HITBOX_HALF_WIDTH = 0.3
     private const val DROPPED_ITEM_PICKUP_EXPAND_HORIZONTAL = 1.0
     private const val DROPPED_ITEM_PICKUP_EXPAND_UP = 0.5
@@ -3017,14 +5364,229 @@ object PlayerSessionManager {
     private const val MAX_DROPPED_ITEM_RELATIVE_MOVE_ACCUMULATOR_SECONDS = 2.0
     private const val MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC = 20.0
     private const val DROPPED_ITEM_VELOCITY_EPSILON = 1.0e-8
-    private val TWO_BLOCK_PLANT_KEYS = hashSetOf(
-        "minecraft:tall_grass",
-        "minecraft:large_fern"
-    )
+    private val json = Json { ignoreUnknownKeys = true }
     private val PICK_ITEM_FALLBACK_BLOCK_BY_BLOCK = hashMapOf(
         "minecraft:tall_grass" to "minecraft:short_grass",
         "minecraft:large_fern" to "minecraft:fern"
     )
+    private val BED_BLOCK_KEYS = loadBlockTag("beds")
+    private val INSTANT_BREAK_BLOCK_KEYS = hashSetOf(
+        "minecraft:air",
+        "minecraft:cave_air",
+        "minecraft:void_air",
+        "minecraft:fire",
+        "minecraft:soul_fire",
+        "minecraft:redstone_wire",
+        "minecraft:tripwire",
+        "minecraft:nether_portal",
+        "minecraft:end_portal",
+        "minecraft:end_gateway"
+    ).apply {
+        addAll(loadBlockTag("replaceable"))
+        addAll(loadBlockTag("flowers"))
+        addAll(loadBlockTag("small_flowers"))
+        addAll(loadBlockTag("crops"))
+        addAll(loadBlockTag("bee_growables"))
+    }
+    private val GRASS_LIKE_SUPPORT_KEYS = setOf(
+        "minecraft:grass_block",
+        "minecraft:podzol",
+        "minecraft:mycelium"
+    )
+    private val GRASS_DECORATION_SUPPORT_KEYS = setOf(
+        "minecraft:short_grass",
+        "minecraft:fern",
+        "minecraft:bush",
+        "minecraft:firefly_bush",
+        "minecraft:pink_petals",
+        "minecraft:wildflowers",
+        "minecraft:leaf_litter"
+    )
+    private val CROPS_REQUIRING_FARMLAND = setOf(
+        "minecraft:wheat",
+        "minecraft:carrots",
+        "minecraft:potatoes",
+        "minecraft:beetroots",
+        "minecraft:torchflower_crop",
+        "minecraft:pitcher_crop"
+    )
+    private val BELOW_SUPPORT_BREAK_KEYS = setOf(
+        "minecraft:short_grass",
+        "minecraft:fern",
+        "minecraft:dead_bush",
+        "minecraft:dandelion",
+        "minecraft:poppy",
+        "minecraft:blue_orchid",
+        "minecraft:allium",
+        "minecraft:azure_bluet",
+        "minecraft:red_tulip",
+        "minecraft:orange_tulip",
+        "minecraft:white_tulip",
+        "minecraft:pink_tulip",
+        "minecraft:oxeye_daisy",
+        "minecraft:cornflower",
+        "minecraft:lily_of_the_valley",
+        "minecraft:wither_rose",
+        "minecraft:torchflower",
+        "minecraft:bush",
+        "minecraft:firefly_bush",
+        "minecraft:pink_petals",
+        "minecraft:wildflowers",
+        "minecraft:leaf_litter",
+        "minecraft:closed_eyeblossom",
+        "minecraft:open_eyeblossom",
+        "minecraft:oak_sapling",
+        "minecraft:spruce_sapling",
+        "minecraft:birch_sapling",
+        "minecraft:jungle_sapling",
+        "minecraft:acacia_sapling",
+        "minecraft:dark_oak_sapling",
+        "minecraft:mangrove_propagule",
+        "minecraft:cherry_sapling",
+        "minecraft:brown_mushroom",
+        "minecraft:red_mushroom",
+        "minecraft:bamboo_sapling",
+        "minecraft:bamboo",
+        "minecraft:sweet_berry_bush",
+        "minecraft:torch",
+        "minecraft:fire",
+        "minecraft:soul_fire",
+        "minecraft:tall_grass",
+        "minecraft:large_fern",
+        "minecraft:sunflower",
+        "minecraft:lilac",
+        "minecraft:rose_bush",
+        "minecraft:peony",
+        "minecraft:pitcher_plant",
+        "minecraft:wheat",
+        "minecraft:carrots",
+        "minecraft:potatoes",
+        "minecraft:beetroots",
+        "minecraft:torchflower_crop",
+        "minecraft:pitcher_crop"
+    )
+    private val WALL_MOUNTED_BLOCK_KEYS = setOf(
+        "minecraft:wall_torch",
+        "minecraft:redstone_wall_torch",
+        "minecraft:soul_wall_torch"
+    )
+    private val NON_SUPPORT_BLOCK_KEYS = setOf(
+        "minecraft:air",
+        "minecraft:cave_air",
+        "minecraft:void_air",
+        "minecraft:water",
+        "minecraft:lava",
+        "minecraft:short_grass",
+        "minecraft:tall_grass",
+        "minecraft:fern",
+        "minecraft:large_fern",
+        "minecraft:dead_bush",
+        "minecraft:vine",
+        "minecraft:glow_lichen",
+        "minecraft:torch",
+        "minecraft:wall_torch",
+        "minecraft:redstone_torch",
+        "minecraft:redstone_wall_torch",
+        "minecraft:soul_torch",
+        "minecraft:soul_wall_torch",
+        "minecraft:fire",
+        "minecraft:soul_fire",
+        "minecraft:snow"
+    )
+    private val fallingGravityStateCache = ConcurrentHashMap<Int, Boolean>()
+    private val fallingPassThroughStateCache = ConcurrentHashMap<Int, Boolean>()
+    private val FALLING_BLOCK_KEYS = loadBlockTag("falling_blocks")
+    private val FALLING_BLOCK_PASS_THROUGH_KEYS = loadBlockTag("falling_block_pass_through")
+    private fun loadBlockTag(tagName: String): Set<String> {
+        return resolveBlockTag(tagName, HashSet())
+    }
+
+    private fun resolveBlockTag(tagName: String, visited: MutableSet<String>): Set<String> {
+        if (!visited.add(tagName)) return emptySet()
+        val resourcePath = "/data/minecraft/tags/block/$tagName.json"
+        val stream = PlayerSessionManager::class.java.getResourceAsStream(resourcePath) ?: return emptySet()
+        val root = stream.bufferedReader().use {
+            json.parseToJsonElement(it.readText()).jsonObject
+        }
+        val out = LinkedHashSet<String>()
+        for (value in root["values"]?.jsonArray.orEmpty()) {
+            val raw = value.jsonPrimitive.content
+            if (raw.startsWith("#minecraft:")) {
+                out.addAll(resolveBlockTag(raw.removePrefix("#minecraft:"), visited))
+            } else if (raw.startsWith("minecraft:")) {
+                out.add(raw)
+            }
+        }
+        return out
+    }
+    private val PLAYER_SMALL_FALL_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.player.small_fall")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.small_fall")
+            ?: PLAYER_SMALL_FALL_SOUND_ID_FALLBACK
+    }
+    private val PLAYER_BIG_FALL_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.player.big_fall")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.big_fall")
+            ?: PLAYER_BIG_FALL_SOUND_ID_FALLBACK
+    }
+    private val PLAYER_HURT_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.player.hurt")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.hurt")
+            ?: PLAYER_HURT_SOUND_ID_FALLBACK
+    }
+    private val PLAYER_ATTACK_STRONG_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.player.attack.strong")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.attack.strong")
+            ?: PLAYER_ATTACK_STRONG_SOUND_ID_FALLBACK
+    }
+    private val PLAYER_ATTACK_KNOCKBACK_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.player.attack.knockback")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.attack.knockback")
+            ?: PLAYER_ATTACK_KNOCKBACK_SOUND_ID_FALLBACK
+    }
+    private val PLAYER_ATTACK_CRIT_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.player.attack.crit")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.attack.crit")
+            ?: PLAYER_ATTACK_CRIT_SOUND_ID_FALLBACK
+    }
+    private val PLAYER_ATTACK_SWEEP_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.player.attack.sweep")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.attack.sweep")
+            ?: PLAYER_ATTACK_SWEEP_SOUND_ID_FALLBACK
+    }
+    private val PLAYER_ATTACK_WEAK_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.player.attack.weak")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.attack.weak")
+            ?: PLAYER_ATTACK_WEAK_SOUND_ID_FALLBACK
+    }
+    private val FALL_DAMAGE_TYPE_ID: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:damage_type", "minecraft:fall")
+            ?: FALL_DAMAGE_TYPE_ID_FALLBACK
+    }
+    private val PLAYER_ATTACK_DAMAGE_TYPE_ID: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:damage_type", "minecraft:player_attack")
+            ?: FALL_DAMAGE_TYPE_ID
+    }
+    private const val BASE_UNARMED_DAMAGE = 1.0f
+    private const val MAX_PLAYER_MELEE_REACH_SQ = 9.0
+    private const val VANILLA_CRITICAL_DAMAGE_MULTIPLIER = 1.5f
+    private const val VANILLA_STRONG_ATTACK_THRESHOLD = 0.9f
+    private const val BASE_PLAYER_KNOCKBACK = 0.4
+    private const val SPRINT_KNOCKBACK_BONUS = 0.5
+    private const val VANILLA_KNOCKBACK_UPWARD = 0.1
+    private const val VANILLA_SWEEP_BASE_DAMAGE = 1.0f
+    private const val VANILLA_SWEEP_KNOCKBACK = 0.4
+    private const val VANILLA_SWEEP_MAX_DISTANCE_SQ = 9.0
+    private const val PLAYER_SWEEP_SPEED_THRESHOLD = 0.25
+    private const val PLAYER_SMALL_FALL_SOUND_ID_FALLBACK = 1257
+    private const val PLAYER_BIG_FALL_SOUND_ID_FALLBACK = 1247
+    private const val PLAYER_HURT_SOUND_ID_FALLBACK = 1251
+    private const val PLAYER_ATTACK_KNOCKBACK_SOUND_ID_FALLBACK = 1242
+    private const val PLAYER_ATTACK_CRIT_SOUND_ID_FALLBACK = 1241
+    private const val PLAYER_ATTACK_STRONG_SOUND_ID_FALLBACK = 1244
+    private const val PLAYER_ATTACK_SWEEP_SOUND_ID_FALLBACK = 1245
+    private const val PLAYER_ATTACK_WEAK_SOUND_ID_FALLBACK = 1246
+    private const val ENTITY_EVENT_DEATH_ANIMATION = 3
 
     private fun chunkStreamBatchWorkers(): Int = ChunkStreamingService.maxWorkerCount().coerceAtLeast(1)
 
@@ -3043,13 +5605,6 @@ object PlayerSessionManager {
                 pending.centerChunkX == centerChunkX &&
                 pending.centerChunkZ == centerChunkZ &&
                 pending.radius == radius
-            ) {
-                return
-            }
-            if (pending == null &&
-                session.centerChunkX == centerChunkX &&
-                session.centerChunkZ == centerChunkZ &&
-                session.chunkRadius == radius
             ) {
                 return
             }
@@ -3097,6 +5652,9 @@ object PlayerSessionManager {
                     toLoadAll.add(coord)
                 }
             }
+            session.targetChunks.clear()
+            session.targetChunks.addAll(targetKeys)
+            updateRetainedBaseWorldChunksForWorld(session.worldKey)
             val toLoad = toLoadAll
 
             val shouldSendCurrentTarget = {
@@ -3129,9 +5687,11 @@ object PlayerSessionManager {
                             for (pos in toUnload) {
                                 val ids = unloadIdsByChunk[pos]?.getNow(IntArray(0)) ?: IntArray(0)
                                 hideDroppedItemsForChunk(session, ctx, pos, ids)
+                                hideFallingBlocksForChunk(session, ctx, pos, world.fallingBlockEntityIdsInChunk(pos.x, pos.z))
                                 session.loadedChunks.remove(pos)
                                 ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
                             }
+                            updateRetainedBaseWorldChunksForWorld(session.worldKey)
                             ctx.writeAndFlush(PlayPackets.chunkBatchFinishedPacket(totalSentCount))
                             drain()
                         }
@@ -3168,8 +5728,9 @@ object PlayerSessionManager {
                 loadedChunks = session.loadedChunks,
                 generatingChunks = session.generatingChunks,
                 shouldSend = shouldSendCurrentTarget,
-                onChunkSent = { _, droppedItems ->
+                onChunkSent = { chunkPos, droppedItems ->
                     sendDroppedItemsForChunk(session, ctx, droppedItems)
+                    sendFallingBlocksForChunk(session, ctx, world.fallingBlocksInChunk(chunkPos.x, chunkPos.z))
                 },
                 workerLimit = chunkStreamBatchWorkers()
             ).whenComplete { sentCount, error ->
@@ -3179,7 +5740,18 @@ object PlayerSessionManager {
                         return@execute
                     }
                     if (error != null) {
-                        session.pendingChunkTarget.set(next)
+                        logger.warn(
+                            "Chunk stream failed for player={} at center=({}, {}) radius={}; closing loading state",
+                            session.profile.username,
+                            next.centerChunkX,
+                            next.centerChunkZ,
+                            next.radius,
+                            error
+                        )
+                        // Avoid "Loading terrain..." stall on persistent generator failures.
+                        // Do not requeue the same failing target; allow future movement/view changes
+                        // to request a fresh stream.
+                        ctx.writeAndFlush(PlayPackets.chunkBatchFinishedPacket(0))
                         drain()
                         return@execute
                     }
