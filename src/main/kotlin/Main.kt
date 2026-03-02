@@ -289,8 +289,15 @@ private fun installJvmStderrWarningFilter() {
 
 private fun installStdoutInfoFilter() {
     System.setOut(createFilteredPrintStream(System.out) { line ->
-        false
+        shouldSuppressStdoutInfoLine(line)
     })
+}
+
+private fun shouldSuppressStdoutInfoLine(line: String): Boolean {
+    val trimmed = line.trim()
+    // External components occasionally emit noisy diagnostics like: "Dangling! 11 8 -1".
+    // Keep application logs intact and suppress only this known non-actionable line family.
+    return trimmed.startsWith("Dangling!")
 }
 
 private fun createFilteredPrintStream(

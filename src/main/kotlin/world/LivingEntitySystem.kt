@@ -78,6 +78,7 @@ data class AnimalEntity(
     override var fallDistance: Double,
     var fireSeconds: Double,
     var fireDamageAccumulatorSeconds: Double,
+    var ambientSoundTime: Int,
     var hurtInvulnerableSeconds: Double,
     var lastHurtAmount: Float,
     override var chunkX: Int,
@@ -172,20 +173,43 @@ data class AnimalDamagedEvent(
     val died: Boolean
 )
 
+data class AnimalAmbientEvent(
+    val entityId: Int,
+    val kind: AnimalKind,
+    val chunkPos: ChunkPos,
+    val x: Double,
+    val y: Double,
+    val z: Double,
+    val hitboxHeight: Double
+)
+
 data class AnimalTickEvents(
     val spawned: List<AnimalSnapshot>,
     val updated: List<AnimalSnapshot>,
     val removed: List<AnimalRemovedEvent>,
-    val damaged: List<AnimalDamagedEvent>
+    val damaged: List<AnimalDamagedEvent>,
+    val ambient: List<AnimalAmbientEvent>
 ) {
     fun isEmpty(): Boolean {
-        return spawned.isEmpty() && updated.isEmpty() && removed.isEmpty() && damaged.isEmpty()
+        return spawned.isEmpty() && updated.isEmpty() && removed.isEmpty() && damaged.isEmpty() && ambient.isEmpty()
     }
 }
 
 data class AnimalDamageResult(
     val damage: AnimalDamagedEvent,
     val removed: AnimalRemovedEvent?
+)
+
+data class AnimalDamageWithKnockbackResult(
+    val damageResult: AnimalDamageResult,
+    val knockbackApplied: Boolean,
+    val velocityX: Double,
+    val velocityY: Double,
+    val velocityZ: Double,
+    val x: Double,
+    val y: Double,
+    val z: Double,
+    val hitboxHeight: Double
 )
 
 class AnimalSystem(
@@ -303,6 +327,7 @@ class AnimalSystem(
             fallDistance = 0.0,
             fireSeconds = 0.0,
             fireDamageAccumulatorSeconds = 0.0,
+            ambientSoundTime = 0,
             hurtInvulnerableSeconds = 0.0,
             lastHurtAmount = 0f,
             chunkX = chunkX,
@@ -387,25 +412,26 @@ class AnimalSystem(
         deltaSeconds: Double,
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): AnimalTickEvents {
-        if (deltaSeconds <= 0.0) return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+        if (deltaSeconds <= 0.0) return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
         val tickScale = deltaSeconds * TICKS_PER_SECOND
         if (tickScale <= 0.0 || !tickScale.isFinite()) {
-            return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+            return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
         }
         val ids = chunkIndex[chunkPos]?.toList().orEmpty()
         if (ids.isEmpty()) {
             chunkTimeRecorder?.invoke(chunkPos, 0L)
-            return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+            return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
         }
         val startedAt = System.nanoTime()
         val updated = ArrayList<AnimalSnapshot>()
         val removed = ArrayList<AnimalRemovedEvent>()
         val damaged = ArrayList<AnimalDamagedEvent>()
+        val ambient = ArrayList<AnimalAmbientEvent>()
 
         for (entityId in ids) {
             val entity = entities[entityId] ?: continue
             if (entity.chunkX != chunkPos.x || entity.chunkZ != chunkPos.z) continue
-            processEntityTick(entityId, entity, tickScale, updated, removed, damaged)
+            processEntityTick(entityId, entity, tickScale, updated, removed, damaged, ambient)
         }
 
         chunkTimeRecorder?.invoke(chunkPos, System.nanoTime() - startedAt)
@@ -413,7 +439,8 @@ class AnimalSystem(
             spawned = emptyList(),
             updated = updated,
             removed = removed,
-            damaged = damaged
+            damaged = damaged,
+            ambient = ambient
         )
     }
 
@@ -422,12 +449,13 @@ class AnimalSystem(
         activeSimulationChunks: Set<ChunkPos>? = null,
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): AnimalTickEvents {
-        if (deltaSeconds <= 0.0) return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
-        if (entities.isEmpty()) return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+        if (deltaSeconds <= 0.0) return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
+        if (entities.isEmpty()) return AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
         val spawned = drainSpawnedSnapshots().toMutableList()
         val updated = ArrayList<AnimalSnapshot>()
         val removed = ArrayList<AnimalRemovedEvent>()
         val damaged = ArrayList<AnimalDamagedEvent>()
+        val ambient = ArrayList<AnimalAmbientEvent>()
         val chunks = if (activeSimulationChunks == null) {
             chunkIndex.keys.toList()
         } else {
@@ -438,9 +466,10 @@ class AnimalSystem(
             if (lane.updated.isNotEmpty()) updated.addAll(lane.updated)
             if (lane.removed.isNotEmpty()) removed.addAll(lane.removed)
             if (lane.damaged.isNotEmpty()) damaged.addAll(lane.damaged)
+            if (lane.ambient.isNotEmpty()) ambient.addAll(lane.ambient)
         }
 
-        return AnimalTickEvents(spawned, updated, removed, damaged)
+        return AnimalTickEvents(spawned, updated, removed, damaged, ambient)
     }
 
     fun damage(entityId: Int, amount: Float, cause: AnimalDamageCause): AnimalDamageResult? {
@@ -448,6 +477,71 @@ class AnimalSystem(
         val entity = entities[entityId] ?: return null
         if (entity.dead) return null
         return applyDamageInternal(entity, amount, cause)
+    }
+
+    fun damageWithKnockback(
+        entityId: Int,
+        amount: Float,
+        cause: AnimalDamageCause,
+        attackerX: Double,
+        attackerZ: Double,
+        strength: Double,
+        preGravityYCompensation: Double = 0.0
+    ): AnimalDamageWithKnockbackResult? {
+        if (amount <= 0f) return null
+        val entity = entities[entityId] ?: return null
+        if (entity.dead) return null
+        val damageResult = applyDamageInternal(entity, amount, cause) ?: return null
+
+        var knockbackApplied = false
+        var velocityX = entity.vx
+        var velocityY = entity.vy
+        var velocityZ = entity.vz
+
+        if (strength > 0.0) {
+            val knockDirX = attackerX - entity.x
+            val knockDirZ = attackerZ - entity.z
+            val norm = sqrt((knockDirX * knockDirX) + (knockDirZ * knockDirZ))
+            if (norm > 1.0e-6) {
+                val normalizedX = knockDirX / norm
+                val normalizedZ = knockDirZ / norm
+                val nextVx = (entity.vx * 0.5) - (normalizedX * strength)
+                val nextVz = (entity.vz * 0.5) - (normalizedZ * strength)
+                val groundedForKnockback = entity.onGround || kotlin.math.abs(entity.vy) <= 1.0e-6
+                val nextVy = if (groundedForKnockback) {
+                    minOf(0.4 + preGravityYCompensation, (entity.vy * 0.5) + strength + preGravityYCompensation)
+                } else {
+                    entity.vy
+                }
+                entity.vx = nextVx
+                entity.vy = nextVy
+                entity.vz = nextVz
+                if (nextVy > 0.0) {
+                    // Apply airborne state immediately so panic/AI steering cannot override
+                    // attack knockback in the same simulation turn before movement integration.
+                    entity.onGround = false
+                }
+                velocityX = nextVx
+                velocityY = nextVy
+                velocityZ = nextVz
+                knockbackApplied = true
+            }
+        }
+
+        if (damageResult.removed == null) {
+            snapshots[entityId] = toSnapshot(entity)
+        }
+        return AnimalDamageWithKnockbackResult(
+            damageResult = damageResult,
+            knockbackApplied = knockbackApplied,
+            velocityX = velocityX,
+            velocityY = velocityY,
+            velocityZ = velocityZ,
+            x = entity.x,
+            y = entity.y,
+            z = entity.z,
+            hitboxHeight = entity.hitboxHeight
+        )
     }
 
     fun remove(entityId: Int, died: Boolean = false): AnimalRemovedEvent? {
@@ -495,7 +589,8 @@ class AnimalSystem(
         tickScale: Double,
         updated: MutableList<AnimalSnapshot>,
         removed: MutableList<AnimalRemovedEvent>,
-        damaged: MutableList<AnimalDamagedEvent>
+        damaged: MutableList<AnimalDamagedEvent>,
+        ambient: MutableList<AnimalAmbientEvent>
     ) {
         val brain = brains.computeIfAbsent(entityId) { AnimalBrain() }
         val preAiX = entity.x
@@ -555,6 +650,7 @@ class AnimalSystem(
                 }
             }
         }
+        tickAmbientSound(entity, ambient)
 
         val fellOut = entity.y < DESPAWN_Y || entity.y > WORLD_MAX_Y + 2.0
         if (fellOut) {
@@ -774,6 +870,7 @@ class AnimalSystem(
 
         val jumpStepY = currentY + MAX_JUMP_STEP_HEIGHT
         if (collidesAt(entity, entity.x, jumpStepY, entity.z)) return false
+        if (collidesAt(entity, targetX, jumpStepY, targetZ)) return false
         // Vanilla LivingEntity#jumpFromGround semantics:
         // set vertical velocity only; position advances through normal travel/collision.
         entity.vy = entity.vy.coerceAtLeast(JUMP_VELOCITY_PER_TICK)
@@ -809,6 +906,7 @@ class AnimalSystem(
         if (nextHealth >= entity.health) return null
         entity.health = nextHealth
         entity.hurtInvulnerableSeconds = HURT_INVULNERABILITY_SECONDS
+        entity.ambientSoundTime = -ambientSoundIntervalTicks(entity.kind)
         entity.lastHurtAmount = amount
         val brain = brains.computeIfAbsent(entity.entityId) { AnimalBrain() }
         if (isPanicCause(cause)) {
@@ -856,14 +954,16 @@ class AnimalSystem(
             applyRiderControlIntent(entity, brain, tickScale, rideControl)
             return
         }
-        brain.panicDangerSeconds = (brain.panicDangerSeconds - deltaSeconds).coerceAtLeast(0.0)
+        if (entity.onGround) {
+            brain.panicDangerSeconds = (brain.panicDangerSeconds - deltaSeconds).coerceAtLeast(0.0)
+        }
         brain.temptCalmDownSeconds = (brain.temptCalmDownSeconds - deltaSeconds).coerceAtLeast(0.0)
         brain.retargetCooldownSeconds = (brain.retargetCooldownSeconds - deltaSeconds).coerceAtLeast(0.0)
         brain.repathCooldownSeconds = (brain.repathCooldownSeconds - deltaSeconds).coerceAtLeast(0.0)
-        if (!brain.panicActive && brain.panicDangerSeconds > 0.0) {
+        if (!brain.panicActive && brain.panicDangerSeconds > 0.0 && entity.onGround) {
             startPanicEscape(entity, brain)
         }
-        val isPanicking = brain.panicActive
+        val isPanicking = brain.panicActive && entity.onGround
         val temptSource = if (!isPanicking && brain.temptCalmDownSeconds <= 0.0) nearestTemptSource(entity) else null
         val isTempted = temptSource != null
         val wasTempted = brain.wasTempted
@@ -1055,9 +1155,11 @@ class AnimalSystem(
         val invLen = 1.0 / sqrt(distSq)
         val dirX = toWaypointX * invLen
         val dirZ = toWaypointZ * invLen
-        // Vanilla knockback preserves airborne momentum better than our direct velocity steering model.
-        // While recently hurt and airborne, suppress AI turn/steer so knockback direction is not snapped.
-        val suppressAirborneSteering = !entity.onGround && entity.hurtInvulnerableSeconds > 0.0
+        // Keep airborne momentum intact:
+        // - right after hurt (vanilla-like knockback preservation)
+        // - and whenever panic state is active in air, so panic steering starts only after landing.
+        val suppressAirborneSteering =
+            !entity.onGround && (entity.hurtInvulnerableSeconds > 0.0 || brain.panicActive)
         if (suppressAirborneSteering) {
             return
         }
@@ -1754,10 +1856,37 @@ class AnimalSystem(
         return 0f
     }
 
+    private fun tickAmbientSound(entity: AnimalEntity, ambient: MutableList<AnimalAmbientEvent>) {
+        if (entity.dead) return
+        val random = ThreadLocalRandom.current().nextInt(1000)
+        val currentAmbientSoundTime = entity.ambientSoundTime
+        entity.ambientSoundTime = currentAmbientSoundTime + 1
+        if (random >= currentAmbientSoundTime) return
+        entity.ambientSoundTime = -ambientSoundIntervalTicks(entity.kind)
+        ambient.add(
+            AnimalAmbientEvent(
+                entityId = entity.entityId,
+                kind = entity.kind,
+                chunkPos = ChunkPos(entity.chunkX, entity.chunkZ),
+                x = entity.x,
+                y = entity.y,
+                z = entity.z,
+                hitboxHeight = entity.hitboxHeight
+            )
+        )
+    }
+
     private fun isPanicCause(cause: AnimalDamageCause): Boolean {
         // Vanilla EscapeDangerGoal checks DamageTypeTags.PANIC_CAUSES via getRecentDamageSource().
         // Our local damage model keeps coarse causes, so treat direct attacks/generic hazard as panic causes.
         return cause != AnimalDamageCause.FALL
+    }
+
+    private fun ambientSoundIntervalTicks(kind: AnimalKind): Int {
+        // Vanilla Mob#getAmbientSoundInterval default is 80 ticks; Pig does not override it.
+        return when (kind) {
+            AnimalKind.PIG -> 80
+        }
     }
 
     private fun aabbIntersects(

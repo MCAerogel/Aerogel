@@ -9,7 +9,8 @@ class ChunkProcessingProfiler {
     data class ChunkStatSnapshot(
         val chunkPos: ChunkPos,
         val mspt: Double,
-        val tps: Double
+        val tps: Double,
+        val breakdownMs: Map<String, Double>
     )
 
     class Frame internal constructor(
@@ -17,21 +18,28 @@ class ChunkProcessingProfiler {
         internal val tickSequence: Long
     ) {
         private val totalsByChunk = ConcurrentHashMap<ChunkPos, LongAdder>()
+        private val totalsByChunkAndCategory = ConcurrentHashMap<ChunkPos, ConcurrentHashMap<String, LongAdder>>()
         private val closed = AtomicBoolean(false)
 
-        fun record(chunkPos: ChunkPos, elapsedNanos: Long) {
+        fun record(chunkPos: ChunkPos, elapsedNanos: Long, category: String = CATEGORY_OTHER) {
             if (closed.get()) {
                 owner.recordImmediate(
                     chunkPos = chunkPos,
                     elapsedNanos = elapsedNanos,
                     accumulateIntoLast = true,
-                    tickSequence = tickSequence
+                    tickSequence = tickSequence,
+                    breakdownMs = mapOf(category to (elapsedNanos.coerceAtLeast(0L) / 1_000_000.0))
                 )
                 return
             }
+            val clamped = elapsedNanos.coerceAtLeast(0L)
             totalsByChunk
                 .computeIfAbsent(chunkPos) { LongAdder() }
-                .add(elapsedNanos.coerceAtLeast(0L))
+                .add(clamped)
+            totalsByChunkAndCategory
+                .computeIfAbsent(chunkPos) { ConcurrentHashMap() }
+                .computeIfAbsent(category) { LongAdder() }
+                .add(clamped)
         }
 
         internal fun close() {
@@ -46,18 +54,36 @@ class ChunkProcessingProfiler {
             }
             return out
         }
+
+        internal fun snapshotNanosByChunkAndCategory(): Map<ChunkPos, Map<String, Long>> {
+            if (totalsByChunkAndCategory.isEmpty()) return emptyMap()
+            val out = HashMap<ChunkPos, Map<String, Long>>(totalsByChunkAndCategory.size)
+            for ((chunkPos, categoryTotals) in totalsByChunkAndCategory) {
+                val byCategory = HashMap<String, Long>(categoryTotals.size)
+                for ((category, total) in categoryTotals) {
+                    byCategory[category] = total.sum()
+                }
+                out[chunkPos] = byCategory
+            }
+            return out
+        }
     }
 
     private data class ChunkStat(
         val lastMs: Double,
-        val ewmaMs: Double,
         val lastIntervalMs: Double,
-        val ewmaIntervalMs: Double,
         val lastTps: Double,
-        val ewmaTps: Double,
+        val measuredMs: Double,
+        val measuredTps: Double,
         val updatedAtNanos: Long,
         val meaningfulUpdatedAtNanos: Long,
-        val lastTickSequence: Long
+        val lastTickSequence: Long,
+        val lastBreakdownMs: Map<String, Double>,
+        val windowStartedAtNanos: Long,
+        val windowAccumulatedWorkMs: Double,
+        val windowAccumulatedIntervalMs: Double,
+        val windowSampleCount: Int,
+        val windowAccumulatedBreakdownMs: Map<String, Double>
     )
 
     private val statsByChunk = ConcurrentHashMap<ChunkPos, ChunkStat>()
@@ -72,6 +98,7 @@ class ChunkProcessingProfiler {
     ) {
         frame.close()
         val frameTotals = frame.snapshotNanosByChunk()
+        val frameBreakdowns = frame.snapshotNanosByChunkAndCategory()
         val nowNanos = System.nanoTime()
 
         for ((chunkPos, totalNanos) in frameTotals) {
@@ -80,7 +107,8 @@ class ChunkProcessingProfiler {
                 lastMs = totalNanos / 1_000_000.0,
                 updatedAtNanos = nowNanos,
                 accumulateIntoLast = accumulateIntoLast,
-                tickSequence = frame.tickSequence
+                tickSequence = frame.tickSequence,
+                breakdownMs = toMsBreakdown(frameBreakdowns[chunkPos].orEmpty())
             )
         }
 
@@ -92,7 +120,8 @@ class ChunkProcessingProfiler {
                     lastMs = 0.0,
                     updatedAtNanos = nowNanos,
                     accumulateIntoLast = accumulateIntoLast,
-                    tickSequence = frame.tickSequence
+                    tickSequence = frame.tickSequence,
+                    breakdownMs = emptyMap()
                 )
             }
         }
@@ -100,32 +129,29 @@ class ChunkProcessingProfiler {
 
     fun mspt(chunkX: Int, chunkZ: Int): Double {
         val stat = statsByChunk[ChunkPos(chunkX, chunkZ)]
-        return stat?.lastMs ?: 0.0
+        return stat?.measuredMs ?: 0.0
     }
 
     fun tps(chunkX: Int, chunkZ: Int): Double {
         val stat = statsByChunk[ChunkPos(chunkX, chunkZ)] ?: return configuredTargetTps()
-        val ageMs = ((System.nanoTime() - stat.updatedAtNanos).coerceAtLeast(0L)) / 1_000_000.0
-        val intervalMs = maxOf(stat.lastIntervalMs, ageMs)
-        return chunkTpsFromIntervalMs(intervalMs)
+        return stat.measuredTps
     }
 
     fun ewmaMspt(chunkX: Int, chunkZ: Int): Double {
         val stat = statsByChunk[ChunkPos(chunkX, chunkZ)]
-        return stat?.ewmaMs ?: 0.0
+        return stat?.measuredMs ?: 0.0
     }
 
     fun ewmaTps(chunkX: Int, chunkZ: Int): Double {
         val stat = statsByChunk[ChunkPos(chunkX, chunkZ)] ?: return configuredTargetTps()
-        val ageMs = ((System.nanoTime() - stat.updatedAtNanos).coerceAtLeast(0L)) / 1_000_000.0
-        val intervalMs = maxOf(stat.ewmaIntervalMs, ageMs)
-        return chunkTpsFromIntervalMs(intervalMs)
+        return stat.measuredTps
     }
 
     fun isChunkIdle(chunkX: Int, chunkZ: Int): Boolean {
         val stat = statsByChunk[ChunkPos(chunkX, chunkZ)] ?: return true
         val ageMs = ((System.nanoTime() - stat.meaningfulUpdatedAtNanos).coerceAtLeast(0L)) / 1_000_000.0
-        val idleThresholdMs = maxOf(stat.lastIntervalMs * IDLE_INTERVAL_MULTIPLIER, IDLE_MIN_AGE_MS)
+        val dynamicThresholdMs = maxOf(stat.lastIntervalMs * IDLE_INTERVAL_MULTIPLIER, IDLE_MIN_AGE_MS)
+        val idleThresholdMs = dynamicThresholdMs.coerceAtMost(IDLE_MAX_AGE_MS)
         return ageMs > idleThresholdMs
     }
 
@@ -133,13 +159,38 @@ class ChunkProcessingProfiler {
         if (limit <= 0) return emptyList()
         val snapshots = ArrayList<ChunkStatSnapshot>(statsByChunk.size)
         for ((chunkPos, stat) in statsByChunk) {
-            val mspt = stat.lastMs
+            val mspt = stat.measuredMs
             if (!mspt.isFinite() || mspt < minMspt) continue
-            val tps = stat.lastTps
+            val tps = stat.measuredTps
             snapshots += ChunkStatSnapshot(
                 chunkPos = chunkPos,
                 mspt = mspt,
-                tps = if (tps.isFinite()) tps else 0.0
+                tps = if (tps.isFinite()) tps else 0.0,
+                breakdownMs = stat.lastBreakdownMs
+            )
+        }
+        if (snapshots.isEmpty()) return emptyList()
+        snapshots.sortWith(
+            compareByDescending<ChunkStatSnapshot> { it.mspt }
+                .thenByDescending { it.tps }
+                .thenBy { it.chunkPos.x }
+                .thenBy { it.chunkPos.z }
+        )
+        return if (snapshots.size <= limit) snapshots else snapshots.subList(0, limit)
+    }
+
+    fun topChunksByEwmaMspt(limit: Int, minMspt: Double = 0.0): List<ChunkStatSnapshot> {
+        if (limit <= 0) return emptyList()
+        val snapshots = ArrayList<ChunkStatSnapshot>(statsByChunk.size)
+        for ((chunkPos, stat) in statsByChunk) {
+            val mspt = stat.measuredMs
+            if (!mspt.isFinite() || mspt < minMspt) continue
+            val tps = stat.measuredTps
+            snapshots += ChunkStatSnapshot(
+                chunkPos = chunkPos,
+                mspt = mspt,
+                tps = if (tps.isFinite()) tps else 0.0,
+                breakdownMs = stat.lastBreakdownMs
             )
         }
         if (snapshots.isEmpty()) return emptyList()
@@ -157,62 +208,110 @@ class ChunkProcessingProfiler {
         lastMs: Double,
         updatedAtNanos: Long,
         accumulateIntoLast: Boolean,
-        tickSequence: Long
+        tickSequence: Long,
+        breakdownMs: Map<String, Double>
     ) {
         statsByChunk.compute(chunkPos) { _, previous ->
+            if (previous != null &&
+                tickSequence != NO_TICK_SEQUENCE &&
+                previous.lastTickSequence != NO_TICK_SEQUENCE &&
+                tickSequence < previous.lastTickSequence &&
+                !accumulateIntoLast
+            ) {
+                // Ignore stale non-accumulating samples.
+                return@compute previous
+            }
             val defaultIntervalMs = 1000.0 / configuredTargetTps()
             val observedIntervalMs = if (previous == null) {
                 defaultIntervalMs
             } else {
                 ((updatedAtNanos - previous.updatedAtNanos).coerceAtLeast(0L)) / 1_000_000.0
             }
-            val sameLogicalTick = accumulateIntoLast &&
+            val staleAccumulatingTick = accumulateIntoLast &&
+                previous != null &&
+                tickSequence != NO_TICK_SEQUENCE &&
+                previous.lastTickSequence != NO_TICK_SEQUENCE &&
+                tickSequence < previous.lastTickSequence
+            val sameLogicalTick = !staleAccumulatingTick && accumulateIntoLast &&
                 previous != null &&
                 tickSequence != NO_TICK_SEQUENCE &&
                 previous.lastTickSequence == tickSequence
-            val effectiveLastMs = if (sameLogicalTick) {
-                previous!!.lastMs + lastMs
+            val aggregateIntoPreviousSample = staleAccumulatingTick || sameLogicalTick
+            val effectiveLastMs = if (aggregateIntoPreviousSample) {
+                previous.lastMs + lastMs
             } else {
                 lastMs
             }
-            val effectiveIntervalMs = if (previous == null) {
+            val effectiveIntervalMs = if (previous == null || staleAccumulatingTick) {
                 observedIntervalMs
             } else if (sameLogicalTick) {
                 previous.lastIntervalMs
             } else {
                 observedIntervalMs.coerceAtLeast(0.001)
             }
-            val lastTps = chunkTpsFromIntervalMs(effectiveIntervalMs)
+            val effectiveLastTps = chunkTpsFromIntervalMs(effectiveIntervalMs)
             val meaningfulUpdatedAtNanos = if (effectiveLastMs >= IDLE_NOISE_MSPT) {
                 updatedAtNanos
             } else {
                 previous?.meaningfulUpdatedAtNanos ?: updatedAtNanos
             }
-            if (previous == null) {
-                ChunkStat(
-                    lastMs = effectiveLastMs,
-                    ewmaMs = effectiveLastMs,
-                    lastIntervalMs = effectiveIntervalMs,
-                    ewmaIntervalMs = effectiveIntervalMs,
-                    lastTps = lastTps,
-                    ewmaTps = lastTps,
-                    updatedAtNanos = updatedAtNanos,
-                    meaningfulUpdatedAtNanos = meaningfulUpdatedAtNanos,
-                    lastTickSequence = tickSequence
-                )
-            } else {
-                ChunkStat(
-                    lastMs = effectiveLastMs,
-                    ewmaMs = previous.ewmaMs * EWMA_KEEP + effectiveLastMs * EWMA_NEW,
-                    lastIntervalMs = effectiveIntervalMs,
-                    ewmaIntervalMs = previous.ewmaIntervalMs * EWMA_KEEP + effectiveIntervalMs * EWMA_NEW,
-                    lastTps = lastTps,
-                    ewmaTps = previous.ewmaTps * EWMA_KEEP + lastTps * EWMA_NEW,
-                    updatedAtNanos = updatedAtNanos,
-                    meaningfulUpdatedAtNanos = meaningfulUpdatedAtNanos,
-                    lastTickSequence = if (tickSequence != NO_TICK_SEQUENCE) tickSequence else previous.lastTickSequence
-                )
+
+            var windowStartedAtNanos = previous?.windowStartedAtNanos ?: updatedAtNanos
+            var windowAccumulatedWorkMs = previous?.windowAccumulatedWorkMs ?: 0.0
+            var windowAccumulatedIntervalMs = previous?.windowAccumulatedIntervalMs ?: 0.0
+            var windowSampleCount = previous?.windowSampleCount ?: 0
+            var windowAccumulatedBreakdownMs = previous?.windowAccumulatedBreakdownMs ?: emptyMap()
+            var measuredMs = previous?.measuredMs ?: 0.0
+            var measuredTps = previous?.measuredTps ?: configuredTargetTps()
+            var measuredBreakdownMs = previous?.lastBreakdownMs ?: emptyMap()
+
+            val windowAgeNanos = (updatedAtNanos - windowStartedAtNanos).coerceAtLeast(0L)
+            if (windowSampleCount > 0 && windowAgeNanos >= MEASUREMENT_WINDOW_NANOS) {
+                measuredMs = windowAccumulatedWorkMs / windowSampleCount.toDouble()
+                val avgIntervalMs = (windowAccumulatedIntervalMs / windowSampleCount.toDouble()).coerceAtLeast(0.001)
+                measuredTps = chunkTpsFromIntervalMs(avgIntervalMs)
+                measuredBreakdownMs = scaleBreakdown(windowAccumulatedBreakdownMs, 1.0 / windowSampleCount.toDouble())
+
+                windowStartedAtNanos = updatedAtNanos
+                windowAccumulatedWorkMs = 0.0
+                windowAccumulatedIntervalMs = 0.0
+                windowSampleCount = 0
+                windowAccumulatedBreakdownMs = emptyMap()
             }
+
+            windowAccumulatedWorkMs += lastMs
+            windowAccumulatedBreakdownMs = mergeBreakdown(windowAccumulatedBreakdownMs, breakdownMs)
+            if (!aggregateIntoPreviousSample) {
+                windowAccumulatedIntervalMs += effectiveIntervalMs
+                windowSampleCount += 1
+            }
+            if (windowSampleCount > 0) {
+                measuredMs = windowAccumulatedWorkMs / windowSampleCount.toDouble()
+                val avgIntervalMs = (windowAccumulatedIntervalMs / windowSampleCount.toDouble()).coerceAtLeast(0.001)
+                measuredTps = chunkTpsFromIntervalMs(avgIntervalMs)
+                measuredBreakdownMs = scaleBreakdown(windowAccumulatedBreakdownMs, 1.0 / windowSampleCount.toDouble())
+            } else {
+                measuredMs = 0.0
+                measuredTps = 0.0
+                measuredBreakdownMs = emptyMap()
+            }
+
+            ChunkStat(
+                lastMs = effectiveLastMs,
+                lastIntervalMs = effectiveIntervalMs,
+                lastTps = effectiveLastTps,
+                measuredMs = measuredMs,
+                measuredTps = measuredTps,
+                updatedAtNanos = updatedAtNanos,
+                meaningfulUpdatedAtNanos = meaningfulUpdatedAtNanos,
+                lastTickSequence = if (tickSequence != NO_TICK_SEQUENCE) tickSequence else previous?.lastTickSequence ?: NO_TICK_SEQUENCE,
+                lastBreakdownMs = measuredBreakdownMs,
+                windowStartedAtNanos = windowStartedAtNanos,
+                windowAccumulatedWorkMs = windowAccumulatedWorkMs,
+                windowAccumulatedIntervalMs = windowAccumulatedIntervalMs,
+                windowSampleCount = windowSampleCount,
+                windowAccumulatedBreakdownMs = windowAccumulatedBreakdownMs
+            )
         }
     }
 
@@ -220,15 +319,51 @@ class ChunkProcessingProfiler {
         chunkPos: ChunkPos,
         elapsedNanos: Long,
         accumulateIntoLast: Boolean,
-        tickSequence: Long
+        tickSequence: Long,
+        breakdownMs: Map<String, Double> = emptyMap()
     ) {
         updateChunkStat(
             chunkPos = chunkPos,
             lastMs = elapsedNanos.coerceAtLeast(0L) / 1_000_000.0,
             updatedAtNanos = System.nanoTime(),
             accumulateIntoLast = accumulateIntoLast,
-            tickSequence = tickSequence
+            tickSequence = tickSequence,
+            breakdownMs = breakdownMs
         )
+    }
+
+    private fun toMsBreakdown(nanosByCategory: Map<String, Long>): Map<String, Double> {
+        if (nanosByCategory.isEmpty()) return emptyMap()
+        val out = HashMap<String, Double>(nanosByCategory.size)
+        for ((category, nanos) in nanosByCategory) {
+            out[category] = nanos.coerceAtLeast(0L) / 1_000_000.0
+        }
+        return out
+    }
+
+    private fun mergeBreakdown(previous: Map<String, Double>, added: Map<String, Double>): Map<String, Double> {
+        if (previous.isEmpty()) return added
+        if (added.isEmpty()) return previous
+        val out = HashMap<String, Double>(previous.size + added.size)
+        for ((key, value) in previous) {
+            out[key] = value
+        }
+        for ((key, value) in added) {
+            out[key] = (out[key] ?: 0.0) + value
+        }
+        return out
+    }
+
+    private fun scaleBreakdown(values: Map<String, Double>, scale: Double): Map<String, Double> {
+        if (values.isEmpty() || !scale.isFinite() || scale <= 0.0) return emptyMap()
+        val out = HashMap<String, Double>(values.size)
+        for ((key, value) in values) {
+            val scaled = value * scale
+            if (scaled.isFinite() && scaled > 0.0) {
+                out[key] = scaled
+            }
+        }
+        return out
     }
 
     private fun chunkTpsFromIntervalMs(intervalMs: Double): Double {
@@ -245,11 +380,12 @@ class ChunkProcessingProfiler {
     }
 
     private companion object {
-        private const val EWMA_KEEP = 0.8
-        private const val EWMA_NEW = 0.2
+        const val CATEGORY_OTHER = "other"
         private const val NO_TICK_SEQUENCE = Long.MIN_VALUE
+        private const val MEASUREMENT_WINDOW_NANOS = 1_000_000_000L
         private const val IDLE_INTERVAL_MULTIPLIER = 1.5
         private const val IDLE_MIN_AGE_MS = 100.0
-        private const val IDLE_NOISE_MSPT = 0.05
+        private const val IDLE_MAX_AGE_MS = 500.0
+        private const val IDLE_NOISE_MSPT = 0.005
     }
 }

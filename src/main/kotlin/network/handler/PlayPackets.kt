@@ -75,6 +75,7 @@ object PlayPackets {
     private const val SET_HEALTH_PACKET_ID = 0x66
     private const val SET_HELD_SLOT_PACKET_ID = 0x67
     private const val CONTAINER_SET_SLOT_PACKET_ID = 0x14
+    private const val COOLDOWN_PACKET_ID = 0x16
     private const val CONTAINER_SET_CONTENT_PACKET_ID = 0x12
     private const val CONTAINER_SET_DATA_PACKET_ID = 0x13
     private const val CONTAINER_CLOSE_PACKET_ID = 0x11
@@ -136,6 +137,10 @@ object PlayPackets {
         RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:egg")
             ?: FALLBACK_EGG_ENTITY_TYPE_ID_1_21_11
     }
+    private val cachedEnderPearlEntityTypeId: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:ender_pearl")
+            ?: cachedEggEntityTypeId
+    }
     private val cachedPigEntityTypeId: Int by lazy {
         RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:pig")
             ?: FALLBACK_PIG_ENTITY_TYPE_ID_1_21_11
@@ -146,6 +151,7 @@ object PlayPackets {
         cachedFallingBlockEntityTypeId
         cachedSnowballEntityTypeId
         cachedEggEntityTypeId
+        cachedEnderPearlEntityTypeId
         cachedPigEntityTypeId
     }
 
@@ -299,6 +305,14 @@ object PlayPackets {
         val packet = ByteArrayOutputStream()
         NetworkUtils.writeVarInt(packet, SET_HELD_SLOT_PACKET_ID)
         NetworkUtils.writeVarInt(packet, slot.coerceIn(0, 8))
+        return packet.toByteArray()
+    }
+
+    fun cooldownPacket(cooldownGroup: String, cooldownTicks: Int): ByteArray {
+        val packet = ByteArrayOutputStream()
+        NetworkUtils.writeVarInt(packet, COOLDOWN_PACKET_ID)
+        NetworkUtils.writeString(packet, cooldownGroup)
+        NetworkUtils.writeVarInt(packet, cooldownTicks.coerceAtLeast(0))
         return packet.toByteArray()
     }
 
@@ -1006,6 +1020,10 @@ object PlayPackets {
 
     fun eggEntityTypeId(): Int {
         return cachedEggEntityTypeId
+    }
+
+    fun enderPearlEntityTypeId(): Int {
+        return cachedEnderPearlEntityTypeId
     }
 
     fun pigEntityTypeId(): Int {

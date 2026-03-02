@@ -19,7 +19,8 @@ object PerfCommand : Command {
         val chunkX: Int,
         val chunkZ: Int,
         val tps: Double,
-        val mspt: Double
+        val mspt: Double,
+        val breakdownMs: Map<String, Double>
     )
 
     override fun execute(context: CommandContext, sender: PlayerSession?, args: List<String>) {
@@ -97,7 +98,7 @@ object PerfCommand : Command {
                         entry.chunkZ.toString(),
                         formatPerf(entry.tps),
                         formatPerf(entry.mspt)
-                    ) + ANSI_RESET
+                    ) + formatBreakdownSuffix(entry.breakdownMs) + ANSI_RESET
                 )
             }
             return
@@ -121,7 +122,7 @@ object PerfCommand : Command {
                 formatPerf(entry.tps),
                 formatPerf(entry.mspt)
             )
-            context.sendMessage(sender, "§7   - §f$line")
+            context.sendMessage(sender, "§7   - §f$line${formatBreakdownSuffix(entry.breakdownMs)}")
         }
     }
 
@@ -130,14 +131,16 @@ object PerfCommand : Command {
         val candidates = ArrayList<ChunkLine>(MAX_CHUNK_LINES * worldKeys.size.coerceAtLeast(1))
         for (worldKey in worldKeys) {
             val world = WorldManager.world(worldKey) ?: continue
-            val topInWorld = world.topChunkStatsByMspt(limit = MAX_CHUNK_LINES, minMspt = MIN_LISTED_MSPT)
+            val topInWorld = world.topChunkStatsByEwmaMspt(limit = MAX_CHUNK_LINES, minMspt = MIN_LISTED_MSPT)
             for (entry in topInWorld) {
+                if (world.isChunkIdle(entry.chunkPos.x, entry.chunkPos.z)) continue
                 candidates += ChunkLine(
                     worldKey = world.key,
                     chunkX = entry.chunkPos.x,
                     chunkZ = entry.chunkPos.z,
                     tps = entry.tps,
-                    mspt = entry.mspt
+                    mspt = entry.mspt,
+                    breakdownMs = entry.breakdownMs
                 )
             }
         }
@@ -178,6 +181,19 @@ object PerfCommand : Command {
             else -> 6
         }
         return String.format("%.${decimals}f", clamped)
+    }
+
+    private fun formatBreakdownSuffix(breakdownMs: Map<String, Double>): String {
+        if (breakdownMs.isEmpty()) return ""
+        val significant = breakdownMs
+            .asSequence()
+            .filter { (_, ms) -> ms.isFinite() && ms >= 0.0005 }
+            .sortedByDescending { (_, ms) -> ms }
+            .take(3)
+            .toList()
+        if (significant.isEmpty()) return ""
+        val joined = significant.joinToString(", ") { (category, ms) -> "$category=${formatPerf(ms)}ms" }
+        return " [$joined]"
     }
 
     private fun displayWorldName(worldKey: String): String {

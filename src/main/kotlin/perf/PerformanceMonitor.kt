@@ -4,12 +4,11 @@ import org.macaroon3145.i18n.ServerI18n
 import kotlin.math.abs
 
 object PerformanceMonitor {
-    private const val REPORT_INTERVAL_NANOS = 500_000_000L
     private const val LOG_TO_CONSOLE = false
-
-    private var windowStartNanos: Long = System.nanoTime()
-    private var ticks: Long = 0L
-    private var msptSumNanos: Long = 0L
+    private const val EWMA_KEEP = 0.8
+    private const val EWMA_NEW = 0.2
+    private var lastTickEndNanos: Long = 0L
+    private var initialized = false
 
     @Volatile
     var tps: Double = 20.0
@@ -23,9 +22,8 @@ object PerformanceMonitor {
         private set
 
     fun start() {
-        windowStartNanos = System.nanoTime()
-        ticks = 0L
-        msptSumNanos = 0L
+        lastTickEndNanos = 0L
+        initialized = false
         rawMspt = 0.0
         mspt = 0.0
         tps = 0.0
@@ -35,24 +33,23 @@ object PerformanceMonitor {
         val tickDurationNanos = (tickEndNanos - tickStartNanos).coerceAtLeast(0L)
         val tickMs = tickDurationNanos / 1_000_000.0
         rawMspt = tickMs
-
-        mspt = tickMs
-        msptSumNanos += tickDurationNanos
-        ticks += 1
-
-        val windowElapsed = tickEndNanos - windowStartNanos
-        if (windowElapsed >= REPORT_INTERVAL_NANOS) {
-            val seconds = windowElapsed / 1_000_000_000.0
-            tps = if (seconds <= 0.0) 0.0 else ticks / seconds
-            val avgMs = if (ticks == 0L) 0.0 else (msptSumNanos / ticks) / 1_000_000.0
-            mspt = avgMs
-            if (LOG_TO_CONSOLE) {
-                ServerI18n.log("aerogel.log.perf", format(tps), format(avgMs))
-            }
-
-            windowStartNanos = tickEndNanos
-            ticks = 0L
-            msptSumNanos = 0L
+        val instantTps = if (lastTickEndNanos > 0L) {
+            val intervalNanos = (tickEndNanos - lastTickEndNanos).coerceAtLeast(1L)
+            1_000_000_000.0 / intervalNanos.toDouble()
+        } else {
+            0.0
+        }
+        lastTickEndNanos = tickEndNanos
+        if (!initialized) {
+            mspt = tickMs
+            tps = instantTps.coerceAtLeast(0.0)
+            initialized = true
+        } else {
+            mspt = (mspt * EWMA_KEEP) + (tickMs * EWMA_NEW)
+            tps = (tps * EWMA_KEEP) + (instantTps.coerceAtLeast(0.0) * EWMA_NEW)
+        }
+        if (LOG_TO_CONSOLE) {
+            ServerI18n.log("aerogel.log.perf", format(tps), format(mspt))
         }
     }
 

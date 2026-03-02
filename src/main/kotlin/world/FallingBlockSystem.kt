@@ -178,6 +178,7 @@ class FallingBlockSystem(
         val updated = ArrayList<FallingBlockSnapshot>()
         val removed = ArrayList<FallingBlockRemovedEvent>()
         val landed = ArrayList<FallingBlockLandedEvent>()
+        val chunkDeltaSecondsByChunk = HashMap<ChunkPos, Double>()
 
         while (true) {
             val entityId = pendingSpawned.poll() ?: break
@@ -189,7 +190,11 @@ class FallingBlockSystem(
             val chunkPos = ChunkPos(entity.chunkX, entity.chunkZ)
             val shouldSimulate = activeSimulationChunks == null || activeSimulationChunks.contains(chunkPos)
             if (!shouldSimulate) continue
-            val chunkDeltaSeconds = (chunkDeltaSecondsProvider?.invoke(chunkPos) ?: deltaSeconds)
+            // Sample once per chunk per tick-frame so entities in the same chunk
+            // advance with identical time slices.
+            val chunkDeltaSeconds = chunkDeltaSecondsByChunk.getOrPut(chunkPos) {
+                chunkDeltaSecondsProvider?.invoke(chunkPos) ?: deltaSeconds
+            }
             if (chunkDeltaSeconds <= 0.0) continue
             val tickScale = chunkDeltaSeconds * 20.0
 

@@ -34,6 +34,7 @@ import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
 import org.macaroon3145.world.AnimalDamageCause
 import org.macaroon3145.world.AnimalKind
 import org.macaroon3145.world.AnimalRideControl
+import org.macaroon3145.world.AnimalTickEvents
 import org.macaroon3145.world.EntityLootDropCache
 import org.macaroon3145.world.AnimalSnapshot
 import org.macaroon3145.world.AnimalTemptSource
@@ -224,6 +225,17 @@ private data class WorldChunkKey(
     val chunkPos: ChunkPos
 )
 
+private data class PushingContactKey(
+    val worldKey: String,
+    val firstEntityId: Int,
+    val secondEntityId: Int
+)
+
+private data class PushingContactState(
+    val ownerChunk: ChunkPos,
+    val remainingTicks: Int
+)
+
 private data class FurnaceState(
     var inputItemId: Int,
     var inputCount: Int,
@@ -273,6 +285,13 @@ private data class PigBoostState(
     var durationSeconds: Double
 )
 
+private data class PlayerSimulationStamp(
+    val worldKey: String,
+    val centerChunkX: Int,
+    val centerChunkZ: Int,
+    val radius: Int
+)
+
     private val logger = LoggerFactory.getLogger(PlayerSessionManager::class.java)
     private val gamemodeCompletionCandidates = listOf("survival", "creative", "adventure", "spectator")
     private val nextEntityId = AtomicInteger(1)
@@ -293,8 +312,19 @@ private data class PigBoostState(
     private val pendingFurnaceResyncSet = ConcurrentHashMap.newKeySet<FurnaceKey>()
     private val furnaceChunkLastTickNanos = ConcurrentHashMap<WorldChunkKey, Long>()
     private val pushingChunkLastTickNanos = ConcurrentHashMap<WorldChunkKey, Long>()
+    private val activeSimulationChunksCacheByWorld = ConcurrentHashMap<String, Set<ChunkPos>>()
+    private val activeSimulationRefCountByWorld = ConcurrentHashMap<String, ConcurrentHashMap<ChunkPos, Int>>()
+    private val activeSimulationStampByPlayerEntityId = ConcurrentHashMap<Int, PlayerSimulationStamp>()
+    private val activeSimulationChunksByPlayerEntityId = ConcurrentHashMap<Int, Set<ChunkPos>>()
+    @Volatile private var activeSimulationLastMaxDistanceChunks = -1
+    private val retainedBaseChunksCacheByWorld = ConcurrentHashMap<String, Set<ChunkPos>>()
+    private val retainedBaseChunksDirtyWorlds = ConcurrentHashMap.newKeySet<String>()
+    private val pushingWakeChunksByWorld = ConcurrentHashMap<String, MutableSet<ChunkPos>>()
+    private val pushingContactStates = ConcurrentHashMap<PushingContactKey, PushingContactState>()
+    private val lastPushingChunkByPlayerEntityId = ConcurrentHashMap<Int, ChunkPos>()
     private val furnaceChunkInFlight = ConcurrentHashMap<WorldChunkKey, AtomicBoolean>()
     private val pushingChunkInFlight = ConcurrentHashMap<WorldChunkKey, AtomicBoolean>()
+    private val enderPearlCooldownEndNanosByPlayerEntityId = ConcurrentHashMap<Int, Long>()
     private val chunkProcessingTickSequence = java.util.concurrent.atomic.AtomicLong(0L)
     private val commandExecutor = Executors.newFixedThreadPool(2) { runnable ->
         Thread(runnable, "aerogel-command-worker").apply {
@@ -426,6 +456,7 @@ private data class PigBoostState(
     private val eggItemId: Int by lazy { itemIdByKey["minecraft:egg"] ?: -1 }
     private val blueEggItemId: Int by lazy { itemIdByKey["minecraft:blue_egg"] ?: -1 }
     private val brownEggItemId: Int by lazy { itemIdByKey["minecraft:brown_egg"] ?: -1 }
+    private val enderPearlItemId: Int by lazy { itemIdByKey["minecraft:ender_pearl"] ?: -1 }
     private val pigSpawnEggItemId: Int by lazy { itemIdByKey["minecraft:pig_spawn_egg"] ?: -1 }
     private val saddleItemId: Int by lazy { itemIdByKey["minecraft:saddle"] ?: -1 }
     private val carrotOnAStickItemId: Int by lazy { itemIdByKey["minecraft:carrot_on_a_stick"] ?: -1 }
@@ -469,6 +500,7 @@ private data class PigBoostState(
         eggItemId
         blueEggItemId
         brownEggItemId
+        enderPearlItemId
         pigSpawnEggItemId
         pigTemptItemIds.size
         waterSourceStateId
@@ -664,6 +696,10 @@ private data class PigBoostState(
         val existing = sessions.values.filter { it.worldKey == worldKey && it.channelId != session.channelId }
         sessions[session.channelId] = session
         contexts[session.channelId] = ctx
+        markWorldChunkCachesDirty(session.worldKey)
+        val spawnChunk = ChunkPos(spawnChunkX, spawnChunkZ)
+        lastPushingChunkByPlayerEntityId[session.entityId] = spawnChunk
+        markPushingChunksAwake(session.worldKey, spawnChunk)
         return JoinResult(session, existing)
     }
 
@@ -897,7 +933,8 @@ private data class PigBoostState(
                             world.recordChunkProcessingNanos(
                                 frame = frame,
                                 chunkPos = chunkPos,
-                                elapsedNanos = System.nanoTime() - startedAt
+                                elapsedNanos = System.nanoTime() - startedAt,
+                                category = "furnace"
                             )
                             world.finishChunkProcessingFrame(
                                 frame = frame,
@@ -914,15 +951,21 @@ private data class PigBoostState(
                                 activeFurnaceKeys.remove(key)
                                 continue
                             }
+                            val wasBurning = furnace.burnRemainingSeconds > 0.0
                             if (tickSingleFurnaceState(furnace, chunkDeltaSeconds)) {
                                 enqueueFurnaceResync(key)
+                            }
+                            val isBurning = furnace.burnRemainingSeconds > 0.0
+                            if (wasBurning != isBurning) {
+                                syncFurnaceLitBlockState(world, key, isBurning)
                             }
                             refreshFurnaceActivity(key, furnace)
                         }
                         world.recordChunkProcessingNanos(
                             frame = frame,
                             chunkPos = chunkPos,
-                            elapsedNanos = System.nanoTime() - startedAt
+                            elapsedNanos = System.nanoTime() - startedAt,
+                            category = "furnace"
                         )
                         world.finishChunkProcessingFrame(
                             frame = frame,
@@ -1089,6 +1132,34 @@ private data class PigBoostState(
         return furnace.fuelCount > 0 && fuelBurnSeconds(furnace.fuelItemId) > 0.0
     }
 
+    private fun syncFurnaceLitBlockState(
+        world: org.macaroon3145.world.World,
+        key: FurnaceKey,
+        lit: Boolean
+    ) {
+        val currentStateId = world.blockStateAt(key.x, key.y, key.z)
+        if (currentStateId <= 0) return
+        val parsed = BlockStateRegistry.parsedState(currentStateId) ?: return
+        if (parsed.blockKey != "minecraft:furnace") return
+        val currentLit = parsed.properties["lit"] ?: return
+        val targetLit = if (lit) "true" else "false"
+        if (currentLit == targetLit) return
+        val props = HashMap(parsed.properties)
+        props["lit"] = targetLit
+        val targetStateId = BlockStateRegistry.stateId(parsed.blockKey, props) ?: return
+        if (targetStateId == currentStateId) return
+        world.setBlockState(key.x, key.y, key.z, targetStateId)
+        val chunkPos = ChunkPos(key.x shr 4, key.z shr 4)
+        broadcastBlockChangeToLoadedPlayers(
+            worldKey = key.worldKey,
+            chunkPos = chunkPos,
+            x = key.x,
+            y = key.y,
+            z = key.z,
+            stateId = targetStateId
+        )
+    }
+
     private fun tickNaturalRegeneration(deltaSeconds: Double) {
         if (!deltaSeconds.isFinite() || deltaSeconds <= 0.0) return
         for (session in sessions.values) {
@@ -1186,9 +1257,11 @@ private data class PigBoostState(
         }
         if (sessionsByWorld.isEmpty()) return null
 
+        ensureActiveSimulationChunkIndex(sessionsByWorld)
+        pruneRetainedBaseChunkCaches(sessionsByWorld.keys)
         val activeByWorld = HashMap<String, Set<ChunkPos>>(sessionsByWorld.size)
         for ((worldKey, worldSessions) in sessionsByWorld) {
-            val activeChunks = collectActiveSimulationChunks(worldSessions)
+            val activeChunks = activeSimulationChunksCacheByWorld[worldKey] ?: emptySet()
             if (activeChunks.isEmpty()) continue
             activeByWorld[worldKey] = activeChunks
         }
@@ -1274,11 +1347,87 @@ private data class PigBoostState(
     }
 
     private fun playerCollisionHeight(session: PlayerSession): Double {
+        return playerPoseHeight(session)
+    }
+
+    private data class Aabb(
+        val minX: Double,
+        val minY: Double,
+        val minZ: Double,
+        val maxX: Double,
+        val maxY: Double,
+        val maxZ: Double
+    ) {
+        fun toDoubleArray(): DoubleArray = doubleArrayOf(minX, maxX, minY, maxY, minZ, maxZ)
+    }
+
+    private fun playerPoseHeight(session: PlayerSession): Double {
         return when {
             session.swimming -> 0.6
             session.sneaking -> 1.5
             else -> 1.8
         }
+    }
+
+    private fun playerAabb(
+        session: PlayerSession,
+        expandHorizontal: Double = 0.0,
+        expandDown: Double = 0.0,
+        expandUp: Double = 0.0
+    ): Aabb {
+        return Aabb(
+            minX = session.x - PLAYER_HITBOX_HALF_WIDTH - expandHorizontal,
+            minY = session.y - expandDown,
+            minZ = session.z - PLAYER_HITBOX_HALF_WIDTH - expandHorizontal,
+            maxX = session.x + PLAYER_HITBOX_HALF_WIDTH + expandHorizontal,
+            maxY = session.y + playerPoseHeight(session) + expandUp,
+            maxZ = session.z + PLAYER_HITBOX_HALF_WIDTH + expandHorizontal
+        )
+    }
+
+    private fun animalAabb(
+        target: AnimalSnapshot,
+        expandHorizontal: Double = 0.0,
+        expandDown: Double = 0.0,
+        expandUp: Double = 0.0
+    ): Aabb {
+        val halfWidth = target.hitboxWidth * 0.5
+        return Aabb(
+            minX = target.x - halfWidth - expandHorizontal,
+            minY = target.y - expandDown,
+            minZ = target.z - halfWidth - expandHorizontal,
+            maxX = target.x + halfWidth + expandHorizontal,
+            maxY = target.y + target.hitboxHeight + expandUp,
+            maxZ = target.z + halfWidth + expandHorizontal
+        )
+    }
+
+    private fun playerAabbAt(
+        x: Double,
+        y: Double,
+        z: Double,
+        halfWidth: Double,
+        height: Double
+    ): Aabb {
+        return Aabb(
+            minX = x - halfWidth,
+            minY = y,
+            minZ = z - halfWidth,
+            maxX = x + halfWidth,
+            maxY = y + height,
+            maxZ = z + halfWidth
+        )
+    }
+
+    private fun droppedItemAabb(snapshot: DroppedItemSnapshot): Aabb {
+        return Aabb(
+            minX = snapshot.x - DROPPED_ITEM_HALF_WIDTH,
+            minY = snapshot.y,
+            minZ = snapshot.z - DROPPED_ITEM_HALF_WIDTH,
+            maxX = snapshot.x + DROPPED_ITEM_HALF_WIDTH,
+            maxY = snapshot.y + DROPPED_ITEM_HEIGHT,
+            maxZ = snapshot.z + DROPPED_ITEM_HALF_WIDTH
+        )
     }
 
     private fun applyAnimalAnimalPushing(
@@ -1288,8 +1437,13 @@ private data class PigBoostState(
     ) {
         for (i in 0 until animals.size) {
             val a = animals[i]
+            val aMinY = a.y
+            val aMaxY = a.y + a.hitboxHeight
             for (j in (i + 1) until animals.size) {
                 val b = animals[j]
+                val bMinY = b.y
+                val bMaxY = b.y + b.hitboxHeight
+                if (aMaxY <= bMinY || aMinY >= bMaxY) continue
                 applyHorizontalPushPair(
                     ax = a.x,
                     az = a.z,
@@ -1594,32 +1748,33 @@ private data class PigBoostState(
                                 droppedItems = chunkEvents,
                                 fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
                                 thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
-                                animals = org.macaroon3145.world.AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+                                animals = org.macaroon3145.world.AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
                             ),
                             deltaSeconds = deltaSeconds
                         )
                     },
                     onDispatchComplete = { done() }
                 ) { chunkPos, elapsedNanos ->
-                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "dropped")
                 }
                 val fallingEvents = world.tickFallingBlocks(
                     physicsDeltaSeconds,
                     activeSimulationChunks
                 ) { chunkPos, elapsedNanos ->
-                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "falling")
                 }
                 val thrownEvents = world.tickThrownItems(
                     physicsDeltaSeconds,
                     activeSimulationChunks
                 ) { chunkPos, elapsedNanos ->
-                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "thrown")
                 }
                 pendingAsync.incrementAndGet()
                 val animalEvents = world.tickAnimals(
                     physicsDeltaSeconds,
                     activeSimulationChunks,
                     onChunkEvents = { chunkEvents ->
+                        markPushingWakeFromAnimalEvents(world.key, chunkEvents)
                         dispatchWorldPhysicsEvents(
                             world = world,
                             worldSessions = sessionsSnapshot,
@@ -1634,7 +1789,7 @@ private data class PigBoostState(
                     },
                     onDispatchComplete = { done() }
                 ) { chunkPos, elapsedNanos ->
-                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "animal")
                 }
                 world.finishChunkProcessingFrame(
                     frame = chunkProcessingFrame,
@@ -1642,6 +1797,7 @@ private data class PigBoostState(
                     includeZeroForInactive = false,
                     accumulateIntoLast = true
                 )
+                markPushingWakeFromAnimalEvents(world.key, animalEvents)
                 dispatchWorldPhysicsEvents(
                     world = world,
                     worldSessions = sessionsSnapshot,
@@ -1673,8 +1829,10 @@ private data class PigBoostState(
         val pickedRemovals = collectDroppedItemPickups(world, worldSessions, outboundByContext)
         val thrownRemoved = ArrayList(thrownEvents.removed)
         val thrownHitIds = HashSet<Int>()
-        collectThrownItemPlayerHits(world, worldSessions, thrownEvents.spawned, thrownRemoved, thrownHitIds)
-        collectThrownItemPlayerHits(world, worldSessions, thrownEvents.updated, thrownRemoved, thrownHitIds)
+        collectThrownItemEntityHits(world, worldSessions, thrownEvents.spawned, thrownRemoved, thrownHitIds)
+        collectThrownItemEntityHits(world, worldSessions, thrownEvents.updated, thrownRemoved, thrownHitIds)
+        processEnderPearlImpacts(world.key, thrownRemoved)
+        val thrownRemovedIds = thrownRemoved.asSequence().map { it.entityId }.toHashSet()
         val pickedEntityIds = pickedRemovals.asSequence()
             .map { it.entityId }
             .toHashSet()
@@ -1707,16 +1865,19 @@ private data class PigBoostState(
         val thrownRemovedByChunk = thrownRemoved.groupBy { it.chunkPos }
         val thrownSpawnedByChunk = thrownEvents.spawned
             .asSequence()
+            .filterNot { it.entityId in thrownRemovedIds }
             .filterNot { it.entityId in thrownHitIds }
             .groupBy { it.chunkPos }
         val thrownUpdatedByChunk = thrownEvents.updated
             .asSequence()
+            .filterNot { it.entityId in thrownRemovedIds }
             .filterNot { it.entityId in thrownHitIds }
             .groupBy { it.chunkPos }
         val animalRemovedByChunk = animalEvents.removed.groupBy { it.chunkPos }
         val animalSpawnedByChunk = animalEvents.spawned.groupBy { it.chunkPos }
         val animalUpdatedByChunk = animalEvents.updated.groupBy { it.chunkPos }
         val animalDamagedByChunk = animalEvents.damaged.groupBy { it.chunkPos }
+        val animalAmbientByChunk = animalEvents.ambient.groupBy { it.chunkPos }
 
         val chunksInOrder = LinkedHashSet<ChunkPos>()
         chunksInOrder.addAll(pickupsByChunk.keys)
@@ -1734,6 +1895,7 @@ private data class PigBoostState(
         chunksInOrder.addAll(animalSpawnedByChunk.keys)
         chunksInOrder.addAll(animalUpdatedByChunk.keys)
         chunksInOrder.addAll(animalDamagedByChunk.keys)
+        chunksInOrder.addAll(animalAmbientByChunk.keys)
 
         for (chunkPos in chunksInOrder) {
             for (pickup in pickupsByChunk[chunkPos].orEmpty()) {
@@ -1746,15 +1908,15 @@ private data class PigBoostState(
                 for (session in worldSessions) {
                     val isCollector = session.entityId == pickup.collectorEntityId
                     val wasVisible = session.visibleDroppedItemEntityIds.contains(pickup.entityId)
-                    val inBroadcastRange = isWithinPickupBroadcastRange(session, pickup)
-                    if (!isCollector && !wasVisible && !inBroadcastRange) continue
-                    if (wasVisible || isCollector) {
-                        session.visibleDroppedItemEntityIds.remove(pickup.entityId)
-                    }
+                    val inLoadedChunk = session.loadedChunks.contains(chunkPos)
+                    if (!isCollector && !wasVisible && !inLoadedChunk) continue
+                    session.visibleDroppedItemEntityIds.remove(pickup.entityId)
                     session.droppedItemTrackerStates.remove(pickup.entityId)
                     val ctx = contexts[session.channelId] ?: continue
                     if (!ctx.channel().isActive) continue
-                    enqueueDroppedItemPacket(outboundByContext, ctx, takePacket)
+                    if (isCollector || wasVisible || inLoadedChunk) {
+                        enqueueDroppedItemPacket(outboundByContext, ctx, takePacket)
+                    }
                     enqueueDroppedItemPacket(outboundByContext, ctx, removePacket)
                 }
             }
@@ -1762,7 +1924,9 @@ private data class PigBoostState(
             for (removed in droppedRemovedByChunk[chunkPos].orEmpty()) {
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
-                    if (!session.visibleDroppedItemEntityIds.remove(removed.entityId)) continue
+                    val wasVisible = session.visibleDroppedItemEntityIds.remove(removed.entityId)
+                    val inLoadedChunk = session.loadedChunks.contains(chunkPos)
+                    if (!wasVisible && !inLoadedChunk) continue
                     session.droppedItemTrackerStates.remove(removed.entityId)
                     val ctx = contexts[session.channelId] ?: continue
                     if (!ctx.channel().isActive) continue
@@ -1791,7 +1955,9 @@ private data class PigBoostState(
             for (removed in fallingRemovedByChunk[chunkPos].orEmpty()) {
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
-                    if (!session.visibleFallingBlockEntityIds.remove(removed.entityId)) continue
+                    val wasVisible = session.visibleFallingBlockEntityIds.remove(removed.entityId)
+                    val inLoadedChunk = session.loadedChunks.contains(chunkPos)
+                    if (!wasVisible && !inLoadedChunk) continue
                     session.fallingBlockTrackerStates.remove(removed.entityId)
                     val ctx = contexts[session.channelId] ?: continue
                     if (!ctx.channel().isActive) continue
@@ -1850,7 +2016,9 @@ private data class PigBoostState(
                 }
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
-                    if (!session.visibleThrownItemEntityIds.remove(removed.entityId)) continue
+                    val wasVisible = session.visibleThrownItemEntityIds.remove(removed.entityId)
+                    val inLoadedChunk = session.loadedChunks.contains(chunkPos)
+                    if (!wasVisible && !inLoadedChunk) continue
                     session.thrownItemTrackerStates.remove(removed.entityId)
                     val ctx = contexts[session.channelId] ?: continue
                     if (!ctx.channel().isActive) continue
@@ -1871,6 +2039,17 @@ private data class PigBoostState(
                     sendPositionUpdate = false,
                     deltaSeconds = deltaSeconds
                 )
+                val soundPacket = thrownItemLaunchSoundPacket(
+                    kind = snapshot.kind,
+                    x = snapshot.x,
+                    y = snapshot.y,
+                    z = snapshot.z
+                )
+                for (session in worldSessions) {
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    enqueueDroppedItemPacket(outboundByContext, ctx, soundPacket)
+                }
             }
             for (snapshot in thrownUpdatedByChunk[chunkPos].orEmpty()) {
                 syncThrownItemSnapshot(
@@ -1930,22 +2109,6 @@ private data class PigBoostState(
                     sendPositionUpdate = false,
                     deltaSeconds = deltaSeconds
                 )
-                val spawnSoundPacket = PlayPackets.soundPacketByKey(
-                    soundKey = snapshot.kind.ambientSoundKey,
-                    soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
-                    x = snapshot.x,
-                    y = snapshot.y + snapshot.hitboxHeight * 0.5,
-                    z = snapshot.z,
-                    volume = 1.0f,
-                    pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
-                    seed = ThreadLocalRandom.current().nextLong()
-                )
-                for (session in worldSessions) {
-                    if (!session.visibleAnimalEntityIds.contains(snapshot.entityId)) continue
-                    val ctx = contexts[session.channelId] ?: continue
-                    if (!ctx.channel().isActive) continue
-                    enqueueDroppedItemPacket(outboundByContext, ctx, spawnSoundPacket)
-                }
             }
             for (snapshot in animalUpdatedByChunk[chunkPos].orEmpty()) {
                 syncAnimalSnapshot(
@@ -1995,6 +2158,24 @@ private data class PigBoostState(
                     for (soundPacket in damageSoundPackets) {
                         enqueueDroppedItemPacket(outboundByContext, ctx, soundPacket)
                     }
+                }
+            }
+            for (ambient in animalAmbientByChunk[chunkPos].orEmpty()) {
+                val soundPacket = PlayPackets.soundPacketByKey(
+                    soundKey = ambient.kind.ambientSoundKey,
+                    soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+                    x = ambient.x,
+                    y = ambient.y + ambient.hitboxHeight * 0.5,
+                    z = ambient.z,
+                    volume = 1.0f,
+                    pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
+                    seed = ThreadLocalRandom.current().nextLong()
+                )
+                for (session in worldSessions) {
+                    if (!session.visibleAnimalEntityIds.contains(ambient.entityId)) continue
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    enqueueDroppedItemPacket(outboundByContext, ctx, soundPacket)
                 }
             }
             flushQueuedPackets(outboundByContext)
@@ -2085,7 +2266,7 @@ private data class PigBoostState(
                     },
                     onDispatchComplete = {}
                 ) { chunkPos, elapsedNanos ->
-                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "fluid")
                 }
                 world.finishChunkProcessingFrame(
                     frame = chunkProcessingFrame,
@@ -2126,92 +2307,252 @@ private data class PigBoostState(
         }
     }
 
-    private fun scheduleEntityPushing(_tickSequence: Long, context: TickSimulationContext, deltaSeconds: Double) {
+    private fun markPushingWakeFromPlayerMovement(
+        session: PlayerSession,
+        previousX: Double,
+        previousZ: Double,
+        nextX: Double,
+        nextZ: Double,
+        horizontalMovementSq: Double
+    ) {
+        val previousChunk = ChunkPos(
+            ChunkStreamingService.chunkXFromBlockX(previousX),
+            ChunkStreamingService.chunkZFromBlockZ(previousZ)
+        )
+        val nextChunk = ChunkPos(
+            ChunkStreamingService.chunkXFromBlockX(nextX),
+            ChunkStreamingService.chunkZFromBlockZ(nextZ)
+        )
+        val knownChunk = lastPushingChunkByPlayerEntityId.put(session.entityId, nextChunk)
+        val changedChunk = previousChunk != nextChunk || (knownChunk != null && knownChunk != nextChunk)
+        val movedEnough = horizontalMovementSq >= PUSHING_WAKE_MIN_HORIZONTAL_MOVEMENT_SQ
+        if (!changedChunk && !movedEnough) return
+        markPushingChunksAwake(session.worldKey, previousChunk)
+        if (nextChunk != previousChunk) {
+            markPushingChunksAwake(session.worldKey, nextChunk)
+        }
+    }
+
+    private fun markPushingChunksAwake(
+        worldKey: String,
+        centerChunk: ChunkPos,
+    ) {
+        val bucket = pushingWakeChunksByWorld.computeIfAbsent(worldKey) { ConcurrentHashMap.newKeySet() }
+        bucket.add(centerChunk)
+    }
+
+    private fun markPushingWakeFromAnimalEvents(worldKey: String, events: AnimalTickEvents) {
+        if (events.isEmpty()) return
+        for (snapshot in events.spawned) {
+            markPushingChunksAwake(worldKey, snapshot.chunkPos)
+        }
+        for (snapshot in events.updated) {
+            markPushingChunksAwake(worldKey, snapshot.chunkPos)
+        }
+        for (removed in events.removed) {
+            markPushingChunksAwake(worldKey, removed.chunkPos)
+        }
+    }
+
+    private fun drainAwakePushingChunks(
+        worldKey: String,
+        activeSimulationChunks: Set<ChunkPos>
+    ): Set<ChunkPos> {
+        if (activeSimulationChunks.isEmpty()) return emptySet()
+        val queued = pushingWakeChunksByWorld.remove(worldKey) ?: return emptySet()
+        val out = HashSet<ChunkPos>()
+        for (chunkPos in queued) {
+            if (chunkPos in activeSimulationChunks) {
+                out.add(chunkPos)
+            }
+        }
+        return out
+    }
+
+    private fun collectContactPushingChunks(
+        worldKey: String,
+        activeSimulationChunks: Set<ChunkPos>
+    ): Set<ChunkPos> {
+        if (activeSimulationChunks.isEmpty() || pushingContactStates.isEmpty()) return emptySet()
+        val out = HashSet<ChunkPos>()
+        for ((key, state) in pushingContactStates) {
+            if (key.worldKey != worldKey) continue
+            val ownerChunk = state.ownerChunk
+            if (ownerChunk in activeSimulationChunks) {
+                out.add(ownerChunk)
+            }
+            val next = state.remainingTicks - 1
+            if (next <= 0) {
+                pushingContactStates.remove(key, state)
+            } else {
+                pushingContactStates.replace(key, state, state.copy(remainingTicks = next))
+            }
+        }
+        return out
+    }
+
+    private fun updatePushingContactStates(touchedContacts: Map<PushingContactKey, ChunkPos>) {
+        if (touchedContacts.isEmpty()) return
+        for ((contactKey, ownerChunk) in touchedContacts) {
+            pushingContactStates[contactKey] = PushingContactState(
+                ownerChunk = ownerChunk,
+                remainingTicks = PUSHING_CONTACT_STICKY_TICKS
+            )
+        }
+    }
+
+    private fun newPushingContactKey(worldKey: String, entityA: Int, entityB: Int): PushingContactKey {
+        return if (entityA <= entityB) {
+            PushingContactKey(worldKey, entityA, entityB)
+        } else {
+            PushingContactKey(worldKey, entityB, entityA)
+        }
+    }
+
+    private fun prunePushingStateForInactiveWorlds(activeWorldKeys: Set<String>) {
+        if (activeWorldKeys.isEmpty()) {
+            pushingWakeChunksByWorld.clear()
+            pushingContactStates.clear()
+            return
+        }
+        val wakeKeys = pushingWakeChunksByWorld.keys.toList()
+        for (worldKey in wakeKeys) {
+            if (worldKey !in activeWorldKeys) {
+                pushingWakeChunksByWorld.remove(worldKey)
+            }
+        }
+        for ((contactKey, state) in pushingContactStates) {
+            if (contactKey.worldKey !in activeWorldKeys) {
+                pushingContactStates.remove(contactKey, state)
+            }
+        }
+    }
+
+    private fun scheduleEntityPushing(tickSequence: Long, context: TickSimulationContext, deltaSeconds: Double) {
         if (deltaSeconds <= 0.0) return
         if (context.sessionsByWorld.isEmpty()) {
             pushingChunkLastTickNanos.clear()
+            pushingWakeChunksByWorld.clear()
+            pushingContactStates.clear()
+            lastPushingChunkByPlayerEntityId.clear()
             return
+        }
+        prunePushingStateForInactiveWorlds(context.sessionsByWorld.keys)
+        if (pushingContactStates.isNotEmpty()) {
+            // Contact-tracking optimization disabled: keep no sticky contacts.
+            pushingContactStates.clear()
         }
         pruneInactiveWorldChunkTimingState(context.sessionsByWorld.keys, pushingChunkLastTickNanos)
         for ((worldKey, worldSessions) in context.sessionsByWorld) {
             val world = WorldManager.world(worldKey)
             if (world == null) continue
             val sessionsSnapshot = worldSessions.toList()
+            val activeSimulationChunks = context.activeChunksByWorld[worldKey] ?: emptySet()
             try {
-                val animals = world.animalSnapshots()
                 if (sessionsSnapshot.isEmpty()) {
                     pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
                     continue
                 }
+                if (activeSimulationChunks.isEmpty()) {
+                    pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
+                    continue
+                }
 
-                    val playerChunkByEntityId = HashMap<Int, ChunkPos>(sessionsSnapshot.size)
-                    val playersByChunk = HashMap<ChunkPos, MutableList<PlayerSession>>()
-                    for (session in sessionsSnapshot) {
-                        val chunkPos = ChunkPos(
-                            ChunkStreamingService.chunkXFromBlockX(session.x),
-                            ChunkStreamingService.chunkZFromBlockZ(session.z)
-                        )
-                        playerChunkByEntityId[session.entityId] = chunkPos
-                        playersByChunk.computeIfAbsent(chunkPos) { ArrayList() }.add(session)
+                val playerChunkByEntityId = HashMap<Int, ChunkPos>(sessionsSnapshot.size)
+                val playersByChunk = HashMap<ChunkPos, MutableList<PlayerSession>>()
+                for (session in sessionsSnapshot) {
+                    if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) continue
+                    val chunkPos = ChunkPos(
+                        ChunkStreamingService.chunkXFromBlockX(session.x),
+                        ChunkStreamingService.chunkZFromBlockZ(session.z)
+                    )
+                    if (chunkPos !in activeSimulationChunks) continue
+                    val previousChunk = lastPushingChunkByPlayerEntityId.put(session.entityId, chunkPos)
+                    if (previousChunk == null || previousChunk != chunkPos) {
+                        markPushingChunksAwake(worldKey, chunkPos)
+                        if (previousChunk != null && previousChunk in activeSimulationChunks) {
+                            markPushingChunksAwake(worldKey, previousChunk)
+                        }
                     }
+                    playerChunkByEntityId[session.entityId] = chunkPos
+                    playersByChunk.computeIfAbsent(chunkPos) { ArrayList() }.add(session)
+                }
+                val chunksToProcess = HashSet<ChunkPos>()
+                chunksToProcess.addAll(drainAwakePushingChunks(worldKey, activeSimulationChunks))
+                if (chunksToProcess.isEmpty()) {
+                    pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
+                    continue
+                }
 
-                    val animalChunkByEntityId = HashMap<Int, ChunkPos>(animals.size)
-                    val animalsByChunk = HashMap<ChunkPos, MutableList<AnimalSnapshot>>()
+                val animalChunkByEntityId = HashMap<Int, ChunkPos>()
+                val animalsByChunk = HashMap<ChunkPos, MutableList<AnimalSnapshot>>()
+                for (chunkPos in chunksToProcess) {
+                    val animals = world.animalsInChunk(chunkPos.x, chunkPos.z)
+                    if (animals.isEmpty()) continue
+                    val bucket = animalsByChunk.computeIfAbsent(chunkPos) { ArrayList(animals.size) }
                     for (animal in animals) {
-                        val chunkPos = animal.chunkPos
                         animalChunkByEntityId[animal.entityId] = chunkPos
-                        animalsByChunk.computeIfAbsent(chunkPos) { ArrayList() }.add(animal)
+                        bucket.add(animal)
                     }
+                }
 
-                    val chunksToProcess = HashSet<ChunkPos>()
-                    chunksToProcess.addAll(playersByChunk.keys)
-                    chunksToProcess.addAll(animalsByChunk.keys)
-                    if (chunksToProcess.isEmpty()) {
-                        pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
-                        continue
-                    }
-                    pruneIdleWorldChunkTimingState(worldKey, chunksToProcess, pushingChunkLastTickNanos)
+                val hasSameChunkPlayerPairs = playersByChunk.values.any { it.size >= 2 }
+                val hasAnimalCandidates = animalsByChunk.isNotEmpty()
+                if (!hasSameChunkPlayerPairs && !hasAnimalCandidates) {
+                    pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
+                    continue
+                }
 
-                    val playerImpulseX = ConcurrentHashMap<Int, DoubleAdder>()
-                    val playerImpulseZ = ConcurrentHashMap<Int, DoubleAdder>()
-                    val animalImpulseX = ConcurrentHashMap<Int, DoubleAdder>()
-                    val animalImpulseZ = ConcurrentHashMap<Int, DoubleAdder>()
-                    val scheduledChunks = ArrayList<ChunkPos>(chunksToProcess.size)
-                    for (chunkPos in chunksToProcess) {
-                        val key = WorldChunkKey(worldKey, chunkPos)
-                        if (tryAcquireWorldChunkInFlight(key, pushingChunkInFlight)) {
-                            scheduledChunks.add(chunkPos)
-                        }
+                pruneIdleWorldChunkTimingState(worldKey, chunksToProcess, pushingChunkLastTickNanos)
+
+                val playerImpulseX = ConcurrentHashMap<Int, DoubleAdder>()
+                val playerImpulseZ = ConcurrentHashMap<Int, DoubleAdder>()
+                val animalImpulseX = ConcurrentHashMap<Int, DoubleAdder>()
+                val animalImpulseZ = ConcurrentHashMap<Int, DoubleAdder>()
+                val scheduledChunks = ArrayList<ChunkPos>(chunksToProcess.size)
+                for (chunkPos in chunksToProcess) {
+                    val key = WorldChunkKey(worldKey, chunkPos)
+                    if (tryAcquireWorldChunkInFlight(key, pushingChunkInFlight)) {
+                        scheduledChunks.add(chunkPos)
                     }
-                    if (scheduledChunks.isEmpty()) {
-                        continue
+                }
+                if (scheduledChunks.isEmpty()) {
+                    continue
+                }
+                val chunkProcessingFrame = world.beginChunkProcessingFrame(tickSequence)
+                val remaining = AtomicInteger(scheduledChunks.size)
+                val finalized = AtomicBoolean(false)
+                val finalizeIfDone = fun() {
+                    if (!finalized.compareAndSet(false, true)) {
+                        return
                     }
-                    val remaining = AtomicInteger(scheduledChunks.size)
-                    val finalized = AtomicBoolean(false)
-                    val finalizeIfDone = fun() {
-                        if (!finalized.compareAndSet(false, true)) {
-                            return
-                        }
-                        val playerImpulses = HashMap<Int, Pair<Double, Double>>()
-                        for ((entityId, xAdder) in playerImpulseX) {
-                            val x = xAdder.sum()
-                            val z = playerImpulseZ[entityId]?.sum() ?: 0.0
-                            if (x == 0.0 && z == 0.0) continue
-                            playerImpulses[entityId] = x to z
-                        }
-                        val animalImpulses = HashMap<Int, Pair<Double, Double>>()
-                        for ((entityId, xAdder) in animalImpulseX) {
-                            val x = xAdder.sum()
-                            val z = animalImpulseZ[entityId]?.sum() ?: 0.0
-                            if (x == 0.0 && z == 0.0) continue
-                            animalImpulses[entityId] = x to z
-                        }
-                        applyPushingImmediately(worldKey, playerImpulses, animalImpulses)
+                    val playerImpulses = HashMap<Int, Pair<Double, Double>>()
+                    for ((entityId, xAdder) in playerImpulseX) {
+                        val x = xAdder.sum()
+                        val z = playerImpulseZ[entityId]?.sum() ?: 0.0
+                        if (x == 0.0 && z == 0.0) continue
+                        playerImpulses[entityId] = x to z
                     }
+                    val animalImpulses = HashMap<Int, Pair<Double, Double>>()
+                    for ((entityId, xAdder) in animalImpulseX) {
+                        val x = xAdder.sum()
+                        val z = animalImpulseZ[entityId]?.sum() ?: 0.0
+                        if (x == 0.0 && z == 0.0) continue
+                        animalImpulses[entityId] = x to z
+                    }
+                    applyPushingImmediately(worldKey, playerImpulses, animalImpulses)
+                    world.finishChunkProcessingFrame(
+                        frame = chunkProcessingFrame,
+                        activeChunks = chunksToProcess,
+                        includeZeroForInactive = false,
+                        accumulateIntoLast = true
+                    )
+                }
 
                 for (chunkPos in scheduledChunks) {
                     world.submitOnChunkActor(chunkPos) {
                         val worldChunkKey = WorldChunkKey(worldKey, chunkPos)
+                        val startedAt = System.nanoTime()
                         try {
                             val chunkDeltaSeconds = consumeChunkElapsedDeltaSeconds(
                                 worldChunkKey = worldChunkKey,
@@ -2226,7 +2567,6 @@ private data class PigBoostState(
                                 deltaSeconds = chunkDeltaSeconds,
                                 playersByChunk = playersByChunk,
                                 animalsByChunk = animalsByChunk,
-                                playerChunkByEntityId = playerChunkByEntityId,
                                 animalChunkByEntityId = animalChunkByEntityId,
                                 playerImpulseX = playerImpulseX,
                                 playerImpulseZ = playerImpulseZ,
@@ -2234,6 +2574,12 @@ private data class PigBoostState(
                                 animalImpulseZ = animalImpulseZ
                             )
                         } finally {
+                            world.recordChunkProcessingNanos(
+                                frame = chunkProcessingFrame,
+                                chunkPos = chunkPos,
+                                elapsedNanos = System.nanoTime() - startedAt,
+                                category = "pushing"
+                            )
                             releaseWorldChunkInFlight(worldChunkKey, pushingChunkInFlight)
                             if (remaining.decrementAndGet() == 0) {
                                 finalizeIfDone()
@@ -2250,27 +2596,25 @@ private data class PigBoostState(
         deltaSeconds: Double,
         playersByChunk: Map<ChunkPos, List<PlayerSession>>,
         animalsByChunk: Map<ChunkPos, List<AnimalSnapshot>>,
-        playerChunkByEntityId: Map<Int, ChunkPos>,
         animalChunkByEntityId: Map<Int, ChunkPos>,
         playerImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
         playerImpulseZ: ConcurrentHashMap<Int, DoubleAdder>,
         animalImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
         animalImpulseZ: ConcurrentHashMap<Int, DoubleAdder>
     ) {
-        val nearbyPlayers = collectNeighborPlayers(chunkPos, playersByChunk)
+        val chunkPlayers = playersByChunk[chunkPos].orEmpty()
+        val chunkAnimals = animalsByChunk[chunkPos].orEmpty()
         val nearbyAnimals = collectNeighborAnimals(chunkPos, animalsByChunk)
+        val chunkAnimalSpatialIndex = buildAnimalSpatialIndex(chunkAnimals)
 
-        for (i in 0 until nearbyPlayers.size) {
-            val a = nearbyPlayers[i]
+        for (i in 0 until chunkPlayers.size) {
+            val a = chunkPlayers[i]
             if (a.dead || a.gameMode == GAME_MODE_SPECTATOR) continue
-            val aChunk = playerChunkByEntityId[a.entityId] ?: continue
             val aMinY = a.y
             val aMaxY = a.y + playerCollisionHeight(a)
-            for (j in (i + 1) until nearbyPlayers.size) {
-                val b = nearbyPlayers[j]
+            for (j in (i + 1) until chunkPlayers.size) {
+                val b = chunkPlayers[j]
                 if (b.dead || b.gameMode == GAME_MODE_SPECTATOR) continue
-                val bChunk = playerChunkByEntityId[b.entityId] ?: continue
-                if (ownerChunkForPair(aChunk, bChunk) != chunkPos) continue
                 val bMinY = b.y
                 val bMaxY = b.y + playerCollisionHeight(b)
                 if (aMaxY <= bMinY || aMinY >= bMaxY) continue
@@ -2285,14 +2629,12 @@ private data class PigBoostState(
             }
         }
 
-        for (player in nearbyPlayers) {
+        for (player in chunkPlayers) {
             if (player.dead || player.gameMode == GAME_MODE_SPECTATOR) continue
-            val playerChunk = playerChunkByEntityId[player.entityId] ?: continue
             val playerMinY = player.y
             val playerMaxY = player.y + playerCollisionHeight(player)
-            for (animal in nearbyAnimals) {
-                val animalChunk = animalChunkByEntityId[animal.entityId] ?: continue
-                if (ownerChunkForPair(playerChunk, animalChunk) != chunkPos) continue
+            val candidateAnimals = candidateAnimalsForPlayer(player, chunkAnimalSpatialIndex)
+            for (animal in candidateAnimals) {
                 val animalMinY = animal.y
                 val animalMaxY = animal.y + animal.hitboxHeight
                 if (playerMaxY <= animalMinY || playerMinY >= animalMaxY) continue
@@ -2309,10 +2651,15 @@ private data class PigBoostState(
         for (i in 0 until nearbyAnimals.size) {
             val a = nearbyAnimals[i]
             val aChunk = animalChunkByEntityId[a.entityId] ?: continue
+            val aMinY = a.y
+            val aMaxY = a.y + a.hitboxHeight
             for (j in (i + 1) until nearbyAnimals.size) {
                 val b = nearbyAnimals[j]
                 val bChunk = animalChunkByEntityId[b.entityId] ?: continue
                 if (ownerChunkForPair(aChunk, bChunk) != chunkPos) continue
+                val bMinY = b.y
+                val bMaxY = b.y + b.hitboxHeight
+                if (aMaxY <= bMinY || aMinY >= bMaxY) continue
                 applyHorizontalPushPair(
                     ax = a.x, az = a.z, ar = a.hitboxWidth * 0.5,
                     bx = b.x, bz = b.z, br = b.hitboxWidth * 0.5,
@@ -2323,6 +2670,52 @@ private data class PigBoostState(
                 }
             }
         }
+    }
+
+    private data class AnimalSpatialIndex(
+        val byCell: Map<Long, MutableList<AnimalSnapshot>>,
+        val maxHalfWidth: Double
+    )
+
+    private fun buildAnimalSpatialIndex(animals: List<AnimalSnapshot>): AnimalSpatialIndex {
+        if (animals.isEmpty()) return AnimalSpatialIndex(emptyMap(), 0.0)
+        val byCell = HashMap<Long, MutableList<AnimalSnapshot>>()
+        var maxHalfWidth = 0.0
+        for (animal in animals) {
+            val halfWidth = (animal.hitboxWidth * 0.5).coerceAtLeast(0.0)
+            if (halfWidth > maxHalfWidth) {
+                maxHalfWidth = halfWidth
+            }
+            val cellX = floor(animal.x / PUSHING_SPATIAL_CELL_SIZE).toInt()
+            val cellZ = floor(animal.z / PUSHING_SPATIAL_CELL_SIZE).toInt()
+            val key = packSpatialCell(cellX, cellZ)
+            byCell.computeIfAbsent(key) { ArrayList() }.add(animal)
+        }
+        return AnimalSpatialIndex(byCell = byCell, maxHalfWidth = maxHalfWidth)
+    }
+
+    private fun candidateAnimalsForPlayer(
+        player: PlayerSession,
+        index: AnimalSpatialIndex
+    ): List<AnimalSnapshot> {
+        if (index.byCell.isEmpty()) return emptyList()
+        val reach = PLAYER_HITBOX_HALF_WIDTH + index.maxHalfWidth + PUSHING_SPATIAL_REACH_MARGIN
+        val minCellX = floor((player.x - reach) / PUSHING_SPATIAL_CELL_SIZE).toInt()
+        val maxCellX = floor((player.x + reach) / PUSHING_SPATIAL_CELL_SIZE).toInt()
+        val minCellZ = floor((player.z - reach) / PUSHING_SPATIAL_CELL_SIZE).toInt()
+        val maxCellZ = floor((player.z + reach) / PUSHING_SPATIAL_CELL_SIZE).toInt()
+        val out = ArrayList<AnimalSnapshot>()
+        for (cellX in minCellX..maxCellX) {
+            for (cellZ in minCellZ..maxCellZ) {
+                val bucket = index.byCell[packSpatialCell(cellX, cellZ)] ?: continue
+                out.addAll(bucket)
+            }
+        }
+        return out
+    }
+
+    private fun packSpatialCell(cellX: Int, cellZ: Int): Long {
+        return (cellX.toLong() shl 32) xor (cellZ.toLong() and 0xFFFFFFFFL)
     }
 
     private fun addImpulse(
@@ -2435,11 +2828,285 @@ private data class PigBoostState(
         }
     }
 
+    private fun collectThrownItemEntityHits(
+        world: org.macaroon3145.world.World,
+        worldSessions: List<PlayerSession>,
+        snapshots: List<ThrownItemSnapshot>,
+        removedOut: MutableList<org.macaroon3145.world.ThrownItemRemovedEvent>,
+        removedIds: MutableSet<Int>
+    ) {
+        for (snapshot in snapshots) {
+            if (snapshot.entityId in removedIds) continue
+            val current = world.thrownItemSnapshot(snapshot.entityId) ?: continue
+
+            var bestT: Double? = null
+            var bestHitX = 0.0
+            var bestHitY = 0.0
+            var bestHitZ = 0.0
+
+            for (target in worldSessions) {
+                if (target.entityId == current.ownerEntityId) continue
+                if (target.dead) continue
+                if (target.gameMode == GAME_MODE_SPECTATOR) continue
+                val t = thrownItemEntryTAgainstPlayer(current, target) ?: continue
+                if (bestT == null || t < bestT) {
+                    bestT = t
+                    val hit = resolveThrownItemImpactAtT(current, t)
+                    bestHitX = hit.first
+                    bestHitY = hit.second
+                    bestHitZ = hit.third
+                }
+            }
+
+            val animalCandidates = collectCandidateAnimalsForThrown(world, current)
+            for (animal in animalCandidates) {
+                val t = thrownItemEntryTAgainstAnimal(current, animal) ?: continue
+                if (bestT == null || t < bestT) {
+                    bestT = t
+                    val hit = resolveThrownItemImpactAtT(current, t)
+                    bestHitX = hit.first
+                    bestHitY = hit.second
+                    bestHitZ = hit.third
+                }
+            }
+
+            if (bestT == null) continue
+            val removed = world.removeThrownItem(
+                entityId = current.entityId,
+                hit = true,
+                x = bestHitX,
+                y = bestHitY,
+                z = bestHitZ
+            ) ?: continue
+            removedIds.add(current.entityId)
+            removedOut.add(removed)
+        }
+    }
+
+    private fun thrownItemEntryTAgainstPlayer(snapshot: ThrownItemSnapshot, target: PlayerSession): Double? {
+        val hitbox = expandedPlayerHitbox(target)
+        return segmentAabbEntryTime(
+            x0 = snapshot.prevX,
+            y0 = snapshot.prevY,
+            z0 = snapshot.prevZ,
+            x1 = snapshot.x,
+            y1 = snapshot.y,
+            z1 = snapshot.z,
+            minX = hitbox[0],
+            maxX = hitbox[1],
+            minY = hitbox[2],
+            maxY = hitbox[3],
+            minZ = hitbox[4],
+            maxZ = hitbox[5]
+        )
+    }
+
+    private fun thrownItemEntryTAgainstAnimal(snapshot: ThrownItemSnapshot, target: AnimalSnapshot): Double? {
+        val hitbox = expandedAnimalHitbox(target)
+        return segmentAabbEntryTime(
+            x0 = snapshot.prevX,
+            y0 = snapshot.prevY,
+            z0 = snapshot.prevZ,
+            x1 = snapshot.x,
+            y1 = snapshot.y,
+            z1 = snapshot.z,
+            minX = hitbox[0],
+            maxX = hitbox[1],
+            minY = hitbox[2],
+            maxY = hitbox[3],
+            minZ = hitbox[4],
+            maxZ = hitbox[5]
+        )
+    }
+
+    private fun resolveThrownItemImpactAtT(snapshot: ThrownItemSnapshot, t: Double): Triple<Double, Double, Double> {
+        val clampedT = t.coerceIn(0.0, 1.0)
+        return Triple(
+            snapshot.prevX + (snapshot.x - snapshot.prevX) * clampedT,
+            snapshot.prevY + (snapshot.y - snapshot.prevY) * clampedT,
+            snapshot.prevZ + (snapshot.z - snapshot.prevZ) * clampedT
+        )
+    }
+
+    private fun collectThrownItemAnimalHits(
+        world: org.macaroon3145.world.World,
+        snapshots: List<ThrownItemSnapshot>,
+        removedOut: MutableList<org.macaroon3145.world.ThrownItemRemovedEvent>,
+        removedIds: MutableSet<Int>
+    ) {
+        for (snapshot in snapshots) {
+            if (snapshot.entityId in removedIds) continue
+            val current = world.thrownItemSnapshot(snapshot.entityId) ?: continue
+            val candidates = collectCandidateAnimalsForThrown(world, current)
+            var hitTarget: AnimalSnapshot? = null
+            for (animal in candidates) {
+                if (!thrownItemHitsAnimal(current, animal)) continue
+                hitTarget = animal
+                break
+            }
+            if (hitTarget == null) continue
+            val (hitX, hitY, hitZ) = resolveThrownItemImpactOnAnimal(current, hitTarget)
+            val removed = world.removeThrownItem(
+                entityId = current.entityId,
+                hit = true,
+                x = hitX,
+                y = hitY,
+                z = hitZ
+            ) ?: continue
+            removedIds.add(current.entityId)
+            removedOut.add(removed)
+        }
+    }
+
+    private fun collectCandidateAnimalsForThrown(
+        world: org.macaroon3145.world.World,
+        snapshot: ThrownItemSnapshot
+    ): List<AnimalSnapshot> {
+        val minChunkX = min(
+            ChunkStreamingService.chunkXFromBlockX(snapshot.prevX),
+            ChunkStreamingService.chunkXFromBlockX(snapshot.x)
+        )
+        val maxChunkX = max(
+            ChunkStreamingService.chunkXFromBlockX(snapshot.prevX),
+            ChunkStreamingService.chunkXFromBlockX(snapshot.x)
+        )
+        val minChunkZ = min(
+            ChunkStreamingService.chunkZFromBlockZ(snapshot.prevZ),
+            ChunkStreamingService.chunkZFromBlockZ(snapshot.z)
+        )
+        val maxChunkZ = max(
+            ChunkStreamingService.chunkZFromBlockZ(snapshot.prevZ),
+            ChunkStreamingService.chunkZFromBlockZ(snapshot.z)
+        )
+        val byEntityId = HashMap<Int, AnimalSnapshot>()
+        for (chunkX in (minChunkX - 1)..(maxChunkX + 1)) {
+            for (chunkZ in (minChunkZ - 1)..(maxChunkZ + 1)) {
+                val animals = world.animalsInChunk(chunkX, chunkZ)
+                for (animal in animals) {
+                    byEntityId.putIfAbsent(animal.entityId, animal)
+                }
+            }
+        }
+        return byEntityId.values.toList()
+    }
+
+    private fun processEnderPearlImpacts(
+        worldKey: String,
+        removedEvents: List<org.macaroon3145.world.ThrownItemRemovedEvent>
+    ) {
+        for (removed in removedEvents) {
+            if (!removed.hit) continue
+            if (removed.kind != ThrownItemKind.ENDER_PEARL) continue
+            val owner = sessions.values.firstOrNull {
+                it.worldKey == worldKey && it.entityId == removed.ownerEntityId
+            } ?: continue
+            if (owner.dead) continue
+            if (owner.gameMode == GAME_MODE_SPECTATOR) continue
+            val safeTeleport = resolveSafeEnderPearlTeleport(owner, removed)
+            if (!teleportPlayer(owner, safeTeleport.first, safeTeleport.second, safeTeleport.third, null, null)) continue
+            broadcastEnderPearlTeleportSound(worldKey, safeTeleport.first, safeTeleport.second, safeTeleport.third)
+            damagePlayer(
+                session = owner,
+                amount = ENDER_PEARL_TELEPORT_DAMAGE,
+                damageTypeId = FALL_DAMAGE_TYPE_ID,
+                hurtSoundId = PLAYER_SMALL_FALL_SOUND_ID,
+                bigHurtSoundId = PLAYER_BIG_FALL_SOUND_ID,
+                deathMessage = PlayPackets.ChatComponent.Translate(
+                    key = "death.fell.accident.generic",
+                    args = listOf(playerNameComponent(owner.profile))
+                )
+            )
+        }
+    }
+
+    private fun resolveSafeEnderPearlTeleport(
+        session: PlayerSession,
+        impact: org.macaroon3145.world.ThrownItemRemovedEvent
+    ): Triple<Double, Double, Double> {
+        val hitAxis = impact.hitAxis ?: return Triple(impact.x, impact.y, impact.z)
+        val hitDirection = impact.hitDirection ?: return Triple(impact.x, impact.y, impact.z)
+        val hitBoundary = impact.hitBoundary ?: return Triple(impact.x, impact.y, impact.z)
+        val face = hitBoundary + when (hitDirection) {
+            1 -> THROWN_ITEM_HITBOX_RADIUS
+            -1 -> -THROWN_ITEM_HITBOX_RADIUS
+            else -> 0.0
+        }
+        val height = playerPoseHeight(session)
+        val halfWidth = PLAYER_HITBOX_HALF_WIDTH
+        return when (hitAxis) {
+            0 -> {
+                val x = if (hitDirection > 0) face - halfWidth else face + halfWidth
+                Triple(x, impact.y, impact.z)
+            }
+            1 -> {
+                val y = if (hitDirection > 0) face - height else face
+                Triple(impact.x, y, impact.z)
+            }
+            2 -> {
+                val z = if (hitDirection > 0) face - halfWidth else face + halfWidth
+                Triple(impact.x, impact.y, z)
+            }
+            else -> Triple(impact.x, impact.y, impact.z)
+        }
+    }
+
+    private fun broadcastEnderPearlTeleportSound(worldKey: String, x: Double, y: Double, z: Double) {
+        val packet = PlayPackets.soundPacketByKey(
+            soundKey = "minecraft:entity.player.teleport",
+            soundSourceId = PLAYERS_SOUND_SOURCE_ID,
+            x = x,
+            y = y,
+            z = z,
+            volume = 1.0f,
+            pitch = 1.0f,
+            seed = ThreadLocalRandom.current().nextLong()
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
     private fun resolveThrownItemImpactOnPlayer(
         snapshot: ThrownItemSnapshot,
         target: PlayerSession
     ): Triple<Double, Double, Double> {
         val hitbox = expandedPlayerHitbox(target)
+        val minX = hitbox[0]
+        val maxX = hitbox[1]
+        val minY = hitbox[2]
+        val maxY = hitbox[3]
+        val minZ = hitbox[4]
+        val maxZ = hitbox[5]
+        val entryT = segmentAabbEntryTime(
+            x0 = snapshot.prevX,
+            y0 = snapshot.prevY,
+            z0 = snapshot.prevZ,
+            x1 = snapshot.x,
+            y1 = snapshot.y,
+            z1 = snapshot.z,
+            minX = minX,
+            maxX = maxX,
+            minY = minY,
+            maxY = maxY,
+            minZ = minZ,
+            maxZ = maxZ
+        )
+        val clampedT = entryT?.coerceIn(0.0, 1.0) ?: 1.0
+        val x = snapshot.prevX + (snapshot.x - snapshot.prevX) * clampedT
+        val y = snapshot.prevY + (snapshot.y - snapshot.prevY) * clampedT
+        val z = snapshot.prevZ + (snapshot.z - snapshot.prevZ) * clampedT
+        return Triple(x.coerceIn(minX, maxX), y.coerceIn(minY, maxY), z.coerceIn(minZ, maxZ))
+    }
+
+    private fun resolveThrownItemImpactOnAnimal(
+        snapshot: ThrownItemSnapshot,
+        target: AnimalSnapshot
+    ): Triple<Double, Double, Double> {
+        val hitbox = expandedAnimalHitbox(target)
         val minX = hitbox[0]
         val maxX = hitbox[1]
         val minY = hitbox[2]
@@ -2492,19 +3159,156 @@ private data class PigBoostState(
         ) != null
     }
 
+    private fun thrownItemHitsAnimal(snapshot: ThrownItemSnapshot, target: AnimalSnapshot): Boolean {
+        val hitbox = expandedAnimalHitbox(target)
+        val minX = hitbox[0]
+        val maxX = hitbox[1]
+        val minY = hitbox[2]
+        val maxY = hitbox[3]
+        val minZ = hitbox[4]
+        val maxZ = hitbox[5]
+        if (snapshot.x in minX..maxX && snapshot.y in minY..maxY && snapshot.z in minZ..maxZ) return true
+        return segmentAabbEntryTime(
+            x0 = snapshot.prevX,
+            y0 = snapshot.prevY,
+            z0 = snapshot.prevZ,
+            x1 = snapshot.x,
+            y1 = snapshot.y,
+            z1 = snapshot.z,
+            minX = minX,
+            maxX = maxX,
+            minY = minY,
+            maxY = maxY,
+            minZ = minZ,
+            maxZ = maxZ
+        ) != null
+    }
+
     private fun expandedPlayerHitbox(target: PlayerSession): DoubleArray {
-        val playerHeight = when {
-            target.swimming -> 0.6
-            target.sneaking -> 1.5
-            else -> 1.8
+        val aabb = playerAabb(
+            session = target,
+            expandHorizontal = THROWN_ITEM_HITBOX_RADIUS,
+            expandDown = THROWN_ITEM_HITBOX_RADIUS,
+            expandUp = THROWN_ITEM_HITBOX_RADIUS
+        )
+        return aabb.toDoubleArray()
+    }
+
+    private fun expandedAnimalHitbox(target: AnimalSnapshot): DoubleArray {
+        val aabb = animalAabb(
+            target = target,
+            expandHorizontal = THROWN_ITEM_HITBOX_RADIUS,
+            expandDown = THROWN_ITEM_HITBOX_RADIUS,
+            expandUp = THROWN_ITEM_HITBOX_RADIUS
+        )
+        return aabb.toDoubleArray()
+    }
+
+    private fun playerCollisionAt(
+        world: org.macaroon3145.world.World,
+        x: Double,
+        y: Double,
+        z: Double,
+        halfWidth: Double,
+        height: Double
+    ): Boolean {
+        val playerBox = playerAabbAt(x, y, z, halfWidth, height)
+        val minX = playerBox.minX
+        val maxX = playerBox.maxX
+        val minY = playerBox.minY
+        val maxY = playerBox.maxY
+        val minZ = playerBox.minZ
+        val maxZ = playerBox.maxZ
+
+        val startX = floor(minX).toInt()
+        val endX = floor(maxX - 1.0e-7).toInt()
+        val startY = floor(minY).toInt()
+        val endY = floor(maxY - 1.0e-7).toInt()
+        val startZ = floor(minZ).toInt()
+        val endZ = floor(maxZ - 1.0e-7).toInt()
+
+        for (bx in startX..endX) {
+            for (by in startY..endY) {
+                for (bz in startZ..endZ) {
+                    val stateId = world.blockStateAt(bx, by, bz)
+                    if (stateId <= 0) continue
+                    val parsed = BlockStateRegistry.parsedState(stateId) ?: continue
+                    if (parsed.blockKey in NON_SUPPORT_BLOCK_KEYS) continue
+                    val resolved = BlockCollisionRegistry.boxesForStateId(stateId, parsed)
+                    if (resolved == null) {
+                        if (aabbOverlap(
+                                playerBox,
+                                Aabb(
+                                    minX = bx.toDouble(),
+                                    minY = by.toDouble(),
+                                    minZ = bz.toDouble(),
+                                    maxX = bx + 1.0,
+                                    maxY = by + 1.0,
+                                    maxZ = bz + 1.0
+                                )
+                            )
+                        ) {
+                            return true
+                        }
+                        continue
+                    }
+                    for (collisionBox in resolved) {
+                        val boxMinX = bx + collisionBox.minX
+                        val boxMinY = by + collisionBox.minY
+                        val boxMinZ = bz + collisionBox.minZ
+                        val boxMaxX = bx + collisionBox.maxX
+                        val boxMaxY = by + collisionBox.maxY
+                        val boxMaxZ = bz + collisionBox.maxZ
+                        if (aabbOverlap(
+                                playerBox,
+                                Aabb(
+                                    minX = boxMinX,
+                                    minY = boxMinY,
+                                    minZ = boxMinZ,
+                                    maxX = boxMaxX,
+                                    maxY = boxMaxY,
+                                    maxZ = boxMaxZ
+                                )
+                            )
+                        ) {
+                            return true
+                        }
+                    }
+                }
+            }
         }
-        val minX = target.x - PLAYER_HITBOX_HALF_WIDTH - THROWN_ITEM_HITBOX_RADIUS
-        val maxX = target.x + PLAYER_HITBOX_HALF_WIDTH + THROWN_ITEM_HITBOX_RADIUS
-        val minY = target.y - THROWN_ITEM_HITBOX_RADIUS
-        val maxY = target.y + playerHeight + THROWN_ITEM_HITBOX_RADIUS
-        val minZ = target.z - PLAYER_HITBOX_HALF_WIDTH - THROWN_ITEM_HITBOX_RADIUS
-        val maxZ = target.z + PLAYER_HITBOX_HALF_WIDTH + THROWN_ITEM_HITBOX_RADIUS
-        return doubleArrayOf(minX, maxX, minY, maxY, minZ, maxZ)
+        return false
+    }
+
+    private fun aabbOverlap(
+        a: Aabb,
+        b: Aabb
+    ): Boolean {
+        return aabbOverlap(
+            a.minX, a.minY, a.minZ,
+            a.maxX, a.maxY, a.maxZ,
+            b.minX, b.minY, b.minZ,
+            b.maxX, b.maxY, b.maxZ
+        )
+    }
+
+    private fun aabbOverlap(
+        aMinX: Double,
+        aMinY: Double,
+        aMinZ: Double,
+        aMaxX: Double,
+        aMaxY: Double,
+        aMaxZ: Double,
+        bMinX: Double,
+        bMinY: Double,
+        bMinZ: Double,
+        bMaxX: Double,
+        bMaxY: Double,
+        bMaxZ: Double
+    ): Boolean {
+        return aMaxX > bMinX && aMinX < bMaxX &&
+            aMaxY > bMinY && aMinY < bMaxY &&
+            aMaxZ > bMinZ && aMinZ < bMaxZ
     }
 
     private fun segmentAabbEntryTime(
@@ -2551,41 +3355,171 @@ private data class PigBoostState(
     }
 
     private fun updateRetainedBaseWorldChunks(sessionsByWorld: Map<String, List<PlayerSession>>) {
+        pruneRetainedBaseChunkCaches(sessionsByWorld.keys)
         for ((worldKey, worldSessions) in sessionsByWorld) {
+            val dirty = retainedBaseChunksDirtyWorlds.contains(worldKey)
+            if (!dirty && retainedBaseChunksCacheByWorld.containsKey(worldKey)) continue
             val retained = HashSet<ChunkPos>()
             for (session in worldSessions) {
                 retained.addAll(session.targetChunks)
                 retained.addAll(session.loadedChunks)
             }
-            FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, retained)
+            val previous = retainedBaseChunksCacheByWorld[worldKey]
+            if (previous == null || previous != retained) {
+                FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, retained)
+                retainedBaseChunksCacheByWorld[worldKey] = retained
+            }
+            retainedBaseChunksDirtyWorlds.remove(worldKey)
         }
     }
 
     private fun updateRetainedBaseWorldChunksForWorld(worldKey: String) {
+        markRetainedBaseChunksDirty(worldKey)
         val retained = HashSet<ChunkPos>()
         for (session in sessions.values) {
             if (session.worldKey != worldKey) continue
             retained.addAll(session.targetChunks)
             retained.addAll(session.loadedChunks)
         }
-        FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, retained)
+        val previous = retainedBaseChunksCacheByWorld[worldKey]
+        if (previous == null || previous != retained) {
+            FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, retained)
+            retainedBaseChunksCacheByWorld[worldKey] = retained
+        }
+        retainedBaseChunksDirtyWorlds.remove(worldKey)
     }
 
-    private fun collectActiveSimulationChunks(worldSessions: List<PlayerSession>): Set<ChunkPos> {
-        val maxSimulation = ServerConfig.maxSimulationDistanceChunks.coerceIn(2, 32)
-        val active = HashSet<ChunkPos>(worldSessions.size * 128)
-        for (session in worldSessions) {
-            val simulationRadius = session.chunkRadius.coerceAtMost(maxSimulation)
-            val radiusSq = simulationRadius * simulationRadius
-            for (dz in -simulationRadius..simulationRadius) {
-                for (dx in -simulationRadius..simulationRadius) {
-                    if (dx * dx + dz * dz <= radiusSq) {
-                        active.add(ChunkPos(session.centerChunkX + dx, session.centerChunkZ + dz))
-                    }
+    private fun buildSimulationChunkFootprint(centerChunkX: Int, centerChunkZ: Int, radius: Int): Set<ChunkPos> {
+        val radiusSq = radius * radius
+        val out = HashSet<ChunkPos>((radius * radius * 3).coerceAtLeast(16))
+        for (dz in -radius..radius) {
+            for (dx in -radius..radius) {
+                if (dx * dx + dz * dz <= radiusSq) {
+                    out.add(ChunkPos(centerChunkX + dx, centerChunkZ + dz))
                 }
             }
         }
-        return active
+        return out
+    }
+
+    private fun addSimulationFootprintRefs(worldKey: String, footprint: Set<ChunkPos>) {
+        if (footprint.isEmpty()) return
+        val refs = activeSimulationRefCountByWorld.computeIfAbsent(worldKey) { ConcurrentHashMap() }
+        for (chunkPos in footprint) {
+            refs.compute(chunkPos) { _, count -> (count ?: 0) + 1 }
+        }
+    }
+
+    private fun removeSimulationFootprintRefs(worldKey: String, footprint: Set<ChunkPos>) {
+        if (footprint.isEmpty()) return
+        val refs = activeSimulationRefCountByWorld[worldKey] ?: return
+        for (chunkPos in footprint) {
+            refs.computeIfPresent(chunkPos) { _, count ->
+                if (count <= 1) null else count - 1
+            }
+        }
+        if (refs.isEmpty()) {
+            activeSimulationRefCountByWorld.remove(worldKey, refs)
+        }
+    }
+
+    private fun ensureActiveSimulationChunkIndex(sessionsByWorld: Map<String, List<PlayerSession>>) {
+        if (sessionsByWorld.isEmpty()) {
+            activeSimulationRefCountByWorld.clear()
+            activeSimulationChunksCacheByWorld.clear()
+            activeSimulationStampByPlayerEntityId.clear()
+            activeSimulationChunksByPlayerEntityId.clear()
+            return
+        }
+
+        val maxSimulation = ServerConfig.maxSimulationDistanceChunks.coerceIn(2, 32)
+        activeSimulationLastMaxDistanceChunks = maxSimulation
+
+        val activeWorldKeys = sessionsByWorld.keys
+        val refWorldKeys = activeSimulationRefCountByWorld.keys.toList()
+        for (worldKey in refWorldKeys) {
+            if (worldKey in activeWorldKeys) continue
+            activeSimulationRefCountByWorld.remove(worldKey)
+            activeSimulationChunksCacheByWorld.remove(worldKey)
+        }
+
+        val activePlayerEntityIds = HashSet<Int>(sessionsByWorld.values.sumOf { it.size })
+        for ((worldKey, worldSessions) in sessionsByWorld) {
+            for (session in worldSessions) {
+                val entityId = session.entityId
+                activePlayerEntityIds.add(entityId)
+                val simulationRadius = session.chunkRadius.coerceAtMost(maxSimulation)
+                val nextStamp = PlayerSimulationStamp(
+                    worldKey = worldKey,
+                    centerChunkX = session.centerChunkX,
+                    centerChunkZ = session.centerChunkZ,
+                    radius = simulationRadius
+                )
+                val prevStamp = activeSimulationStampByPlayerEntityId[entityId]
+                if (prevStamp == nextStamp) {
+                    continue
+                }
+                if (prevStamp != null) {
+                    val previous = activeSimulationChunksByPlayerEntityId.remove(entityId)
+                    if (previous != null) {
+                        removeSimulationFootprintRefs(prevStamp.worldKey, previous)
+                    }
+                }
+                val nextFootprint = buildSimulationChunkFootprint(
+                    centerChunkX = nextStamp.centerChunkX,
+                    centerChunkZ = nextStamp.centerChunkZ,
+                    radius = nextStamp.radius
+                )
+                activeSimulationStampByPlayerEntityId[entityId] = nextStamp
+                activeSimulationChunksByPlayerEntityId[entityId] = nextFootprint
+                addSimulationFootprintRefs(worldKey, nextFootprint)
+            }
+        }
+
+        val knownEntityIds = activeSimulationStampByPlayerEntityId.keys.toList()
+        for (entityId in knownEntityIds) {
+            if (entityId in activePlayerEntityIds) continue
+            val prevStamp = activeSimulationStampByPlayerEntityId.remove(entityId) ?: continue
+            val previous = activeSimulationChunksByPlayerEntityId.remove(entityId)
+            if (previous != null) {
+                removeSimulationFootprintRefs(prevStamp.worldKey, previous)
+            }
+        }
+
+        for (worldKey in activeWorldKeys) {
+            val refs = activeSimulationRefCountByWorld[worldKey]
+            if (refs == null || refs.isEmpty()) {
+                activeSimulationChunksCacheByWorld.remove(worldKey)
+                continue
+            }
+            activeSimulationChunksCacheByWorld[worldKey] = HashSet(refs.keys)
+        }
+    }
+
+    private fun markRetainedBaseChunksDirty(worldKey: String) {
+        retainedBaseChunksDirtyWorlds.add(worldKey)
+    }
+
+    private fun markWorldChunkCachesDirty(worldKey: String) {
+        markRetainedBaseChunksDirty(worldKey)
+    }
+
+    private fun pruneRetainedBaseChunkCaches(activeWorldKeys: Set<String>) {
+        if (activeWorldKeys.isEmpty()) {
+            for (worldKey in retainedBaseChunksCacheByWorld.keys) {
+                FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, emptySet())
+            }
+            retainedBaseChunksCacheByWorld.clear()
+            retainedBaseChunksDirtyWorlds.clear()
+            return
+        }
+        val retainKeys = retainedBaseChunksCacheByWorld.keys.toList()
+        for (worldKey in retainKeys) {
+            if (worldKey in activeWorldKeys) continue
+            FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, emptySet())
+            retainedBaseChunksCacheByWorld.remove(worldKey)
+            retainedBaseChunksDirtyWorlds.remove(worldKey)
+        }
     }
 
     private fun advanceAndBroadcastWorldTime(deltaSeconds: Double) {
@@ -2676,6 +3610,14 @@ private data class PigBoostState(
         session.yaw = yaw
         session.pitch = pitch
         session.onGround = onGround
+        markPushingWakeFromPlayerMovement(
+            session = session,
+            previousX = previousX,
+            previousZ = previousZ,
+            nextX = x,
+            nextZ = z,
+            horizontalMovementSq = session.lastHorizontalMovementSq
+        )
         updateFallDistance(session, world, wasOnGround, onGround, deltaY)
         applyMovementFoodExhaustion(
             session = session,
@@ -2916,10 +3858,22 @@ private data class PigBoostState(
             }
 
             val knockbackStrength = BASE_PLAYER_KNOCKBACK + if (knockbackAttack) SPRINT_KNOCKBACK_BONUS else 0.0
-            applyVanillaKnockback(attacker, playerTarget, knockbackStrength)
+            applyVanillaKnockback(
+                attacker = attacker,
+                target = playerTarget,
+                strength = knockbackStrength,
+                attackDirX = attacker.x - playerTarget.x,
+                attackDirZ = attacker.z - playerTarget.z
+            )
             if (sweepAttack) {
                 playedSweep = true
-                applySweepAttack(attacker, playerTarget, damageTypeId = PLAYER_ATTACK_DAMAGE_TYPE_ID)
+                applySweepAttack(
+                    attacker = attacker,
+                    primaryTarget = playerTarget,
+                    damageTypeId = PLAYER_ATTACK_DAMAGE_TYPE_ID,
+                    attackOriginX = attacker.x,
+                    attackOriginZ = attacker.z
+                )
             }
             playAttackFeedback(attacker, knockbackAttack, criticalAttack, strongAttack, playedSweep)
             return
@@ -2938,11 +3892,17 @@ private data class PigBoostState(
         if (criticalAttack) {
             damage *= VANILLA_CRITICAL_DAMAGE_MULTIPLIER
         }
-        val damageResult = world.damageAnimal(
+        val knockbackStrength = if (knockbackAttack) ANIMAL_SPRINT_ATTACK_KNOCKBACK else ANIMAL_BASE_ATTACK_KNOCKBACK
+        val damageWithKnockback = world.damageAnimalWithKnockback(
             entityId = animalTarget.entityId,
             amount = damage,
-            cause = AnimalDamageCause.PLAYER_ATTACK
+            cause = AnimalDamageCause.PLAYER_ATTACK,
+            attackerX = attacker.x,
+            attackerZ = attacker.z,
+            strength = knockbackStrength,
+            preGravityYCompensation = KNOCKBACK_Y_PRE_GRAVITY_COMPENSATION
         ) ?: return
+        val damageResult = damageWithKnockback.damageResult
         if (criticalAttack) {
             broadcastEntityAnimation(attacker.worldKey, animalTarget.entityId, ENTITY_ANIMATION_CRITICAL_HIT)
         }
@@ -2953,9 +3913,21 @@ private data class PigBoostState(
             broadcastAnimalDeath(attacker.worldKey, damageResult.removed)
             broadcastAnimalRemoval(attacker.worldKey, damageResult.removed.entityId)
         }
-
-        val knockbackStrength = if (knockbackAttack) ANIMAL_SPRINT_ATTACK_KNOCKBACK else ANIMAL_BASE_ATTACK_KNOCKBACK
-        applyAnimalKnockback(attacker, animalTarget, world, knockbackStrength)
+        if (damageWithKnockback.knockbackApplied) {
+            broadcastAnimalVelocity(
+                attacker.worldKey,
+                animalTarget.entityId,
+                damageWithKnockback.velocityX,
+                damageWithKnockback.velocityY,
+                damageWithKnockback.velocityZ
+            )
+            broadcastAttackKnockbackAt(
+                worldKey = attacker.worldKey,
+                x = damageWithKnockback.x,
+                y = damageWithKnockback.y + damageWithKnockback.hitboxHeight * 0.5,
+                z = damageWithKnockback.z
+            )
+        }
         playAttackFeedback(
             attacker = attacker,
             knockbackAttack = knockbackAttack,
@@ -3030,6 +4002,26 @@ private data class PigBoostState(
         session.lastClientVehiclePitch = pitch
         session.lastClientVehicleOnGround = onGround
         session.lastClientVehiclePacketAtNanos = System.nanoTime()
+        session.yaw = yaw
+        session.pitch = pitch
+        broadcastMountedAnimalHeadYawFromVehiclePacket(session, yaw)
+    }
+
+    private fun broadcastMountedAnimalHeadYawFromVehiclePacket(session: PlayerSession, yaw: Float) {
+        val animalEntityId = session.ridingAnimalEntityId
+        if (animalEntityId < 0) return
+        val world = WorldManager.world(session.worldKey) ?: return
+        val animal = world.animalSnapshot(animalEntityId) ?: return
+        val chunkPos = animal.chunkPos
+        val packet = PlayPackets.entityHeadLookPacket(animalEntityId, yaw)
+        for ((id, other) in sessions) {
+            if (other.worldKey != session.worldKey) continue
+            if (!other.loadedChunks.contains(chunkPos)) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
     }
 
     private fun tryMountPig(session: PlayerSession, animalEntityId: Int): Boolean {
@@ -3149,12 +4141,19 @@ private data class PigBoostState(
         z: Double,
         height: Double
     ): Boolean {
-        val minX = x - PLAYER_HITBOX_HALF_WIDTH
-        val maxX = x + PLAYER_HITBOX_HALF_WIDTH
-        val minY = y
-        val maxY = y + height
-        val minZ = z - PLAYER_HITBOX_HALF_WIDTH
-        val maxZ = z + PLAYER_HITBOX_HALF_WIDTH
+        val playerBox = playerAabbAt(
+            x = x,
+            y = y,
+            z = z,
+            halfWidth = PLAYER_HITBOX_HALF_WIDTH,
+            height = height
+        )
+        val minX = playerBox.minX
+        val maxX = playerBox.maxX
+        val minY = playerBox.minY
+        val maxY = playerBox.maxY
+        val minZ = playerBox.minZ
+        val maxZ = playerBox.maxZ
 
         val startX = floor(minX).toInt()
         val endX = floor(maxX - 1.0e-7).toInt()
@@ -3388,14 +4387,13 @@ private data class PigBoostState(
     private fun canCriticalAttack(attacker: PlayerSession, target: PlayerSession): Boolean {
         return attacker.fallDistance > 0.0 &&
             !attacker.onGround &&
-            !attacker.sprinting &&
             !attacker.swimming &&
             !attacker.dead &&
             !target.dead
     }
 
     private fun canCriticalAttackAgainstPoint(attacker: PlayerSession, targetX: Double, targetY: Double, targetZ: Double): Boolean {
-        if (attacker.dead || attacker.onGround || attacker.sprinting || attacker.swimming) return false
+        if (attacker.dead || attacker.onGround || attacker.swimming) return false
         if (attacker.fallDistance <= 0.0) return false
         val dx = attacker.x - targetX
         val dy = attacker.y - targetY
@@ -3445,16 +4443,20 @@ private data class PigBoostState(
         broadcastAttackSound(attacker, PLAYER_ATTACK_WEAK_SOUND_ID)
     }
 
-    private fun applyVanillaKnockback(attacker: PlayerSession, target: PlayerSession, strength: Double) {
+    private fun applyVanillaKnockback(
+        attacker: PlayerSession,
+        target: PlayerSession,
+        strength: Double,
+        attackDirX: Double,
+        attackDirZ: Double
+    ) {
         if (strength <= 0.0) return
 
         // Match vanilla LivingEntity#knockback: use target's current motion as base.
         val horizontalBaseX = target.velocityX
         val horizontalBaseY = target.velocityY
         val horizontalBaseZ = target.velocityZ
-        val yawRad = Math.toRadians(attacker.yaw.toDouble())
-        val knockDirX = sin(yawRad)
-        val knockDirZ = -cos(yawRad)
+        val (knockDirX, knockDirZ) = resolveAttackKnockbackDirection(attacker, attackDirX, attackDirZ)
         val norm = kotlin.math.sqrt((knockDirX * knockDirX) + (knockDirZ * knockDirZ))
         if (norm <= 1.0e-6) return
 
@@ -3475,7 +4477,26 @@ private data class PigBoostState(
         broadcastEntityVelocity(target, nextVx, nextVy, nextVz)
     }
 
-    private fun applySweepAttack(attacker: PlayerSession, primaryTarget: PlayerSession, damageTypeId: Int) {
+    private fun resolveAttackKnockbackDirection(
+        attacker: PlayerSession,
+        attackDirX: Double,
+        attackDirZ: Double
+    ): Pair<Double, Double> {
+        val dirNormSq = (attackDirX * attackDirX) + (attackDirZ * attackDirZ)
+        if (dirNormSq > 1.0e-12) {
+            return attackDirX to attackDirZ
+        }
+        val yawRad = Math.toRadians(attacker.yaw.toDouble())
+        return sin(yawRad) to -cos(yawRad)
+    }
+
+    private fun applySweepAttack(
+        attacker: PlayerSession,
+        primaryTarget: PlayerSession,
+        damageTypeId: Int,
+        attackOriginX: Double,
+        attackOriginZ: Double
+    ) {
         val sweepDamage = VANILLA_SWEEP_BASE_DAMAGE
         if (sweepDamage <= 0f) return
         for (other in sessions.values) {
@@ -3503,44 +4524,14 @@ private data class PigBoostState(
                     )
                 )
             )
-            applyVanillaKnockback(attacker, other, VANILLA_SWEEP_KNOCKBACK)
+            applyVanillaKnockback(
+                attacker = attacker,
+                target = other,
+                strength = VANILLA_SWEEP_KNOCKBACK,
+                attackDirX = attackOriginX - other.x,
+                attackDirZ = attackOriginZ - other.z
+            )
         }
-    }
-
-    private fun applyAnimalKnockback(
-        attacker: PlayerSession,
-        target: AnimalSnapshot,
-        world: org.macaroon3145.world.World,
-        strength: Double
-    ) {
-        if (strength <= 0.0) return
-        val yawRad = Math.toRadians(attacker.yaw.toDouble())
-        val knockDirX = sin(yawRad)
-        val knockDirZ = -cos(yawRad)
-        val norm = sqrt((knockDirX * knockDirX) + (knockDirZ * knockDirZ))
-        if (norm <= 1.0e-6) return
-
-        val normalizedX = knockDirX / norm
-        val normalizedZ = knockDirZ / norm
-        // Match vanilla LivingEntity#knockback:
-        // newVel = oldVel/2 - normalizedDir*strength, and Y boost only when on ground.
-        val nextVx = (target.vx * 0.5) - (normalizedX * strength)
-        val nextVz = (target.vz * 0.5) - (normalizedZ * strength)
-        val groundedForKnockback = target.onGround || kotlin.math.abs(target.vy) <= 1.0e-6
-        val nextVy = if (groundedForKnockback) {
-            // AnimalSystem integrates gravity before movement; compensate one tick so effective lift matches vanilla.
-            minOf(0.4 + KNOCKBACK_Y_PRE_GRAVITY_COMPENSATION, (target.vy * 0.5) + strength + KNOCKBACK_Y_PRE_GRAVITY_COMPENSATION)
-        } else {
-            target.vy
-        }
-        if (!world.setAnimalVelocity(target.entityId, nextVx, nextVy, nextVz)) return
-        broadcastAnimalVelocity(attacker.worldKey, target.entityId, nextVx, nextVy, nextVz)
-        broadcastAttackKnockbackAt(
-            worldKey = attacker.worldKey,
-            x = target.x,
-            y = target.y + target.hitboxHeight * 0.5,
-            z = target.z
-        )
     }
 
     private fun broadcastAttackKnockbackAt(worldKey: String, x: Double, y: Double, z: Double) {
@@ -4117,6 +5108,21 @@ private data class PigBoostState(
         val removed = sessions.remove(channelId) ?: return
         contexts.remove(channelId)
         channelFlushStates.remove(channelId)
+        enderPearlCooldownEndNanosByPlayerEntityId.remove(removed.entityId)
+        lastPushingChunkByPlayerEntityId.remove(removed.entityId)
+        markWorldChunkCachesDirty(removed.worldKey)
+        val removedStamp = activeSimulationStampByPlayerEntityId.remove(removed.entityId)
+        val removedFootprint = activeSimulationChunksByPlayerEntityId.remove(removed.entityId)
+        if (removedStamp != null && removedFootprint != null) {
+            removeSimulationFootprintRefs(removedStamp.worldKey, removedFootprint)
+            val refs = activeSimulationRefCountByWorld[removedStamp.worldKey]
+            if (refs == null || refs.isEmpty()) {
+                activeSimulationChunksCacheByWorld.remove(removedStamp.worldKey)
+            } else {
+                activeSimulationChunksCacheByWorld[removedStamp.worldKey] = HashSet(refs.keys)
+            }
+        }
+        updateRetainedBaseWorldChunksForWorld(removed.worldKey)
 
         val removeEntitiesPacket = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
         val removeInfoPacket = PlayPackets.playerInfoRemovePacket(listOf(removed.profile.uuid))
@@ -4165,6 +5171,13 @@ private data class PigBoostState(
         channelFlushStates.clear()
         contexts.clear()
         sessions.clear()
+        activeSimulationChunksCacheByWorld.clear()
+        activeSimulationRefCountByWorld.clear()
+        activeSimulationStampByPlayerEntityId.clear()
+        activeSimulationChunksByPlayerEntityId.clear()
+        activeSimulationLastMaxDistanceChunks = -1
+        retainedBaseChunksCacheByWorld.clear()
+        retainedBaseChunksDirtyWorlds.clear()
         saddledAnimalEntityIds.clear()
         animalRiderEntityIdByAnimalEntityId.clear()
         animalEntityIdByRiderEntityId.clear()
@@ -4794,8 +5807,8 @@ private data class PigBoostState(
                     session.centerChunkZ
                 )
             } else {
-                val mspt = world.chunkMspt(session.centerChunkX, session.centerChunkZ)
-                val tps = world.chunkTps(session.centerChunkX, session.centerChunkZ)
+                val mspt = world.chunkEwmaMspt(session.centerChunkX, session.centerChunkZ)
+                val tps = world.chunkEwmaTps(session.centerChunkX, session.centerChunkZ)
                 String.format(
                     Locale.ROOT,
                     "Chunk (%d, %d) MSPT: %.3f ms | TPS: %.2f",
@@ -7282,27 +8295,50 @@ private data class PigBoostState(
             kind = AnimalKind.PIG
         ) ?: return false
         if (!isChunkLoadedForSession(session, floor(spawnPos.first).toInt(), floor(spawnPos.third).toInt())) return false
-        val entityId = allocateEntityId()
-        if (!world.spawnAnimal(
-                entityId = entityId,
-                kind = AnimalKind.PIG,
-                x = spawnPos.first,
-                y = spawnPos.second,
-                z = spawnPos.third,
-                yaw = session.yaw
-            )
-        ) {
-            return false
+        val spawnedSnapshots = ArrayList<AnimalSnapshot>(100)
+        repeat(100) {
+            val entityId = allocateEntityId()
+            if (!world.spawnAnimal(
+                    entityId = entityId,
+                    kind = AnimalKind.PIG,
+                    x = spawnPos.first,
+                    y = spawnPos.second,
+                    z = spawnPos.third,
+                    yaw = session.yaw
+                )
+            ) {
+                return@repeat
+            }
+            val snapshot = world.animalSnapshot(entityId) ?: return@repeat
+            spawnedSnapshots.add(snapshot)
         }
-        val snapshot = world.animalSnapshot(entityId) ?: return false
+        if (spawnedSnapshots.isEmpty()) return false
         for (other in sessions.values) {
             if (other.worldKey != session.worldKey) continue
-            if (!other.loadedChunks.contains(snapshot.chunkPos)) continue
-            if (!other.visibleAnimalEntityIds.add(snapshot.entityId)) continue
             val ctx = contexts[other.channelId] ?: continue
             if (!ctx.channel().isActive) continue
-            writeAnimalSpawnPackets(other, ctx, snapshot)
-            ctx.flush()
+            var wrote = false
+            for (snapshot in spawnedSnapshots) {
+                if (!other.loadedChunks.contains(snapshot.chunkPos)) continue
+                if (!other.visibleAnimalEntityIds.add(snapshot.entityId)) continue
+                writeAnimalSpawnPackets(other, ctx, snapshot)
+                ctx.write(
+                    PlayPackets.soundPacketByKey(
+                        soundKey = snapshot.kind.ambientSoundKey,
+                        soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+                        x = snapshot.x,
+                        y = snapshot.y + snapshot.hitboxHeight * 0.5,
+                        z = snapshot.z,
+                        volume = 1.0f,
+                        pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
+                        seed = ThreadLocalRandom.current().nextLong()
+                    )
+                )
+                wrote = true
+            }
+            if (wrote) {
+                ctx.flush()
+            }
         }
         if (session.gameMode != GAME_MODE_CREATIVE) {
             consumePlacedItem(session, hand)
@@ -7699,12 +8735,61 @@ private data class PigBoostState(
             eggItemId -> ThrownItemKind.EGG
             blueEggItemId -> ThrownItemKind.BLUE_EGG
             brownEggItemId -> ThrownItemKind.BROWN_EGG
+            enderPearlItemId -> ThrownItemKind.ENDER_PEARL
             else -> return
         }
+        var enderPearlCooldownEndNanos = 0L
+        if (kind == ThrownItemKind.ENDER_PEARL) {
+            enderPearlCooldownEndNanos = tryReserveEnderPearlCooldown(session) ?: return
+        }
         val spawned = spawnThrownItemFromPlayer(session, world, kind)
-        if (!spawned) return
+        if (!spawned) {
+            if (kind == ThrownItemKind.ENDER_PEARL && enderPearlCooldownEndNanos > 0L) {
+                enderPearlCooldownEndNanosByPlayerEntityId.remove(session.entityId, enderPearlCooldownEndNanos)
+            }
+            return
+        }
         if (session.gameMode != GAME_MODE_CREATIVE) {
             consumePlacedItem(session, hand)
+        }
+    }
+
+    private fun tryReserveEnderPearlCooldown(session: PlayerSession): Long? {
+        val now = System.nanoTime()
+        var reservedEndAtNanos = 0L
+        var blocked = false
+        enderPearlCooldownEndNanosByPlayerEntityId.compute(session.entityId) { _, previous ->
+            if (previous != null && now < previous) {
+                blocked = true
+                return@compute previous
+            }
+            reservedEndAtNanos = now + ENDER_PEARL_COOLDOWN_NANOS
+            reservedEndAtNanos
+        }
+        if (blocked) {
+            return null
+        }
+        sendEnderPearlCooldownUpdate(session, ENDER_PEARL_COOLDOWN_TICKS)
+        return reservedEndAtNanos
+    }
+
+    private fun sendEnderPearlCooldownUpdate(session: PlayerSession, overrideTicks: Int? = null) {
+        val cooldownTicks = overrideTicks ?: run {
+            val endAtNanos = enderPearlCooldownEndNanosByPlayerEntityId[session.entityId] ?: return@run 0
+            val remainingNanos = (endAtNanos - System.nanoTime()).coerceAtLeast(0L)
+            val tickNanos = 1_000_000_000L / MINECRAFT_TICKS_PER_SECOND.toLong()
+            ceil(remainingNanos.toDouble() / tickNanos.toDouble()).toInt().coerceAtLeast(0)
+        }
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        val packet = PlayPackets.cooldownPacket(
+            cooldownGroup = ENDER_PEARL_COOLDOWN_GROUP,
+            cooldownTicks = cooldownTicks
+        )
+        ctx.executor().execute {
+            if (ctx.channel().isActive) {
+                ctx.writeAndFlush(packet)
+            }
         }
     }
 
@@ -7882,15 +8967,16 @@ private data class PigBoostState(
         if (!world.spawnThrownItem(entityId, session.entityId, kind, spawnX, spawnY, spawnZ, vx, vy, vz)) {
             return false
         }
-        broadcastThrownItemLaunchSound(session, kind)
-        val snapshot = world.thrownItemSnapshot(entityId) ?: return true
-        val worldSessions = sessions.values.filter { it.worldKey == session.worldKey }
-        for (other in worldSessions) {
-            if (!other.loadedChunks.contains(snapshot.chunkPos)) continue
-            if (!other.visibleThrownItemEntityIds.add(snapshot.entityId)) continue
-            val ctx = contexts[other.channelId] ?: continue
-            if (!ctx.channel().isActive) continue
-            writeThrownItemSpawnPackets(other, ctx, snapshot)
+        // Keep shooter-side client prediction aligned by sending authoritative spawn immediately.
+        val snapshot = world.thrownItemSnapshot(entityId)
+        if (snapshot != null && session.loadedChunks.contains(snapshot.chunkPos)) {
+            if (session.visibleThrownItemEntityIds.add(snapshot.entityId)) {
+                val selfCtx = contexts[session.channelId]
+                if (selfCtx != null && selfCtx.channel().isActive) {
+                    writeThrownItemSpawnPackets(session, selfCtx, snapshot)
+                    selfCtx.flush()
+                }
+            }
         }
         return true
     }
@@ -7963,28 +9049,22 @@ private data class PigBoostState(
         return null
     }
 
-    private fun broadcastThrownItemLaunchSound(session: PlayerSession, kind: ThrownItemKind) {
+    private fun thrownItemLaunchSoundPacket(kind: ThrownItemKind, x: Double, y: Double, z: Double): ByteArray {
         val soundKey = when (kind) {
             ThrownItemKind.SNOWBALL -> "minecraft:entity.snowball.throw"
             ThrownItemKind.EGG, ThrownItemKind.BLUE_EGG, ThrownItemKind.BROWN_EGG -> "minecraft:entity.egg.throw"
+            ThrownItemKind.ENDER_PEARL -> "minecraft:entity.ender_pearl.throw"
         }
-        val packet = PlayPackets.soundPacketByKey(
+        return PlayPackets.soundPacketByKey(
             soundKey = soundKey,
             soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
-            x = session.x,
-            y = session.y,
-            z = session.z,
+            x = x,
+            y = y,
+            z = z,
             volume = 0.5f,
             pitch = 0.4f / (ThreadLocalRandom.current().nextFloat() * 0.4f + 0.8f),
             seed = ThreadLocalRandom.current().nextLong()
         )
-        for ((id, other) in sessions) {
-            if (other.worldKey != session.worldKey) continue
-            val ctx = contexts[id] ?: continue
-            if (!ctx.channel().isActive) continue
-            ctx.write(packet)
-            ctx.flush()
-        }
     }
 
     private fun broadcastFoodUseProgressSound(session: PlayerSession, soundKey: String) {
@@ -8176,11 +9256,7 @@ private data class PigBoostState(
     }
 
     private fun pickupDistanceSquared(session: PlayerSession, snapshot: DroppedItemSnapshot): Double {
-        val playerCenterY = when {
-            session.swimming -> session.y + 0.3
-            session.sneaking -> session.y + 0.75
-            else -> session.y + 0.9
-        }
+        val playerCenterY = session.y + (playerPoseHeight(session) * 0.5)
         val itemCenterY = snapshot.y + (DROPPED_ITEM_HEIGHT * 0.5)
         val dx = session.x - snapshot.x
         val dy = playerCenterY - itemCenterY
@@ -8188,41 +9264,15 @@ private data class PigBoostState(
         return (dx * dx) + (dy * dy) + (dz * dz)
     }
 
-    private fun isWithinPickupBroadcastRange(session: PlayerSession, pickup: DroppedItemPickupResult): Boolean {
-        val dx = session.x - pickup.x
-        val dy = session.y - pickup.y
-        val dz = session.z - pickup.z
-        return (dx * dx) + (dy * dy) + (dz * dz) <= DROPPED_ITEM_PICKUP_BROADCAST_DISTANCE_SQ
-    }
-
     private fun canPlayerPickDroppedItem(session: PlayerSession, snapshot: DroppedItemSnapshot): Boolean {
-        val playerHeight = when {
-            session.swimming -> 0.6
-            session.sneaking -> 1.5
-            else -> 1.8
-        }
-
-        val playerMinX = session.x - PLAYER_HITBOX_HALF_WIDTH - DROPPED_ITEM_PICKUP_EXPAND_HORIZONTAL
-        val playerMaxX = session.x + PLAYER_HITBOX_HALF_WIDTH + DROPPED_ITEM_PICKUP_EXPAND_HORIZONTAL
-        val playerMinY = session.y - DROPPED_ITEM_PICKUP_EXPAND_DOWN
-        val playerMaxY = session.y + playerHeight + DROPPED_ITEM_PICKUP_EXPAND_UP
-        val playerMinZ = session.z - PLAYER_HITBOX_HALF_WIDTH - DROPPED_ITEM_PICKUP_EXPAND_HORIZONTAL
-        val playerMaxZ = session.z + PLAYER_HITBOX_HALF_WIDTH + DROPPED_ITEM_PICKUP_EXPAND_HORIZONTAL
-
-        val itemMinX = snapshot.x - DROPPED_ITEM_HALF_WIDTH
-        val itemMaxX = snapshot.x + DROPPED_ITEM_HALF_WIDTH
-        val itemMinY = snapshot.y
-        val itemMaxY = snapshot.y + DROPPED_ITEM_HEIGHT
-        val itemMinZ = snapshot.z - DROPPED_ITEM_HALF_WIDTH
-        val itemMaxZ = snapshot.z + DROPPED_ITEM_HALF_WIDTH
-
-        // Vanilla AABB intersection is strict: touching only at the border does not count.
-        return playerMaxX > itemMinX &&
-            playerMinX < itemMaxX &&
-            playerMaxY > itemMinY &&
-            playerMinY < itemMaxY &&
-            playerMaxZ > itemMinZ &&
-            playerMinZ < itemMaxZ
+        val playerBox = playerAabb(
+            session = session,
+            expandHorizontal = DROPPED_ITEM_PICKUP_EXPAND_HORIZONTAL,
+            expandDown = DROPPED_ITEM_PICKUP_EXPAND_DOWN,
+            expandUp = DROPPED_ITEM_PICKUP_EXPAND_UP
+        )
+        val itemBox = droppedItemAabb(snapshot)
+        return aabbOverlap(playerBox, itemBox)
     }
 
     private fun canAbsorbDroppedItem(session: PlayerSession, itemId: Int, itemCount: Int): Boolean {
@@ -9214,6 +10264,7 @@ private data class PigBoostState(
         val entityTypeId = when (snapshot.kind) {
             ThrownItemKind.SNOWBALL -> PlayPackets.snowballEntityTypeId()
             ThrownItemKind.EGG, ThrownItemKind.BLUE_EGG, ThrownItemKind.BROWN_EGG -> PlayPackets.eggEntityTypeId()
+            ThrownItemKind.ENDER_PEARL -> PlayPackets.enderPearlEntityTypeId()
         }
         enqueueDroppedItemPacket(
             outboundByContext,
@@ -9392,6 +10443,7 @@ private data class PigBoostState(
         val entityTypeId = when (snapshot.kind) {
             ThrownItemKind.SNOWBALL -> PlayPackets.snowballEntityTypeId()
             ThrownItemKind.EGG, ThrownItemKind.BLUE_EGG, ThrownItemKind.BROWN_EGG -> PlayPackets.eggEntityTypeId()
+            ThrownItemKind.ENDER_PEARL -> PlayPackets.enderPearlEntityTypeId()
         }
         ctx.write(
             PlayPackets.addEntityPacket(
@@ -9444,6 +10496,7 @@ private data class PigBoostState(
             ThrownItemKind.EGG -> eggItemId
             ThrownItemKind.BLUE_EGG -> blueEggItemId
             ThrownItemKind.BROWN_EGG -> brownEggItemId
+            ThrownItemKind.ENDER_PEARL -> enderPearlItemId
         }
     }
 
@@ -10133,7 +11186,7 @@ private data class PigBoostState(
         if (y !in -64..319) return
         val world = WorldManager.world(session.worldKey) ?: return
         val oldStateId = world.blockStateAt(x, y, z)
-        maybeDropAndClearFurnaceInventory(world, x, y, z, oldStateId, stateId)
+        val furnaceInventoryDrops = maybeDropAndClearFurnaceInventory(world, x, y, z, oldStateId, stateId)
         world.setBlockState(x, y, z, stateId)
         if (stateId != 0 && stateId != oldStateId) {
             world.requestDroppedItemUnstuckAtBlock(x, y, z)
@@ -10147,6 +11200,10 @@ private data class PigBoostState(
             )
         } else {
             world.setBlockEntity(x, y, z, null)
+        }
+        if (furnaceInventoryDrops.isNotEmpty()) {
+            // Spawn after block state change so dropped items don't get pushed upward out of the still-solid furnace.
+            spawnBrokenBlockDropsInWorld(world, x, y, z, furnaceInventoryDrops)
         }
         val chunk = ChunkPos(x shr 4, z shr 4)
         val packet = PlayPackets.blockChangePacket(x, y, z, stateId)
@@ -10197,13 +11254,13 @@ private data class PigBoostState(
         z: Int,
         oldStateId: Int,
         newStateId: Int
-    ) {
-        if (oldStateId == newStateId) return
-        if (!isFurnaceState(oldStateId)) return
-        if (isFurnaceState(newStateId)) return
+    ): List<org.macaroon3145.world.VanillaDrop> {
+        if (oldStateId == newStateId) return emptyList()
+        if (!isFurnaceState(oldStateId)) return emptyList()
+        if (isFurnaceState(newStateId)) return emptyList()
 
         val key = FurnaceKey(world.key, x, y, z)
-        val removed = furnaceStates.remove(key) ?: return
+        val removed = furnaceStates.remove(key) ?: return emptyList()
         activeFurnaceKeys.remove(key)
         activeFurnaceKeysByWorld[key.worldKey]?.let { set ->
             set.remove(key)
@@ -10224,9 +11281,6 @@ private data class PigBoostState(
                 }
             }
         }
-        if (drops.isNotEmpty()) {
-            spawnBrokenBlockDropsInWorld(world, x, y, z, drops)
-        }
 
         for (viewer in sessions.values) {
             if (viewer.worldKey != world.key) continue
@@ -10234,6 +11288,7 @@ private data class PigBoostState(
             if (viewer.openFurnaceX != x || viewer.openFurnaceY != y || viewer.openFurnaceZ != z) continue
             closeFurnace(viewer)
         }
+        return drops
     }
 
     private fun triggerFallingBlocksNear(session: PlayerSession, world: org.macaroon3145.world.World, x: Int, y: Int, z: Int) {
@@ -10319,11 +11374,15 @@ private data class PigBoostState(
             if (!other.loadedChunks.contains(chunk)) continue
             val ctx = contexts[id] ?: continue
             if (!ctx.channel().isActive) continue
-            ctx.write(clearPacket)
-            if (other.visibleFallingBlockEntityIds.add(entityId)) {
-                writeFallingBlockSpawnPackets(other, ctx, snapshot)
+            ctx.executor().execute {
+                if (!ctx.channel().isActive) return@execute
+                if (!other.loadedChunks.contains(chunk)) return@execute
+                ctx.write(clearPacket)
+                if (other.visibleFallingBlockEntityIds.add(entityId)) {
+                    writeFallingBlockSpawnPackets(other, ctx, snapshot)
+                }
+                ctx.flush()
             }
-            ctx.flush()
         }
         return true
     }
@@ -11502,29 +12561,16 @@ private data class PigBoostState(
     }
 
     private fun isPlacementBlockedByPlayer(session: PlayerSession, blockX: Int, blockY: Int, blockZ: Int): Boolean {
-        val playerHeight = when {
-            session.swimming -> 0.6
-            session.sneaking -> 1.5
-            else -> 1.8
-        }
-
-        val playerMinX = session.x - PLAYER_HITBOX_HALF_WIDTH
-        val playerMaxX = session.x + PLAYER_HITBOX_HALF_WIDTH
-        val playerMinY = session.y
-        val playerMaxY = session.y + playerHeight
-        val playerMinZ = session.z - PLAYER_HITBOX_HALF_WIDTH
-        val playerMaxZ = session.z + PLAYER_HITBOX_HALF_WIDTH
-
-        val blockMinX = blockX.toDouble()
-        val blockMaxX = blockMinX + 1.0
-        val blockMinY = blockY.toDouble()
-        val blockMaxY = blockMinY + 1.0
-        val blockMinZ = blockZ.toDouble()
-        val blockMaxZ = blockMinZ + 1.0
-
-        return playerMaxX > blockMinX && playerMinX < blockMaxX &&
-            playerMaxY > blockMinY && playerMinY < blockMaxY &&
-            playerMaxZ > blockMinZ && playerMinZ < blockMaxZ
+        val playerAabb = playerAabb(session)
+        val blockAabb = Aabb(
+            minX = blockX.toDouble(),
+            minY = blockY.toDouble(),
+            minZ = blockZ.toDouble(),
+            maxX = blockX + 1.0,
+            maxY = blockY + 1.0,
+            maxZ = blockZ + 1.0
+        )
+        return aabbOverlap(playerAabb, blockAabb)
     }
 
     private fun commandBlockNbtPayload(
@@ -11766,7 +12812,6 @@ private data class PigBoostState(
     private const val DROPPED_ITEM_HEIGHT = 0.25
     private const val DROPPED_ITEM_PICKUP_DELAY_EPSILON = 1.0e-9
     private const val DROPPED_ITEM_PICKUP_DISTANCE_EPSILON = 1.0e-9
-    private const val DROPPED_ITEM_PICKUP_BROADCAST_DISTANCE_SQ = 32.0 * 32.0
     private const val PLAYER_RELATIVE_MOVE_SCALE = 4096.0
     private const val DROPPED_ITEM_RELATIVE_MOVE_SCALE = 4096.0
     private const val MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC = 20.0
@@ -12063,9 +13108,17 @@ private data class PigBoostState(
     private const val PLAYER_SWEEP_SPEED_THRESHOLD = 0.25
     private const val ANIMAL_BASE_ATTACK_KNOCKBACK = 0.4
     private const val ANIMAL_SPRINT_ATTACK_KNOCKBACK = 0.5
+    private const val ENDER_PEARL_TELEPORT_DAMAGE = 5.0f
+    private const val ENDER_PEARL_COOLDOWN_TICKS = 20
+    private const val ENDER_PEARL_COOLDOWN_NANOS = ENDER_PEARL_COOLDOWN_TICKS * 50_000_000L
+    private const val ENDER_PEARL_COOLDOWN_GROUP = "minecraft:ender_pearl"
     private const val VANILLA_ENTITY_PUSH_STRENGTH_PER_TICK = 0.05000000074505806
     private const val VANILLA_ENTITY_PUSH_MIN_DISTANCE = 0.009999999776482582
     private const val ENTITY_PUSH_MAX_PLAYER_VELOCITY = 0.45
+    private const val PUSHING_CONTACT_STICKY_TICKS = 2
+    private const val PUSHING_WAKE_MIN_HORIZONTAL_MOVEMENT_SQ = 1.0e-6
+    private const val PUSHING_SPATIAL_CELL_SIZE = 1.0
+    private const val PUSHING_SPATIAL_REACH_MARGIN = 0.1
     private const val PLAYER_SMALL_FALL_SOUND_ID_FALLBACK = 1257
     private const val PLAYER_BIG_FALL_SOUND_ID_FALLBACK = 1247
     private const val PLAYER_HURT_SOUND_ID_FALLBACK = 1251

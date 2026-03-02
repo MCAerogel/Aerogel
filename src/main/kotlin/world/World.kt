@@ -409,9 +409,10 @@ class World(
     fun recordChunkProcessingNanos(
         frame: ChunkProcessingProfiler.Frame,
         chunkPos: ChunkPos,
-        elapsedNanos: Long
+        elapsedNanos: Long,
+        category: String = "other"
     ) {
-        frame.record(chunkPos, elapsedNanos)
+        frame.record(chunkPos, elapsedNanos, category)
     }
 
     fun finishChunkProcessingFrame(
@@ -450,6 +451,10 @@ class World(
 
     fun topChunkStatsByMspt(limit: Int, minMspt: Double = 0.0): List<ChunkProcessingProfiler.ChunkStatSnapshot> {
         return chunkProcessingProfiler.topChunksByMspt(limit, minMspt)
+    }
+
+    fun topChunkStatsByEwmaMspt(limit: Int, minMspt: Double = 0.0): List<ChunkProcessingProfiler.ChunkStatSnapshot> {
+        return chunkProcessingProfiler.topChunksByEwmaMspt(limit, minMspt)
     }
 
     fun requestDroppedItemUnstuckAtBlock(x: Int, y: Int, z: Int) {
@@ -682,19 +687,66 @@ class World(
     }
 
     fun damageAnimal(entityId: Int, amount: Float, cause: AnimalDamageCause): AnimalDamageResult? {
-        return animalSystem.damage(entityId, amount, cause)
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.damage(entityId, amount, cause) },
+            enqueuedFromOtherChunkActor = { null }
+        )
+    }
+
+    fun damageAnimalWithKnockback(
+        entityId: Int,
+        amount: Float,
+        cause: AnimalDamageCause,
+        attackerX: Double,
+        attackerZ: Double,
+        strength: Double,
+        preGravityYCompensation: Double = 0.0
+    ): AnimalDamageWithKnockbackResult? {
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = {
+                animalSystem.damageWithKnockback(
+                    entityId = entityId,
+                    amount = amount,
+                    cause = cause,
+                    attackerX = attackerX,
+                    attackerZ = attackerZ,
+                    strength = strength,
+                    preGravityYCompensation = preGravityYCompensation
+                )
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun removeAnimal(entityId: Int, died: Boolean = false): AnimalRemovedEvent? {
-        return animalSystem.remove(entityId, died)
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.remove(entityId, died) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setAnimalVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): Boolean {
-        return animalSystem.setVelocity(entityId, vx, vy, vz)
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return false
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.setVelocity(entityId, vx, vy, vz) },
+            enqueuedFromOtherChunkActor = { true }
+        )
     }
 
     fun addAnimalHorizontalImpulse(entityId: Int, impulseX: Double, impulseZ: Double): Boolean {
-        return animalSystem.addHorizontalImpulse(entityId, impulseX, impulseZ)
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return false
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.addHorizontalImpulse(entityId, impulseX, impulseZ) },
+            enqueuedFromOtherChunkActor = { true }
+        )
     }
 
     fun tickAnimals(
@@ -708,22 +760,24 @@ class World(
         val readyUpdated = ArrayList<AnimalSnapshot>()
         val readyRemoved = ArrayList<AnimalRemovedEvent>()
         val readyDamaged = ArrayList<AnimalDamagedEvent>()
+        val readyAmbient = ArrayList<AnimalAmbientEvent>()
         while (true) {
             val ready = pendingAnimalTickEvents.poll() ?: break
             if (ready.updated.isNotEmpty()) readyUpdated.addAll(ready.updated)
             if (ready.removed.isNotEmpty()) readyRemoved.addAll(ready.removed)
             if (ready.damaged.isNotEmpty()) readyDamaged.addAll(ready.damaged)
+            if (ready.ambient.isNotEmpty()) readyAmbient.addAll(ready.ambient)
         }
         val timeScale = ServerConfig.timeScale
         if (timeScale <= 0.0 || !timeScale.isFinite()) {
             animalLastTickNanos.clear()
             onDispatchComplete?.invoke()
-            return AnimalTickEvents(spawned, readyUpdated, readyRemoved, readyDamaged)
+            return AnimalTickEvents(spawned, readyUpdated, readyRemoved, readyDamaged, readyAmbient)
         }
         if (!animalSystem.hasAnimals()) {
             animalLastTickNanos.clear()
             onDispatchComplete?.invoke()
-            return AnimalTickEvents(spawned, readyUpdated, readyRemoved, readyDamaged)
+            return AnimalTickEvents(spawned, readyUpdated, readyRemoved, readyDamaged, readyAmbient)
         }
 
         val byChunk = LinkedHashMap<ChunkPos, MutableList<BlockPos>>()
@@ -741,7 +795,7 @@ class World(
         if (byChunk.isEmpty()) {
             animalLastTickNanos.clear()
             onDispatchComplete?.invoke()
-            return AnimalTickEvents(spawned, readyUpdated, readyRemoved, readyDamaged)
+            return AnimalTickEvents(spawned, readyUpdated, readyRemoved, readyDamaged, readyAmbient)
         }
         pruneIdleChunkTimingState(animalLastTickNanos, byChunk.keys)
 
@@ -759,21 +813,22 @@ class World(
                         lastTickMap = animalLastTickNanos
                     )
                     if (chunkDelta <= 0.0) {
-                        return@submit AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+                        return@submit AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
                     }
                     val events = animalSystem.tickChunk(
                         chunkPos = chunkPos,
                         deltaSeconds = chunkDelta,
                         chunkTimeRecorder = chunkTimeRecorder
                     )
-                    if (events.updated.isNotEmpty() || events.removed.isNotEmpty() || events.damaged.isNotEmpty()) {
+                    if (events.updated.isNotEmpty() || events.removed.isNotEmpty() || events.damaged.isNotEmpty() || events.ambient.isNotEmpty()) {
                         if (onChunkEvents != null) {
                             onChunkEvents(
                                 AnimalTickEvents(
                                     spawned = emptyList(),
                                     updated = events.updated,
                                     removed = events.removed,
-                                    damaged = events.damaged
+                                    damaged = events.damaged,
+                                    ambient = events.ambient
                                 )
                             )
                         } else {
@@ -782,7 +837,8 @@ class World(
                                     spawned = emptyList(),
                                     updated = events.updated,
                                     removed = events.removed,
-                                    damaged = events.damaged
+                                    damaged = events.damaged,
+                                    ambient = events.ambient
                                 )
                             )
                         }
@@ -803,7 +859,8 @@ class World(
             spawned = spawned,
             updated = readyUpdated,
             removed = readyRemoved,
-            damaged = readyDamaged
+            damaged = readyDamaged,
+            ambient = readyAmbient
         )
     }
 
@@ -872,13 +929,16 @@ class World(
                         return@submit emptyList<FluidBlockChange>()
                     }
                     val localChanged = ArrayList<FluidBlockChange>()
-                    repeat(steps) {
-                        if (currentPositions.isEmpty()) return@repeat
+                    for (stepIndex in 0 until steps) {
+                        if (currentPositions.isEmpty()) break
                         val localPlanned = planFluidChunkChanges(chunkPos, currentPositions, chunkTimeRecorder)
                         if (localPlanned.isNotEmpty()) {
                             applyPlannedFluidChanges(localPlanned, localChanged)
                         }
-                        currentPositions = drainPendingFluidUpdatesForChunk(chunkPos)
+                        if (stepIndex < steps - 1) {
+                            // Keep freshly enqueued updates in pending set for the next server tick.
+                            currentPositions = drainPendingFluidUpdatesForChunk(chunkPos)
+                        }
                     }
                     if (localChanged.isNotEmpty()) {
                         if (onChunkChanged != null) {
@@ -990,6 +1050,25 @@ class World(
         task: () -> T
     ): CompletableFuture<T> {
         return chunkActorScheduler.submit(chunkPos, task)
+    }
+
+    private fun currentChunkActorThreadChunkPos(): ChunkPos? = chunkActorScheduler.currentChunkPos()
+
+    private fun <T> runOnAnimalChunk(
+        chunkPos: ChunkPos,
+        task: () -> T,
+        enqueuedFromOtherChunkActor: () -> T
+    ): T {
+        val currentActorChunk = currentChunkActorThreadChunkPos()
+        if (currentActorChunk == chunkPos) {
+            return task()
+        }
+        if (currentActorChunk != null) {
+            // Never block one chunk actor on another chunk actor.
+            chunkActorScheduler.submit(chunkPos, task)
+            return enqueuedFromOtherChunkActor()
+        }
+        return chunkActorScheduler.submit(chunkPos, task).join()
     }
 
     fun resetFluidTickAccumulator() {

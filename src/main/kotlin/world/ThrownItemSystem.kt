@@ -1,5 +1,9 @@
 package org.macaroon3145.world
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.macaroon3145.network.codec.BlockStateRegistry
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -7,6 +11,8 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sqrt
 
@@ -14,7 +20,8 @@ enum class ThrownItemKind {
     SNOWBALL,
     EGG,
     BLUE_EGG,
-    BROWN_EGG
+    BROWN_EGG,
+    ENDER_PEARL
 }
 
 data class ThrownItemSnapshot(
@@ -36,11 +43,16 @@ data class ThrownItemSnapshot(
 
 data class ThrownItemRemovedEvent(
     val entityId: Int,
+    val ownerEntityId: Int,
+    val kind: ThrownItemKind,
     val chunkPos: ChunkPos,
     val hit: Boolean,
     val x: Double,
     val y: Double,
-    val z: Double
+    val z: Double,
+    val hitAxis: Int? = null,
+    val hitDirection: Int? = null,
+    val hitBoundary: Double? = null
 )
 
 data class ThrownItemTickEvents(
@@ -54,6 +66,29 @@ data class ThrownItemTickEvents(
 class ThrownItemSystem(
     private val blockStateAt: (Int, Int, Int) -> Int
 ) {
+    private data class CollisionHit(
+        val t: Double,
+        val axis: Int?,
+        val boundary: Double?,
+        val direction: Int?
+    )
+
+    private data class SegmentAabbHit(
+        val t: Double,
+        val axis: Int?,
+        val boundary: Double?,
+        val direction: Int?
+    )
+
+    private data class CollisionBox(
+        val minX: Double,
+        val minY: Double,
+        val minZ: Double,
+        val maxX: Double,
+        val maxY: Double,
+        val maxZ: Double
+    )
+
     private data class MutableThrownItem(
         val entityId: Int,
         val ownerEntityId: Int,
@@ -96,7 +131,7 @@ class ThrownItemSystem(
     private val snapshots = ConcurrentHashMap<Int, ThrownItemSnapshot>()
     private val chunkIndex = ConcurrentHashMap<ChunkPos, MutableSet<Int>>()
     private val pendingSpawned = ConcurrentLinkedQueue<Int>()
-    private val collidableStateCache = ConcurrentHashMap<Int, Boolean>()
+    private val collisionBoxesByState = ConcurrentHashMap<Int, Array<CollisionBox>>()
 
     fun spawn(
         entityId: Int,
@@ -138,18 +173,32 @@ class ThrownItemSystem(
         return true
     }
 
-    fun remove(entityId: Int, hit: Boolean, x: Double? = null, y: Double? = null, z: Double? = null): ThrownItemRemovedEvent? {
+    fun remove(
+        entityId: Int,
+        hit: Boolean,
+        x: Double? = null,
+        y: Double? = null,
+        z: Double? = null,
+        hitAxis: Int? = null,
+        hitDirection: Int? = null,
+        hitBoundary: Double? = null
+    ): ThrownItemRemovedEvent? {
         val entity = entities.remove(entityId) ?: return null
         val oldChunk = ChunkPos(entity.chunkX, entity.chunkZ)
         snapshots.remove(entityId)
         removeFromChunkIndex(oldChunk, entityId)
         return ThrownItemRemovedEvent(
             entityId = entityId,
+            ownerEntityId = entity.ownerEntityId,
+            kind = entity.kind,
             chunkPos = oldChunk,
             hit = hit,
             x = x ?: entity.x,
             y = y ?: entity.y,
-            z = z ?: entity.z
+            z = z ?: entity.z,
+            hitAxis = hitAxis,
+            hitDirection = hitDirection,
+            hitBoundary = hitBoundary
         )
     }
 
@@ -195,6 +244,7 @@ class ThrownItemSystem(
         val spawned = ArrayList<ThrownItemSnapshot>()
         val updated = ArrayList<ThrownItemSnapshot>()
         val removed = ArrayList<ThrownItemRemovedEvent>()
+        val chunkDeltaSecondsByChunk = HashMap<ChunkPos, Double>()
 
         while (true) {
             val entityId = pendingSpawned.poll() ?: break
@@ -205,7 +255,12 @@ class ThrownItemSystem(
         for ((entityId, entity) in entities.toList()) {
             val oldChunk = ChunkPos(entity.chunkX, entity.chunkZ)
             if (activeSimulationChunks != null && oldChunk !in activeSimulationChunks) continue
-            val chunkDeltaSeconds = (chunkDeltaSecondsProvider?.invoke(oldChunk) ?: deltaSeconds)
+            // Chunk delta must be sampled once per chunk per tick frame.
+            // Sampling per-entity causes later entities in the same chunk
+            // to get near-zero elapsed time and appear frozen briefly.
+            val chunkDeltaSeconds = chunkDeltaSecondsByChunk.getOrPut(oldChunk) {
+                chunkDeltaSecondsProvider?.invoke(oldChunk) ?: deltaSeconds
+            }
             if (chunkDeltaSeconds <= 0.0) continue
             val tickScale = chunkDeltaSeconds * 20.0
             val startedAt = System.nanoTime()
@@ -223,8 +278,8 @@ class ThrownItemSystem(
             entity.prevZ = oldZ
             entity.ageTicks += tickScale
 
-            val collisionT = firstCollisionT(oldX, oldY, oldZ, entity.x, entity.y, entity.z)
-            val hit = collisionT != null
+            val collisionHit = firstCollisionHit(oldX, oldY, oldZ, entity.x, entity.y, entity.z)
+            val hit = collisionHit != null
             val despawn =
                 entity.y < DESPAWN_Y ||
                     entity.y > WORLD_MAX_Y + 2.0 ||
@@ -232,14 +287,28 @@ class ThrownItemSystem(
                     hit
             if (despawn) {
                 val (removeX, removeY, removeZ) = if (hit) {
-                    impactPointAtT(oldX, oldY, oldZ, entity.x, entity.y, entity.z, collisionT!!)
+                    impactPointAtCollisionFace(oldX, oldY, oldZ, entity.x, entity.y, entity.z, collisionHit!!)
                 } else {
                     Triple(entity.x, entity.y, entity.z)
                 }
                 if (entities.remove(entityId, entity)) {
                     snapshots.remove(entityId)
                     removeFromChunkIndex(oldChunk, entityId)
-                    removed.add(ThrownItemRemovedEvent(entityId, oldChunk, hit, removeX, removeY, removeZ))
+                    removed.add(
+                        ThrownItemRemovedEvent(
+                            entityId = entityId,
+                            ownerEntityId = entity.ownerEntityId,
+                            kind = entity.kind,
+                            chunkPos = oldChunk,
+                            hit = hit,
+                            x = removeX,
+                            y = removeY,
+                            z = removeZ,
+                            hitAxis = collisionHit?.axis,
+                            hitDirection = collisionHit?.direction,
+                            hitBoundary = collisionHit?.boundary
+                        )
+                    )
                 }
                 chunkTimeRecorder?.invoke(oldChunk, System.nanoTime() - startedAt)
                 continue
@@ -287,80 +356,179 @@ class ThrownItemSystem(
         if (abs(entity.vz) < VELOCITY_EPSILON) entity.vz = 0.0
     }
 
-    private fun collides(x: Double, y: Double, z: Double): Boolean {
-        val bx = floor(x).toInt()
-        val by = floor(y).toInt()
-        val bz = floor(z).toInt()
-        return isCollidableState(blockStateAt(bx, by, bz))
-    }
-
-    private fun firstCollisionT(
+    private fun firstCollisionHit(
         oldX: Double,
         oldY: Double,
         oldZ: Double,
         newX: Double,
         newY: Double,
         newZ: Double
-    ): Double? {
-        if (collides(oldX, oldY, oldZ)) return 0.0
-        val dx = newX - oldX
-        val dy = newY - oldY
-        val dz = newZ - oldZ
-        val distance = sqrt(dx * dx + dy * dy + dz * dz)
-        val steps = ceil(distance / SWEEP_STEP_BLOCKS).toInt().coerceAtLeast(1)
-        var prevT = 0.0
-        for (i in 1..steps) {
-            val t = i.toDouble() / steps.toDouble()
-            val x = lerp(oldX, newX, t)
-            val y = lerp(oldY, newY, t)
-            val z = lerp(oldZ, newZ, t)
-            if (!collides(x, y, z)) {
-                prevT = t
-                continue
-            }
-            var lo = prevT
-            var hi = t
-            repeat(8) {
-                val mid = (lo + hi) * 0.5
-                val mx = lerp(oldX, newX, mid)
-                val my = lerp(oldY, newY, mid)
-                val mz = lerp(oldZ, newZ, mid)
-                if (collides(mx, my, mz)) {
-                    hi = mid
-                } else {
-                    lo = mid
+    ): CollisionHit? {
+        val radius = PROJECTILE_COLLISION_RADIUS
+        val minX = min(oldX, newX) - radius
+        val maxX = max(oldX, newX) + radius
+        val minY = min(oldY, newY) - radius
+        val maxY = max(oldY, newY) + radius
+        val minZ = min(oldZ, newZ) - radius
+        val maxZ = max(oldZ, newZ) + radius
+        val startX = floor(minX).toInt()
+        val endX = floor(maxX - 1.0e-7).toInt()
+        val startY = floor(minY).toInt()
+        val endY = floor(maxY - 1.0e-7).toInt()
+        val startZ = floor(minZ).toInt()
+        val endZ = floor(maxZ - 1.0e-7).toInt()
+
+        var earliest: CollisionHit? = null
+        for (bx in startX..endX) {
+            for (by in startY..endY) {
+                for (bz in startZ..endZ) {
+                    val stateId = blockStateAt(bx, by, bz)
+                    if (stateId <= 0) continue
+                    val boxes = collisionBoxesForState(stateId)
+                    if (boxes.isEmpty()) continue
+                    for (box in boxes) {
+                        val expandedMinX = bx + box.minX - radius
+                        val expandedMinY = by + box.minY - radius
+                        val expandedMinZ = bz + box.minZ - radius
+                        val expandedMaxX = bx + box.maxX + radius
+                        val expandedMaxY = by + box.maxY + radius
+                        val expandedMaxZ = bz + box.maxZ + radius
+                        if (oldX in expandedMinX..expandedMaxX &&
+                            oldY in expandedMinY..expandedMaxY &&
+                            oldZ in expandedMinZ..expandedMaxZ
+                        ) {
+                            return CollisionHit(t = 0.0, axis = null, boundary = null, direction = null)
+                        }
+                        val hit = segmentAabbEntryHit(
+                            x0 = oldX,
+                            y0 = oldY,
+                            z0 = oldZ,
+                            x1 = newX,
+                            y1 = newY,
+                            z1 = newZ,
+                            minX = expandedMinX,
+                            maxX = expandedMaxX,
+                            minY = expandedMinY,
+                            maxY = expandedMaxY,
+                            minZ = expandedMinZ,
+                            maxZ = expandedMaxZ
+                        ) ?: continue
+                        val current = earliest?.t
+                        if (current == null || hit.t < current) {
+                            earliest = CollisionHit(
+                                t = hit.t,
+                                axis = hit.axis,
+                                boundary = hit.boundary,
+                                direction = hit.direction
+                            )
+                        }
+                    }
                 }
             }
-            return hi
         }
-        return null
+        return earliest
     }
 
-    private fun impactPointAtT(
+    private fun impactPointAtCollisionFace(
         oldX: Double,
         oldY: Double,
         oldZ: Double,
         newX: Double,
         newY: Double,
         newZ: Double,
-        collisionT: Double
+        collisionHit: CollisionHit
     ): Triple<Double, Double, Double> {
-        val t = (collisionT - 1.0e-4).coerceAtLeast(0.0)
-        return Triple(
-            lerp(oldX, newX, t),
-            lerp(oldY, newY, t),
-            lerp(oldZ, newZ, t)
-        )
+        var x = lerp(oldX, newX, collisionHit.t)
+        var y = lerp(oldY, newY, collisionHit.t)
+        var z = lerp(oldZ, newZ, collisionHit.t)
+        val axis = collisionHit.axis
+        val boundary = collisionHit.boundary
+        if (axis != null && boundary != null) {
+            when (axis) {
+                AXIS_X -> x = boundary
+                AXIS_Y -> y = boundary
+                AXIS_Z -> z = boundary
+            }
+        }
+        return Triple(x, y, z)
     }
 
     private fun lerp(a: Double, b: Double, t: Double): Double = a + (b - a) * t
 
-    private fun isCollidableState(stateId: Int): Boolean {
-        if (stateId == 0) return false
-        return collidableStateCache.computeIfAbsent(stateId) { id ->
-            val blockKey = BlockStateRegistry.parsedState(id)?.blockKey ?: return@computeIfAbsent true
-            blockKey !in NON_COLLIDING_BLOCK_KEYS
+    private fun collisionBoxesForState(stateId: Int): Array<CollisionBox> {
+        if (stateId <= 0) return EMPTY_COLLISION_BOXES
+        return collisionBoxesByState.computeIfAbsent(stateId) { id ->
+            val parsed = BlockStateRegistry.parsedState(id) ?: return@computeIfAbsent FULL_BLOCK_COLLISION_BOXES
+            if (parsed.blockKey in NON_COLLIDING_BLOCK_KEYS) return@computeIfAbsent EMPTY_COLLISION_BOXES
+            val resolved = BlockCollisionRegistry.boxesForStateId(id, parsed)
+            if (resolved == null) return@computeIfAbsent FULL_BLOCK_COLLISION_BOXES
+            if (resolved.isEmpty()) return@computeIfAbsent EMPTY_COLLISION_BOXES
+            Array(resolved.size) { i ->
+                val box = resolved[i]
+                CollisionBox(
+                    minX = box.minX,
+                    minY = box.minY,
+                    minZ = box.minZ,
+                    maxX = box.maxX,
+                    maxY = box.maxY,
+                    maxZ = box.maxZ
+                )
+            }
         }
+    }
+
+    private fun segmentAabbEntryHit(
+        x0: Double,
+        y0: Double,
+        z0: Double,
+        x1: Double,
+        y1: Double,
+        z1: Double,
+        minX: Double,
+        maxX: Double,
+        minY: Double,
+        maxY: Double,
+        minZ: Double,
+        maxZ: Double
+    ): SegmentAabbHit? {
+        val epsilon = 1.0e-8
+        var tMin = 0.0
+        var tMax = 1.0
+        var enterAxis: Int? = null
+        var enterBoundary: Double? = null
+        var enterDirection: Int? = null
+
+        fun clip(p0: Double, p1: Double, min: Double, max: Double, axis: Int): Boolean {
+            val d = p1 - p0
+            if (abs(d) <= epsilon) return p0 in min..max
+            val inv = 1.0 / d
+            var t1 = (min - p0) * inv
+            var t2 = (max - p0) * inv
+            if (t1 > t2) {
+                val tmp = t1
+                t1 = t2
+                t2 = tmp
+            }
+            if (t2 < tMin || t1 > tMax) return false
+            if (t1 > tMin) {
+                tMin = t1
+                enterAxis = axis
+                enterBoundary = if (d > 0.0) min else max
+                enterDirection = if (d > 0.0) 1 else -1
+            }
+            if (t2 < tMax) tMax = t2
+            return tMin <= tMax
+        }
+
+        if (!clip(x0, x1, minX, maxX, AXIS_X)) return null
+        if (!clip(y0, y1, minY, maxY, AXIS_Y)) return null
+        if (!clip(z0, z1, minZ, maxZ, AXIS_Z)) return null
+        return SegmentAabbHit(
+            t = tMin.coerceIn(0.0, 1.0),
+            axis = enterAxis,
+            boundary = enterBoundary,
+            direction = enterDirection
+        )
     }
 
     private fun addToChunkIndex(chunkPos: ChunkPos, entityId: Int) {
@@ -383,6 +551,7 @@ class ThrownItemSystem(
     private fun chunkZFromBlockZ(z: Double): Int = floor(z / 16.0).toInt()
 
     private companion object {
+        private val json = Json { ignoreUnknownKeys = true }
         private const val GRAVITY_PER_TICK = 0.03
         private const val AIR_DRAG = 0.99
         private const val POSITION_EPSILON = 1.0e-4
@@ -390,22 +559,57 @@ class ThrownItemSystem(
         private const val DESPAWN_Y = -128.0
         private const val WORLD_MAX_Y = 319
         private const val MAX_LIFETIME_TICKS = 1200.0
-        private const val SWEEP_STEP_BLOCKS = 0.125
-        private val NON_COLLIDING_BLOCK_KEYS = setOf(
-            "minecraft:air",
-            "minecraft:cave_air",
-            "minecraft:void_air",
-            "minecraft:water",
-            "minecraft:lava",
-            "minecraft:short_grass",
-            "minecraft:tall_grass",
-            "minecraft:fern",
-            "minecraft:large_fern",
-            "minecraft:dead_bush",
-            "minecraft:vine",
-            "minecraft:glow_lichen",
-            "minecraft:fire",
-            "minecraft:soul_fire"
+        private const val PROJECTILE_COLLISION_RADIUS = 0.125
+        private const val AXIS_X = 0
+        private const val AXIS_Y = 1
+        private const val AXIS_Z = 2
+        private val EMPTY_COLLISION_BOXES = emptyArray<CollisionBox>()
+        private val FULL_BLOCK_COLLISION_BOXES = arrayOf(
+            CollisionBox(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
         )
+        private val NON_COLLIDING_BLOCK_KEYS: Set<String> = run {
+            val loaded = loadBlockTag("dropped_item_non_colliding")
+            if (loaded.isNotEmpty()) return@run loaded
+            // Fallback for environments where the tag resource is unavailable.
+            setOf(
+                "minecraft:air",
+                "minecraft:cave_air",
+                "minecraft:void_air",
+                "minecraft:water",
+                "minecraft:lava",
+                "minecraft:short_grass",
+                "minecraft:tall_grass",
+                "minecraft:fern",
+                "minecraft:large_fern",
+                "minecraft:dead_bush",
+                "minecraft:vine",
+                "minecraft:glow_lichen",
+                "minecraft:fire",
+                "minecraft:soul_fire"
+            )
+        }
+
+        private fun loadBlockTag(tagName: String): Set<String> {
+            return resolveBlockTag(tagName, HashSet())
+        }
+
+        private fun resolveBlockTag(tagName: String, visited: MutableSet<String>): Set<String> {
+            if (!visited.add(tagName)) return emptySet()
+            val resourcePath = "/data/minecraft/tags/block/$tagName.json"
+            val stream = ThrownItemSystem::class.java.getResourceAsStream(resourcePath) ?: return emptySet()
+            val root = stream.bufferedReader().use {
+                json.parseToJsonElement(it.readText()).jsonObject
+            }
+            val out = LinkedHashSet<String>()
+            for (value in root["values"]?.jsonArray.orEmpty()) {
+                val raw = value.jsonPrimitive.content
+                if (raw.startsWith("#minecraft:")) {
+                    out.addAll(resolveBlockTag(raw.removePrefix("#minecraft:"), visited))
+                } else if (raw.startsWith("minecraft:")) {
+                    out.add(raw)
+                }
+            }
+            return out
+        }
     }
 }
