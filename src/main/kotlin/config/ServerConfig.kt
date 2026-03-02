@@ -8,6 +8,10 @@ object ServerConfig {
     @Volatile
     var maxTps: Double = 20.0
 
+    // Server-wide max player count used for status response and dashboard display.
+    @Volatile
+    var maxPlayers: Int = 20
+
     // Global simulation time scale.
     // 1.0 = normal speed, <1.0 = slower, >1.0 = faster.
     @Volatile

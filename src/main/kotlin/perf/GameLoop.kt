@@ -2,6 +2,7 @@ package org.macaroon3145.perf
 
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.handler.PlayerSessionManager
+import org.macaroon3145.ui.ServerDashboard
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.roundToLong
 
@@ -76,6 +77,7 @@ object GameLoop {
             PlayerSessionManager.tick(deltaSeconds)
             val tickEndNanos = System.nanoTime()
             PerformanceMonitor.recordTick(tickStartNanos, tickEndNanos)
+            ServerDashboard.onTick()
 
             if (!uncapped) {
                 nextTickDeadline += tickIntervalNanos

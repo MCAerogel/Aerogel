@@ -304,6 +304,9 @@ private data class PlayerSimulationStamp(
     private val animalRiderEntityIdByAnimalEntityId = ConcurrentHashMap<Int, Int>()
     private val animalEntityIdByRiderEntityId = ConcurrentHashMap<Int, Int>()
     private val pigBoostStatesByAnimalEntityId = ConcurrentHashMap<Int, PigBoostState>()
+    private val animalSourceDirtyWorlds = ConcurrentHashMap.newKeySet<String>()
+    private val animalRideControlsActiveWorlds = ConcurrentHashMap.newKeySet<String>()
+    private val attackCooldownActiveChannelIds = ConcurrentHashMap.newKeySet<ChannelId>()
     private val worldTimes = ConcurrentHashMap<String, WorldTimeState>()
     private val furnaceStates = ConcurrentHashMap<FurnaceKey, FurnaceState>()
     private val activeFurnaceKeys = ConcurrentHashMap.newKeySet<FurnaceKey>()
@@ -318,7 +321,9 @@ private data class PlayerSimulationStamp(
     private val activeSimulationChunksByPlayerEntityId = ConcurrentHashMap<Int, Set<ChunkPos>>()
     @Volatile private var activeSimulationLastMaxDistanceChunks = -1
     private val retainedBaseChunksCacheByWorld = ConcurrentHashMap<String, Set<ChunkPos>>()
-    private val retainedBaseChunksDirtyWorlds = ConcurrentHashMap.newKeySet<String>()
+    private val retainedBaseRefCountByWorld = ConcurrentHashMap<String, ConcurrentHashMap<ChunkPos, Int>>()
+    private val retainedBaseChunksByPlayerEntityId = ConcurrentHashMap<Int, Set<ChunkPos>>()
+    private val retainedBaseWorldKeyByPlayerEntityId = ConcurrentHashMap<Int, String>()
     private val pushingWakeChunksByWorld = ConcurrentHashMap<String, MutableSet<ChunkPos>>()
     private val pushingContactStates = ConcurrentHashMap<PushingContactKey, PushingContactState>()
     private val lastPushingChunkByPlayerEntityId = ConcurrentHashMap<Int, ChunkPos>()
@@ -332,6 +337,8 @@ private data class PlayerSimulationStamp(
             priority = Thread.NORM_PRIORITY - 1
         }
     }
+    @Volatile
+    private var nextChunkMsptActionBarSweepAtNanos: Long = 0L
     private val operatorFilePath: Path = Path.of("op.txt")
         private val persistedOperatorUuids = ConcurrentHashMap.newKeySet<UUID>()
     private val operatorUuids = ConcurrentHashMap.newKeySet<java.util.UUID>()
@@ -696,7 +703,7 @@ private data class PlayerSimulationStamp(
         val existing = sessions.values.filter { it.worldKey == worldKey && it.channelId != session.channelId }
         sessions[session.channelId] = session
         contexts[session.channelId] = ctx
-        markWorldChunkCachesDirty(session.worldKey)
+        animalSourceDirtyWorlds.add(session.worldKey)
         val spawnChunk = ChunkPos(spawnChunkX, spawnChunkZ)
         lastPushingChunkByPlayerEntityId[session.entityId] = spawnChunk
         markPushingChunksAwake(session.worldKey, spawnChunk)
@@ -792,10 +799,7 @@ private data class PlayerSimulationStamp(
         if (deltaSeconds <= 0.0) return
         val tickSequence = chunkProcessingTickSequence.incrementAndGet()
         val gameplayDeltaSeconds = computePhysicsDeltaSeconds(deltaSeconds)
-        tickPlayerHurtInvulnerability(gameplayDeltaSeconds)
-        tickAttackStrengthCooldowns(gameplayDeltaSeconds)
-        tickUsingItems(gameplayDeltaSeconds)
-        tickNaturalRegeneration(deltaSeconds)
+        tickPerPlayerState(gameplayDeltaSeconds, deltaSeconds)
         advanceAndBroadcastWorldTime(deltaSeconds)
         val simulationContext = buildTickSimulationContext()
         val physicsDeltaSeconds = gameplayDeltaSeconds
@@ -818,6 +822,63 @@ private data class PlayerSimulationStamp(
         flushPendingAnimalRemovals()
         drainPendingFurnaceResyncs()
         maybeSendChunkMsptActionBar(System.nanoTime())
+    }
+
+    private fun tickPerPlayerState(gameplayDeltaSeconds: Double, deltaSeconds: Double) {
+        if (sessions.isEmpty()) return
+        val hasGameplayDelta = gameplayDeltaSeconds.isFinite() && gameplayDeltaSeconds > 0.0
+        val hasDelta = deltaSeconds.isFinite() && deltaSeconds > 0.0
+        if (!hasGameplayDelta && !hasDelta) return
+        val tickDelta = if (hasGameplayDelta) {
+            (gameplayDeltaSeconds * MINECRAFT_TICKS_PER_SECOND).takeIf { it.isFinite() && it > 0.0 } ?: 0.0
+        } else {
+            0.0
+        }
+        if (tickDelta > 0.0) {
+            tickAttackStrengthCooldownsIncremental(tickDelta)
+        }
+
+        for (session in sessions.values) {
+            if (hasGameplayDelta) {
+                if (session.hurtInvulnerableSeconds > 0.0) {
+                    session.hurtInvulnerableSeconds =
+                        (session.hurtInvulnerableSeconds - gameplayDeltaSeconds).coerceAtLeast(0.0)
+                    if (session.hurtInvulnerableSeconds <= 0.0) {
+                        session.lastHurtAmount = 0f
+                    }
+                }
+                tickUsingItemForSession(session, gameplayDeltaSeconds)
+            }
+
+            if (hasDelta) {
+                tickNaturalRegenerationForSession(session, deltaSeconds)
+            }
+        }
+    }
+
+    private fun tickAttackStrengthCooldownsIncremental(tickDelta: Double) {
+        if (attackCooldownActiveChannelIds.isEmpty()) return
+        val toRemove = ArrayList<ChannelId>()
+        for (channelId in attackCooldownActiveChannelIds) {
+            val session = sessions[channelId]
+            if (session == null) {
+                toRemove.add(channelId)
+                continue
+            }
+            val current = session.attackStrengthTickerTicks
+            if (current >= MAX_ATTACK_STRENGTH_TICKER) {
+                toRemove.add(channelId)
+                continue
+            }
+            val next = (current + tickDelta).coerceAtMost(MAX_ATTACK_STRENGTH_TICKER)
+            session.attackStrengthTickerTicks = next
+            if (next >= MAX_ATTACK_STRENGTH_TICKER) {
+                toRemove.add(channelId)
+            }
+        }
+        for (channelId in toRemove) {
+            attackCooldownActiveChannelIds.remove(channelId)
+        }
     }
 
     private fun tickAttackStrengthCooldowns(deltaSeconds: Double) {
@@ -852,33 +913,37 @@ private data class PlayerSimulationStamp(
     private fun tickUsingItems(deltaSeconds: Double) {
         if (!deltaSeconds.isFinite() || deltaSeconds <= 0.0) return
         for (session in sessions.values) {
-            if (session.usingItemRemainingSeconds <= 0.0) continue
-            if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) {
-                stopUsingItem(session)
-                continue
-            }
-            session.usingItemSoundDelaySeconds -= deltaSeconds
-            var soundLoops = 0
-            while (session.usingItemSoundDelaySeconds <= 0.0 &&
-                session.usingItemRemainingSeconds > 0.0 &&
-                soundLoops < MAX_ITEM_USE_SOUND_LOOPS_PER_TICK
-            ) {
-                val soundKey = session.usingItemSoundKey
-                if (!soundKey.isNullOrEmpty()) {
-                    broadcastFoodUseProgressSound(session, soundKey)
-                }
-                session.usingItemSoundDelaySeconds += FOOD_USE_SOUND_INTERVAL_SECONDS
-                soundLoops++
-            }
-            session.usingItemRemainingSeconds -= deltaSeconds
-            if (session.usingItemRemainingSeconds > 0.0) continue
-
-            val hand = session.usingItemHand
-            val expectedItemId = session.usingItemId
-            stopUsingItem(session)
-            if (hand !in 0..1 || expectedItemId < 0) continue
-            finishConsumingFoodItem(session, hand, expectedItemId)
+            tickUsingItemForSession(session, deltaSeconds)
         }
+    }
+
+    private fun tickUsingItemForSession(session: PlayerSession, deltaSeconds: Double) {
+        if (session.usingItemRemainingSeconds <= 0.0) return
+        if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) {
+            stopUsingItem(session)
+            return
+        }
+        session.usingItemSoundDelaySeconds -= deltaSeconds
+        var soundLoops = 0
+        while (session.usingItemSoundDelaySeconds <= 0.0 &&
+            session.usingItemRemainingSeconds > 0.0 &&
+            soundLoops < MAX_ITEM_USE_SOUND_LOOPS_PER_TICK
+        ) {
+            val soundKey = session.usingItemSoundKey
+            if (!soundKey.isNullOrEmpty()) {
+                broadcastFoodUseProgressSound(session, soundKey)
+            }
+            session.usingItemSoundDelaySeconds += FOOD_USE_SOUND_INTERVAL_SECONDS
+            soundLoops++
+        }
+        session.usingItemRemainingSeconds -= deltaSeconds
+        if (session.usingItemRemainingSeconds > 0.0) return
+
+        val hand = session.usingItemHand
+        val expectedItemId = session.usingItemId
+        stopUsingItem(session)
+        if (hand !in 0..1 || expectedItemId < 0) return
+        finishConsumingFoodItem(session, hand, expectedItemId)
     }
 
     private fun tickFurnaces(tickSequence: Long, deltaSeconds: Double, context: TickSimulationContext?) {
@@ -1163,67 +1228,71 @@ private data class PlayerSimulationStamp(
     private fun tickNaturalRegeneration(deltaSeconds: Double) {
         if (!deltaSeconds.isFinite() || deltaSeconds <= 0.0) return
         for (session in sessions.values) {
-            if (session.dead) continue
-            if (session.gameMode == GAME_MODE_SPECTATOR) continue
-            if (session.health >= MAX_PLAYER_HEALTH) {
-                session.regenAccumulatorSeconds = 0.0
-                continue
-            }
+            tickNaturalRegenerationForSession(session, deltaSeconds)
+        }
+    }
 
-            session.regenAccumulatorSeconds += deltaSeconds
-            if (!session.regenAccumulatorSeconds.isFinite()) {
-                session.regenAccumulatorSeconds = 0.0
-                continue
-            }
+    private fun tickNaturalRegenerationForSession(session: PlayerSession, deltaSeconds: Double) {
+        if (session.dead) return
+        if (session.gameMode == GAME_MODE_SPECTATOR) return
+        if (session.health >= MAX_PLAYER_HEALTH) {
+            session.regenAccumulatorSeconds = 0.0
+            return
+        }
 
-            var changed = false
-            var loops = 0
-            while (loops < MAX_PLAYER_REGEN_LOOPS_PER_TICK) {
-                val canSaturatedRegen = session.food >= SATURATED_REGEN_FOOD_THRESHOLD && session.saturation > 0f
-                val canNormalRegen = session.food >= NORMAL_REGEN_FOOD_THRESHOLD
-                val intervalSeconds = when {
-                    canSaturatedRegen -> SATURATED_REGEN_INTERVAL_SECONDS
-                    canNormalRegen -> NORMAL_REGEN_INTERVAL_SECONDS
-                    else -> {
-                        session.regenAccumulatorSeconds = 0.0
-                        break
-                    }
-                }
-                if (session.regenAccumulatorSeconds + REGEN_TIME_EPSILON < intervalSeconds) break
-                session.regenAccumulatorSeconds -= intervalSeconds
+        session.regenAccumulatorSeconds += deltaSeconds
+        if (!session.regenAccumulatorSeconds.isFinite()) {
+            session.regenAccumulatorSeconds = 0.0
+            return
+        }
 
-                val healAmount = if (canSaturatedRegen) {
-                    min(session.saturation, SATURATED_REGEN_MAX_EXHAUSTION) / SATURATED_REGEN_MAX_EXHAUSTION
-                } else {
-                    NORMAL_REGEN_HEAL_AMOUNT
-                }
-                if (healAmount <= 0f) {
-                    loops++
-                    continue
-                }
-
-                val previousHealth = session.health
-                val nextHealth = (previousHealth + healAmount).coerceAtMost(MAX_PLAYER_HEALTH)
-                if (nextHealth <= previousHealth) {
-                    loops++
-                    continue
-                }
-                session.health = nextHealth
-                applyFoodExhaustion(
-                    session = session,
-                    exhaustion = if (canSaturatedRegen) healAmount * SATURATED_REGEN_MAX_EXHAUSTION else NORMAL_REGEN_EXHAUSTION
-                )
-                changed = true
-                if (session.health >= MAX_PLAYER_HEALTH) {
+        var changed = false
+        var loops = 0
+        while (loops < MAX_PLAYER_REGEN_LOOPS_PER_TICK) {
+            val canSaturatedRegen = session.food >= SATURATED_REGEN_FOOD_THRESHOLD && session.saturation > 0f
+            val canNormalRegen = session.food >= NORMAL_REGEN_FOOD_THRESHOLD
+            val intervalSeconds = when {
+                canSaturatedRegen -> SATURATED_REGEN_INTERVAL_SECONDS
+                canNormalRegen -> NORMAL_REGEN_INTERVAL_SECONDS
+                else -> {
                     session.regenAccumulatorSeconds = 0.0
                     break
                 }
+            }
+            if (session.regenAccumulatorSeconds + REGEN_TIME_EPSILON < intervalSeconds) break
+            session.regenAccumulatorSeconds -= intervalSeconds
+
+            val healAmount = if (canSaturatedRegen) {
+                min(session.saturation, SATURATED_REGEN_MAX_EXHAUSTION) / SATURATED_REGEN_MAX_EXHAUSTION
+            } else {
+                NORMAL_REGEN_HEAL_AMOUNT
+            }
+            if (healAmount <= 0f) {
                 loops++
+                continue
             }
 
-            if (changed) {
-                sendHealthPacket(session)
+            val previousHealth = session.health
+            val nextHealth = (previousHealth + healAmount).coerceAtMost(MAX_PLAYER_HEALTH)
+            if (nextHealth <= previousHealth) {
+                loops++
+                continue
             }
+            session.health = nextHealth
+            applyFoodExhaustion(
+                session = session,
+                exhaustion = if (canSaturatedRegen) healAmount * SATURATED_REGEN_MAX_EXHAUSTION else NORMAL_REGEN_EXHAUSTION
+            )
+            changed = true
+            if (session.health >= MAX_PLAYER_HEALTH) {
+                session.regenAccumulatorSeconds = 0.0
+                break
+            }
+            loops++
+        }
+
+        if (changed) {
+            sendHealthPacket(session)
         }
     }
 
@@ -1726,15 +1795,30 @@ private data class PlayerSimulationStamp(
                 pendingAsync.decrementAndGet()
             }
             try {
-                world.setAnimalTemptSources(collectAnimalTemptSources(sessionsSnapshot))
-                world.setAnimalLookSources(collectAnimalLookSources(sessionsSnapshot))
-                world.setAnimalRideControls(
-                    collectAnimalRideControls(
-                        world = world,
-                        worldSessions = sessionsSnapshot,
-                        deltaSeconds = physicsDeltaSeconds
-                    )
-                )
+                val hasAnimals = world.hasAnimals()
+                if (hasAnimals) {
+                    if (animalSourceDirtyWorlds.remove(world.key)) {
+                        world.setAnimalTemptSources(collectAnimalTemptSources(sessionsSnapshot))
+                        world.setAnimalLookSources(collectAnimalLookSources(sessionsSnapshot))
+                    }
+                    if (animalEntityIdByRiderEntityId.isNotEmpty()) {
+                        world.setAnimalRideControls(
+                            collectAnimalRideControls(
+                                world = world,
+                                worldSessions = sessionsSnapshot,
+                                deltaSeconds = physicsDeltaSeconds
+                            )
+                        )
+                        animalRideControlsActiveWorlds.add(world.key)
+                    } else if (animalRideControlsActiveWorlds.remove(world.key)) {
+                        world.setAnimalRideControls(emptyList())
+                    }
+                } else {
+                    animalSourceDirtyWorlds.remove(world.key)
+                    if (animalRideControlsActiveWorlds.remove(world.key)) {
+                        world.setAnimalRideControls(emptyList())
+                    }
+                }
                 val chunkProcessingFrame = world.beginChunkProcessingFrame(tickSequence)
                 pendingAsync.incrementAndGet()
                 val droppedEvents = world.tickDroppedItems(
@@ -1769,27 +1853,31 @@ private data class PlayerSimulationStamp(
                 ) { chunkPos, elapsedNanos ->
                     world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "thrown")
                 }
-                pendingAsync.incrementAndGet()
-                val animalEvents = world.tickAnimals(
-                    physicsDeltaSeconds,
-                    activeSimulationChunks,
-                    onChunkEvents = { chunkEvents ->
-                        markPushingWakeFromAnimalEvents(world.key, chunkEvents)
-                        dispatchWorldPhysicsEvents(
-                            world = world,
-                            worldSessions = sessionsSnapshot,
-                            events = WorldPhysicsEvents(
-                                droppedItems = org.macaroon3145.world.DroppedItemTickEvents(emptyList(), emptyList(), emptyList()),
-                                fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
-                                thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
-                                animals = chunkEvents
-                            ),
-                            deltaSeconds = deltaSeconds
-                        )
-                    },
-                    onDispatchComplete = { done() }
-                ) { chunkPos, elapsedNanos ->
-                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "animal")
+                val animalEvents = if (hasAnimals) {
+                    pendingAsync.incrementAndGet()
+                    world.tickAnimals(
+                        physicsDeltaSeconds,
+                        activeSimulationChunks,
+                        onChunkEvents = { chunkEvents ->
+                            markPushingWakeFromAnimalEvents(world.key, chunkEvents)
+                            dispatchWorldPhysicsEvents(
+                                world = world,
+                                worldSessions = sessionsSnapshot,
+                                events = WorldPhysicsEvents(
+                                    droppedItems = org.macaroon3145.world.DroppedItemTickEvents(emptyList(), emptyList(), emptyList()),
+                                    fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
+                                    thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
+                                    animals = chunkEvents
+                                ),
+                                deltaSeconds = deltaSeconds
+                            )
+                        },
+                        onDispatchComplete = { done() }
+                    ) { chunkPos, elapsedNanos ->
+                        world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "animal")
+                    }
+                } else {
+                    org.macaroon3145.world.AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
                 }
                 world.finishChunkProcessingFrame(
                     frame = chunkProcessingFrame,
@@ -2326,6 +2414,9 @@ private data class PlayerSimulationStamp(
         val knownChunk = lastPushingChunkByPlayerEntityId.put(session.entityId, nextChunk)
         val changedChunk = previousChunk != nextChunk || (knownChunk != null && knownChunk != nextChunk)
         val movedEnough = horizontalMovementSq >= PUSHING_WAKE_MIN_HORIZONTAL_MOVEMENT_SQ
+        if (movedEnough) {
+            animalSourceDirtyWorlds.add(session.worldKey)
+        }
         if (!changedChunk && !movedEnough) return
         markPushingChunksAwake(session.worldKey, previousChunk)
         if (nextChunk != previousChunk) {
@@ -2458,7 +2549,13 @@ private data class PlayerSimulationStamp(
                     continue
                 }
 
-                val playerChunkByEntityId = HashMap<Int, ChunkPos>(sessionsSnapshot.size)
+                val chunksToProcess = HashSet<ChunkPos>()
+                chunksToProcess.addAll(drainAwakePushingChunks(worldKey, activeSimulationChunks))
+                if (chunksToProcess.isEmpty()) {
+                    pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
+                    continue
+                }
+
                 val playersByChunk = HashMap<ChunkPos, MutableList<PlayerSession>>()
                 for (session in sessionsSnapshot) {
                     if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) continue
@@ -2467,21 +2564,8 @@ private data class PlayerSimulationStamp(
                         ChunkStreamingService.chunkZFromBlockZ(session.z)
                     )
                     if (chunkPos !in activeSimulationChunks) continue
-                    val previousChunk = lastPushingChunkByPlayerEntityId.put(session.entityId, chunkPos)
-                    if (previousChunk == null || previousChunk != chunkPos) {
-                        markPushingChunksAwake(worldKey, chunkPos)
-                        if (previousChunk != null && previousChunk in activeSimulationChunks) {
-                            markPushingChunksAwake(worldKey, previousChunk)
-                        }
-                    }
-                    playerChunkByEntityId[session.entityId] = chunkPos
+                    if (chunkPos !in chunksToProcess) continue
                     playersByChunk.computeIfAbsent(chunkPos) { ArrayList() }.add(session)
-                }
-                val chunksToProcess = HashSet<ChunkPos>()
-                chunksToProcess.addAll(drainAwakePushingChunks(worldKey, activeSimulationChunks))
-                if (chunksToProcess.isEmpty()) {
-                    pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
-                    continue
                 }
 
                 val animalChunkByEntityId = HashMap<Int, ChunkPos>()
@@ -2606,6 +2690,7 @@ private data class PlayerSimulationStamp(
         val chunkAnimals = animalsByChunk[chunkPos].orEmpty()
         val nearbyAnimals = collectNeighborAnimals(chunkPos, animalsByChunk)
         val chunkAnimalSpatialIndex = buildAnimalSpatialIndex(chunkAnimals)
+        val nearbyAnimalSpatialIndex = buildAnimalSpatialIndex(nearbyAnimals)
 
         for (i in 0 until chunkPlayers.size) {
             val a = chunkPlayers[i]
@@ -2648,28 +2733,14 @@ private data class PlayerSimulationStamp(
             }
         }
 
-        for (i in 0 until nearbyAnimals.size) {
-            val a = nearbyAnimals[i]
-            val aChunk = animalChunkByEntityId[a.entityId] ?: continue
-            val aMinY = a.y
-            val aMaxY = a.y + a.hitboxHeight
-            for (j in (i + 1) until nearbyAnimals.size) {
-                val b = nearbyAnimals[j]
-                val bChunk = animalChunkByEntityId[b.entityId] ?: continue
-                if (ownerChunkForPair(aChunk, bChunk) != chunkPos) continue
-                val bMinY = b.y
-                val bMaxY = b.y + b.hitboxHeight
-                if (aMaxY <= bMinY || aMinY >= bMaxY) continue
-                applyHorizontalPushPair(
-                    ax = a.x, az = a.z, ar = a.hitboxWidth * 0.5,
-                    bx = b.x, bz = b.z, br = b.hitboxWidth * 0.5,
-                    deltaSeconds = deltaSeconds
-                ) { pushAX, pushAZ, pushBX, pushBZ ->
-                    addImpulse(animalImpulseX, animalImpulseZ, a.entityId, pushAX, pushAZ)
-                    addImpulse(animalImpulseX, animalImpulseZ, b.entityId, pushBX, pushBZ)
-                }
-            }
-        }
+        applyAnimalAnimalPushingInChunk(
+            chunkPos = chunkPos,
+            deltaSeconds = deltaSeconds,
+            nearbyIndex = nearbyAnimalSpatialIndex,
+            animalChunkByEntityId = animalChunkByEntityId,
+            animalImpulseX = animalImpulseX,
+            animalImpulseZ = animalImpulseZ
+        )
     }
 
     private data class AnimalSpatialIndex(
@@ -2712,6 +2783,90 @@ private data class PlayerSimulationStamp(
             }
         }
         return out
+    }
+
+    private fun applyAnimalAnimalPushingInChunk(
+        chunkPos: ChunkPos,
+        deltaSeconds: Double,
+        nearbyIndex: AnimalSpatialIndex,
+        animalChunkByEntityId: Map<Int, ChunkPos>,
+        animalImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
+        animalImpulseZ: ConcurrentHashMap<Int, DoubleAdder>
+    ) {
+        val byCell = nearbyIndex.byCell
+        if (byCell.isEmpty()) return
+        val reach = (nearbyIndex.maxHalfWidth * 2.0) + PUSHING_SPATIAL_REACH_MARGIN
+        val cellRadius = ceil(reach / PUSHING_SPATIAL_CELL_SIZE).toInt().coerceAtLeast(1)
+
+        for ((cellKey, cellAnimals) in byCell) {
+            val cellX = (cellKey shr 32).toInt()
+            val cellZ = cellKey.toInt()
+            for (dx in 0..cellRadius) {
+                for (dz in -cellRadius..cellRadius) {
+                    if (dx == 0 && dz < 0) continue
+                    val neighbor = byCell[packSpatialCell(cellX + dx, cellZ + dz)] ?: continue
+                    if (dx == 0 && dz == 0) {
+                        for (i in 0 until cellAnimals.size) {
+                            val a = cellAnimals[i]
+                            for (j in (i + 1) until cellAnimals.size) {
+                                val b = cellAnimals[j]
+                                applyAnimalPushPair(
+                                    ownerChunk = chunkPos,
+                                    deltaSeconds = deltaSeconds,
+                                    a = a,
+                                    b = b,
+                                    animalChunkByEntityId = animalChunkByEntityId,
+                                    animalImpulseX = animalImpulseX,
+                                    animalImpulseZ = animalImpulseZ
+                                )
+                            }
+                        }
+                    } else {
+                        for (a in cellAnimals) {
+                            for (b in neighbor) {
+                                applyAnimalPushPair(
+                                    ownerChunk = chunkPos,
+                                    deltaSeconds = deltaSeconds,
+                                    a = a,
+                                    b = b,
+                                    animalChunkByEntityId = animalChunkByEntityId,
+                                    animalImpulseX = animalImpulseX,
+                                    animalImpulseZ = animalImpulseZ
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun applyAnimalPushPair(
+        ownerChunk: ChunkPos,
+        deltaSeconds: Double,
+        a: AnimalSnapshot,
+        b: AnimalSnapshot,
+        animalChunkByEntityId: Map<Int, ChunkPos>,
+        animalImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
+        animalImpulseZ: ConcurrentHashMap<Int, DoubleAdder>
+    ) {
+        if (a.entityId == b.entityId) return
+        val aChunk = animalChunkByEntityId[a.entityId] ?: return
+        val bChunk = animalChunkByEntityId[b.entityId] ?: return
+        if (ownerChunkForPair(aChunk, bChunk) != ownerChunk) return
+        val aMinY = a.y
+        val aMaxY = a.y + a.hitboxHeight
+        val bMinY = b.y
+        val bMaxY = b.y + b.hitboxHeight
+        if (aMaxY <= bMinY || aMinY >= bMaxY) return
+        applyHorizontalPushPair(
+            ax = a.x, az = a.z, ar = a.hitboxWidth * 0.5,
+            bx = b.x, bz = b.z, br = b.hitboxWidth * 0.5,
+            deltaSeconds = deltaSeconds
+        ) { pushAX, pushAZ, pushBX, pushBZ ->
+            addImpulse(animalImpulseX, animalImpulseZ, a.entityId, pushAX, pushAZ)
+            addImpulse(animalImpulseX, animalImpulseZ, b.entityId, pushBX, pushBZ)
+        }
     }
 
     private fun packSpatialCell(cellX: Int, cellZ: Int): Long {
@@ -3355,38 +3510,100 @@ private data class PlayerSimulationStamp(
     }
 
     private fun updateRetainedBaseWorldChunks(sessionsByWorld: Map<String, List<PlayerSession>>) {
+        val connectedCount = sessionsByWorld.values.sumOf { it.size }
+        if (retainedBaseChunksByPlayerEntityId.size > connectedCount) {
+            val activePlayerEntityIds = HashSet<Int>(connectedCount)
+            for (worldSessions in sessionsByWorld.values) {
+                for (session in worldSessions) {
+                    activePlayerEntityIds.add(session.entityId)
+                }
+            }
+            val knownEntityIds = retainedBaseChunksByPlayerEntityId.keys.toList()
+            for (entityId in knownEntityIds) {
+                if (entityId in activePlayerEntityIds) continue
+                val previous = retainedBaseChunksByPlayerEntityId.remove(entityId) ?: continue
+                val worldKey = retainedBaseWorldKeyByPlayerEntityId.remove(entityId) ?: continue
+                removeRetainedBaseFootprintRefs(worldKey, previous)
+                publishRetainedBaseChunksForWorld(worldKey)
+            }
+        }
         pruneRetainedBaseChunkCaches(sessionsByWorld.keys)
-        for ((worldKey, worldSessions) in sessionsByWorld) {
-            val dirty = retainedBaseChunksDirtyWorlds.contains(worldKey)
-            if (!dirty && retainedBaseChunksCacheByWorld.containsKey(worldKey)) continue
-            val retained = HashSet<ChunkPos>()
-            for (session in worldSessions) {
-                retained.addAll(session.targetChunks)
-                retained.addAll(session.loadedChunks)
-            }
-            val previous = retainedBaseChunksCacheByWorld[worldKey]
-            if (previous == null || previous != retained) {
-                FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, retained)
-                retainedBaseChunksCacheByWorld[worldKey] = retained
-            }
-            retainedBaseChunksDirtyWorlds.remove(worldKey)
+    }
+
+    private fun buildRetainedBaseChunkFootprint(session: PlayerSession): Set<ChunkPos> {
+        if (session.targetChunks.isEmpty() && session.loadedChunks.isEmpty()) return emptySet()
+        val footprint = HashSet<ChunkPos>(session.targetChunks.size + session.loadedChunks.size)
+        footprint.addAll(session.targetChunks)
+        footprint.addAll(session.loadedChunks)
+        return footprint
+    }
+
+    private fun addRetainedBaseFootprintRefs(worldKey: String, footprint: Set<ChunkPos>) {
+        if (footprint.isEmpty()) return
+        val refs = retainedBaseRefCountByWorld.computeIfAbsent(worldKey) { ConcurrentHashMap() }
+        for (chunkPos in footprint) {
+            refs.compute(chunkPos) { _, count -> (count ?: 0) + 1 }
         }
     }
 
-    private fun updateRetainedBaseWorldChunksForWorld(worldKey: String) {
-        markRetainedBaseChunksDirty(worldKey)
-        val retained = HashSet<ChunkPos>()
-        for (session in sessions.values) {
-            if (session.worldKey != worldKey) continue
-            retained.addAll(session.targetChunks)
-            retained.addAll(session.loadedChunks)
+    private fun removeRetainedBaseFootprintRefs(worldKey: String, footprint: Set<ChunkPos>) {
+        if (footprint.isEmpty()) return
+        val refs = retainedBaseRefCountByWorld[worldKey] ?: return
+        for (chunkPos in footprint) {
+            refs.computeIfPresent(chunkPos) { _, count ->
+                if (count <= 1) null else count - 1
+            }
         }
+        if (refs.isEmpty()) {
+            retainedBaseRefCountByWorld.remove(worldKey, refs)
+        }
+    }
+
+    private fun publishRetainedBaseChunksForWorld(worldKey: String) {
+        val refs = retainedBaseRefCountByWorld[worldKey]
+        val retained = if (refs == null || refs.isEmpty()) emptySet() else HashSet(refs.keys)
         val previous = retainedBaseChunksCacheByWorld[worldKey]
         if (previous == null || previous != retained) {
             FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, retained)
-            retainedBaseChunksCacheByWorld[worldKey] = retained
+            if (retained.isEmpty()) {
+                retainedBaseChunksCacheByWorld.remove(worldKey)
+            } else {
+                retainedBaseChunksCacheByWorld[worldKey] = retained
+            }
         }
-        retainedBaseChunksDirtyWorlds.remove(worldKey)
+    }
+
+    private fun refreshRetainedBaseChunksForSession(session: PlayerSession) {
+        val worldKey = session.worldKey
+        synchronized(session) {
+            val next = buildRetainedBaseChunkFootprint(session)
+            val previous = retainedBaseChunksByPlayerEntityId[session.entityId]
+            if (previous == next) {
+                return
+            }
+            if (previous != null) {
+                removeRetainedBaseFootprintRefs(worldKey, previous)
+            }
+            if (next.isEmpty()) {
+                retainedBaseChunksByPlayerEntityId.remove(session.entityId)
+                retainedBaseWorldKeyByPlayerEntityId.remove(session.entityId)
+            } else {
+                retainedBaseChunksByPlayerEntityId[session.entityId] = next
+                retainedBaseWorldKeyByPlayerEntityId[session.entityId] = worldKey
+                addRetainedBaseFootprintRefs(worldKey, next)
+            }
+        }
+        publishRetainedBaseChunksForWorld(worldKey)
+    }
+
+    private fun removeRetainedBaseChunksForSession(session: PlayerSession) {
+        val worldKey = session.worldKey
+        synchronized(session) {
+            val previous = retainedBaseChunksByPlayerEntityId.remove(session.entityId) ?: return
+            retainedBaseWorldKeyByPlayerEntityId.remove(session.entityId)
+            removeRetainedBaseFootprintRefs(worldKey, previous)
+        }
+        publishRetainedBaseChunksForWorld(worldKey)
     }
 
     private fun buildSimulationChunkFootprint(centerChunkX: Int, centerChunkZ: Int, radius: Int): Set<ChunkPos> {
@@ -3434,6 +3651,7 @@ private data class PlayerSimulationStamp(
 
         val maxSimulation = ServerConfig.maxSimulationDistanceChunks.coerceIn(2, 32)
         activeSimulationLastMaxDistanceChunks = maxSimulation
+        val changedWorldKeys = HashSet<String>()
 
         val activeWorldKeys = sessionsByWorld.keys
         val refWorldKeys = activeSimulationRefCountByWorld.keys.toList()
@@ -3441,13 +3659,13 @@ private data class PlayerSimulationStamp(
             if (worldKey in activeWorldKeys) continue
             activeSimulationRefCountByWorld.remove(worldKey)
             activeSimulationChunksCacheByWorld.remove(worldKey)
+            changedWorldKeys.add(worldKey)
         }
 
-        val activePlayerEntityIds = HashSet<Int>(sessionsByWorld.values.sumOf { it.size })
+        val connectedCount = sessionsByWorld.values.sumOf { it.size }
         for ((worldKey, worldSessions) in sessionsByWorld) {
             for (session in worldSessions) {
                 val entityId = session.entityId
-                activePlayerEntityIds.add(entityId)
                 val simulationRadius = session.chunkRadius.coerceAtMost(maxSimulation)
                 val nextStamp = PlayerSimulationStamp(
                     worldKey = worldKey,
@@ -3463,6 +3681,7 @@ private data class PlayerSimulationStamp(
                     val previous = activeSimulationChunksByPlayerEntityId.remove(entityId)
                     if (previous != null) {
                         removeSimulationFootprintRefs(prevStamp.worldKey, previous)
+                        changedWorldKeys.add(prevStamp.worldKey)
                     }
                 }
                 val nextFootprint = buildSimulationChunkFootprint(
@@ -3473,20 +3692,32 @@ private data class PlayerSimulationStamp(
                 activeSimulationStampByPlayerEntityId[entityId] = nextStamp
                 activeSimulationChunksByPlayerEntityId[entityId] = nextFootprint
                 addSimulationFootprintRefs(worldKey, nextFootprint)
+                changedWorldKeys.add(worldKey)
             }
         }
 
-        val knownEntityIds = activeSimulationStampByPlayerEntityId.keys.toList()
-        for (entityId in knownEntityIds) {
-            if (entityId in activePlayerEntityIds) continue
-            val prevStamp = activeSimulationStampByPlayerEntityId.remove(entityId) ?: continue
-            val previous = activeSimulationChunksByPlayerEntityId.remove(entityId)
-            if (previous != null) {
-                removeSimulationFootprintRefs(prevStamp.worldKey, previous)
+        // Normal leave path already removes stamps/footprints eagerly.
+        // Keep this fallback cleanup only for mismatch cases to avoid per-tick full scans.
+        if (activeSimulationStampByPlayerEntityId.size > connectedCount) {
+            val activePlayerEntityIds = HashSet<Int>(connectedCount)
+            for (worldSessions in sessionsByWorld.values) {
+                for (session in worldSessions) {
+                    activePlayerEntityIds.add(session.entityId)
+                }
+            }
+            val knownEntityIds = activeSimulationStampByPlayerEntityId.keys.toList()
+            for (entityId in knownEntityIds) {
+                if (entityId in activePlayerEntityIds) continue
+                val prevStamp = activeSimulationStampByPlayerEntityId.remove(entityId) ?: continue
+                val previous = activeSimulationChunksByPlayerEntityId.remove(entityId)
+                if (previous != null) {
+                    removeSimulationFootprintRefs(prevStamp.worldKey, previous)
+                    changedWorldKeys.add(prevStamp.worldKey)
+                }
             }
         }
 
-        for (worldKey in activeWorldKeys) {
+        for (worldKey in changedWorldKeys) {
             val refs = activeSimulationRefCountByWorld[worldKey]
             if (refs == null || refs.isEmpty()) {
                 activeSimulationChunksCacheByWorld.remove(worldKey)
@@ -3496,21 +3727,15 @@ private data class PlayerSimulationStamp(
         }
     }
 
-    private fun markRetainedBaseChunksDirty(worldKey: String) {
-        retainedBaseChunksDirtyWorlds.add(worldKey)
-    }
-
-    private fun markWorldChunkCachesDirty(worldKey: String) {
-        markRetainedBaseChunksDirty(worldKey)
-    }
-
     private fun pruneRetainedBaseChunkCaches(activeWorldKeys: Set<String>) {
         if (activeWorldKeys.isEmpty()) {
             for (worldKey in retainedBaseChunksCacheByWorld.keys) {
                 FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, emptySet())
             }
             retainedBaseChunksCacheByWorld.clear()
-            retainedBaseChunksDirtyWorlds.clear()
+            retainedBaseRefCountByWorld.clear()
+            retainedBaseChunksByPlayerEntityId.clear()
+            retainedBaseWorldKeyByPlayerEntityId.clear()
             return
         }
         val retainKeys = retainedBaseChunksCacheByWorld.keys.toList()
@@ -3518,7 +3743,19 @@ private data class PlayerSimulationStamp(
             if (worldKey in activeWorldKeys) continue
             FoliaSharedMemoryWorldGenerator.retainLoadedChunks(worldKey, emptySet())
             retainedBaseChunksCacheByWorld.remove(worldKey)
-            retainedBaseChunksDirtyWorlds.remove(worldKey)
+            retainedBaseRefCountByWorld.remove(worldKey)
+        }
+        val refKeys = retainedBaseRefCountByWorld.keys.toList()
+        for (worldKey in refKeys) {
+            if (worldKey in activeWorldKeys) continue
+            retainedBaseRefCountByWorld.remove(worldKey)
+        }
+        val playerKeys = retainedBaseWorldKeyByPlayerEntityId.keys.toList()
+        for (entityId in playerKeys) {
+            val worldKey = retainedBaseWorldKeyByPlayerEntityId[entityId] ?: continue
+            if (worldKey in activeWorldKeys) continue
+            retainedBaseWorldKeyByPlayerEntityId.remove(entityId)
+            retainedBaseChunksByPlayerEntityId.remove(entityId)
         }
     }
 
@@ -3604,6 +3841,9 @@ private data class PlayerSimulationStamp(
         session.velocityY = deltaY
         session.velocityZ = deltaZ
         session.lastHorizontalMovementSq = deltaX * deltaX + deltaZ * deltaZ
+        if (deltaX != 0.0 || deltaY != 0.0 || deltaZ != 0.0) {
+            animalSourceDirtyWorlds.add(session.worldKey)
+        }
         session.x = x
         session.y = y
         session.z = z
@@ -4284,6 +4524,7 @@ private data class PlayerSimulationStamp(
 
     private fun resetPlayerAttackStrengthTicker(session: PlayerSession) {
         session.attackStrengthTickerTicks = 0.0
+        attackCooldownActiveChannelIds.add(session.channelId)
     }
 
     private fun playerAttackStrengthDelayTicks(session: PlayerSession): Float {
@@ -4982,7 +5223,7 @@ private data class PlayerSimulationStamp(
         for (pos in toUnload) {
             ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
         }
-        updateRetainedBaseWorldChunksForWorld(session.worldKey)
+        refreshRetainedBaseChunksForSession(session)
     }
 
     fun respawnIfDead(channelId: ChannelId) {
@@ -5017,6 +5258,7 @@ private data class PlayerSimulationStamp(
         if (sneaking != null) session.sneaking = sneaking
         if (sprinting != null) session.sprinting = sprinting
         if (swimming != null) session.swimming = swimming
+        animalSourceDirtyWorlds.add(session.worldKey)
         session.clientEyeY = session.y + playerEyeOffset(session)
 
         val metadataPacket = PlayPackets.playerSharedFlagsMetadataPacket(
@@ -5108,9 +5350,10 @@ private data class PlayerSimulationStamp(
         val removed = sessions.remove(channelId) ?: return
         contexts.remove(channelId)
         channelFlushStates.remove(channelId)
+        attackCooldownActiveChannelIds.remove(channelId)
+        animalSourceDirtyWorlds.add(removed.worldKey)
         enderPearlCooldownEndNanosByPlayerEntityId.remove(removed.entityId)
         lastPushingChunkByPlayerEntityId.remove(removed.entityId)
-        markWorldChunkCachesDirty(removed.worldKey)
         val removedStamp = activeSimulationStampByPlayerEntityId.remove(removed.entityId)
         val removedFootprint = activeSimulationChunksByPlayerEntityId.remove(removed.entityId)
         if (removedStamp != null && removedFootprint != null) {
@@ -5122,7 +5365,7 @@ private data class PlayerSimulationStamp(
                 activeSimulationChunksCacheByWorld[removedStamp.worldKey] = HashSet(refs.keys)
             }
         }
-        updateRetainedBaseWorldChunksForWorld(removed.worldKey)
+        removeRetainedBaseChunksForSession(removed)
 
         val removeEntitiesPacket = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
         val removeInfoPacket = PlayPackets.playerInfoRemovePacket(listOf(removed.profile.uuid))
@@ -5171,13 +5414,18 @@ private data class PlayerSimulationStamp(
         channelFlushStates.clear()
         contexts.clear()
         sessions.clear()
+        animalSourceDirtyWorlds.clear()
+        animalRideControlsActiveWorlds.clear()
+        attackCooldownActiveChannelIds.clear()
         activeSimulationChunksCacheByWorld.clear()
         activeSimulationRefCountByWorld.clear()
         activeSimulationStampByPlayerEntityId.clear()
         activeSimulationChunksByPlayerEntityId.clear()
         activeSimulationLastMaxDistanceChunks = -1
         retainedBaseChunksCacheByWorld.clear()
-        retainedBaseChunksDirtyWorlds.clear()
+        retainedBaseRefCountByWorld.clear()
+        retainedBaseChunksByPlayerEntityId.clear()
+        retainedBaseWorldKeyByPlayerEntityId.clear()
         saddledAnimalEntityIds.clear()
         animalRiderEntityIdByAnimalEntityId.clear()
         animalEntityIdByRiderEntityId.clear()
@@ -5793,8 +6041,15 @@ private data class PlayerSimulationStamp(
     }
 
     private fun maybeSendChunkMsptActionBar(nowNanos: Long) {
+        val sweepAt = nextChunkMsptActionBarSweepAtNanos
+        if (sweepAt > 0L && nowNanos < sweepAt) return
+        var minNextDue = Long.MAX_VALUE
         for (session in sessions.values) {
-            if (nowNanos - session.lastChunkMsptActionBarAtNanos < CHUNK_MSPT_ACTION_BAR_INTERVAL_NANOS) continue
+            val dueAt = session.lastChunkMsptActionBarAtNanos + CHUNK_MSPT_ACTION_BAR_INTERVAL_NANOS
+            if (nowNanos < dueAt) {
+                if (dueAt < minNextDue) minNextDue = dueAt
+                continue
+            }
             val ctx = contexts[session.channelId] ?: continue
             if (!ctx.channel().isActive) continue
             val world = WorldManager.world(session.worldKey) ?: continue
@@ -5823,12 +6078,17 @@ private data class PlayerSimulationStamp(
                 overlay = true
             )
             session.lastChunkMsptActionBarAtNanos = nowNanos
+            val nextDue = nowNanos + CHUNK_MSPT_ACTION_BAR_INTERVAL_NANOS
+            if (nextDue < minNextDue) minNextDue = nextDue
             ctx.executor().execute {
                 if (ctx.channel().isActive) {
                     ctx.writeAndFlush(packet)
                 }
             }
         }
+        nextChunkMsptActionBarSweepAtNanos =
+            if (minNextDue == Long.MAX_VALUE) nowNanos + CHUNK_MSPT_ACTION_BAR_INTERVAL_NANOS
+            else minNextDue
     }
 
     private fun sendSystemComponent(session: PlayerSession, component: PlayPackets.ChatComponent) {
@@ -6098,6 +6358,7 @@ private data class PlayerSimulationStamp(
         val session = sessions[channelId] ?: return
         val clamped = slot.coerceIn(0, 8)
         session.selectedHotbarSlot = clamped
+        animalSourceDirtyWorlds.add(session.worldKey)
         session.selectedBlockStateId = if (session.hotbarItemCounts[clamped] > 0) {
             session.hotbarBlockStateIds[clamped]
         } else {
@@ -9217,7 +9478,7 @@ private data class PlayerSimulationStamp(
             if (!canPlayerPickDroppedItem(collector, snapshot)) continue
             if (!canAbsorbDroppedItem(collector, snapshot.itemId, snapshot.itemCount)) continue
 
-            val removedSnapshot = world.removeDroppedItem(snapshot.entityId) ?: continue
+            val removedSnapshot = world.removeDroppedItemIfUuidMatches(snapshot.entityId, snapshot.uuid) ?: continue
             if (!absorbDroppedItemIntoHotbar(
                     session = collector,
                     itemId = removedSnapshot.itemId,
@@ -13204,7 +13465,7 @@ private data class PlayerSimulationStamp(
             }
             session.targetChunks.clear()
             session.targetChunks.addAll(targetKeys)
-            updateRetainedBaseWorldChunksForWorld(session.worldKey)
+            refreshRetainedBaseChunksForSession(session)
             val toLoad = toLoadAll
 
             val shouldSendCurrentTarget = {
@@ -13243,7 +13504,7 @@ private data class PlayerSimulationStamp(
                                 session.loadedChunks.remove(pos)
                                 ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
                             }
-                            updateRetainedBaseWorldChunksForWorld(session.worldKey)
+                            refreshRetainedBaseChunksForSession(session)
                             ctx.writeAndFlush(PlayPackets.chunkBatchFinishedPacket(totalSentCount))
                             drain()
                         }

@@ -194,6 +194,22 @@ class DroppedItemSystem(
         return removed
     }
 
+    fun removeIfUuidMatches(entityId: Int, expectedUuid: UUID): DroppedItemSnapshot? {
+        var removed: DroppedItemSnapshot? = null
+        snapshots.compute(entityId) { _, current ->
+            if (current != null && current.uuid == expectedUuid) {
+                removed = current
+                null
+            } else {
+                current
+            }
+        }
+        val removedSnapshot = removed ?: return null
+        removeFromChunkIndex(removedSnapshot.chunkPos, entityId)
+        dirtyChunksByLane[laneFor(removedSnapshot.chunkPos.x, removedSnapshot.chunkPos.z)].add(removedSnapshot.chunkPos)
+        return removedSnapshot
+    }
+
     fun hasEntities(): Boolean {
         return snapshots.isNotEmpty()
     }

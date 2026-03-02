@@ -390,6 +390,10 @@ class World(
         return droppedItemSystem.remove(entityId)
     }
 
+    fun removeDroppedItemIfUuidMatches(entityId: Int, expectedUuid: UUID): DroppedItemSnapshot? {
+        return droppedItemSystem.removeIfUuidMatches(entityId, expectedUuid)
+    }
+
     fun droppedItemsInChunk(chunkX: Int, chunkZ: Int): List<DroppedItemSnapshot> {
         return droppedItemSystem.snapshotsInChunk(chunkX, chunkZ)
     }
@@ -514,6 +518,21 @@ class World(
         activeSimulationChunks: Set<ChunkPos>? = null,
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): ThrownItemTickEvents {
+        if (!thrownItemSystem.hasEntities()) {
+            thrownItemLastTickNanos.clear()
+            return thrownItemSystem.tick(
+                deltaSeconds = deltaSeconds,
+                activeSimulationChunks = activeSimulationChunks,
+                chunkDeltaSecondsProvider = { chunkPos ->
+                    consumeChunkElapsedDeltaSeconds(
+                        chunkPos = chunkPos,
+                        fallbackSeconds = deltaSeconds,
+                        lastTickMap = thrownItemLastTickNanos
+                    )
+                },
+                chunkTimeRecorder = chunkTimeRecorder
+            )
+        }
         if (activeSimulationChunks != null) {
             val activeEntityChunks = HashSet<ChunkPos>()
             for (chunkPos in activeSimulationChunks) {
@@ -582,6 +601,21 @@ class World(
         activeSimulationChunks: Set<ChunkPos>? = null,
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): FallingBlockTickEvents {
+        if (!fallingBlockSystem.hasEntities()) {
+            fallingBlockLastTickNanos.clear()
+            return fallingBlockSystem.tick(
+                deltaSeconds = deltaSeconds,
+                activeSimulationChunks = activeSimulationChunks,
+                chunkDeltaSecondsProvider = { chunkPos ->
+                    consumeChunkElapsedDeltaSeconds(
+                        chunkPos = chunkPos,
+                        fallbackSeconds = deltaSeconds,
+                        lastTickMap = fallingBlockLastTickNanos
+                    )
+                },
+                chunkTimeRecorder = chunkTimeRecorder
+            )
+        }
         if (activeSimulationChunks != null) {
             val activeEntityChunks = HashSet<ChunkPos>()
             for (chunkPos in activeSimulationChunks) {
@@ -614,6 +648,24 @@ class World(
         onDispatchComplete: (() -> Unit)? = null,
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): DroppedItemTickEvents {
+        if (!droppedItemSystem.hasEntities()) {
+            droppedItemLastTickNanos.clear()
+            return droppedItemSystem.tickOnChunkActors(
+                deltaSeconds = deltaSeconds,
+                activeSimulationChunks = activeSimulationChunks,
+                submitChunkTask = { chunkPos, task -> chunkActorScheduler.submit(chunkPos, task) },
+                chunkDeltaSecondsProvider = { chunkPos ->
+                    consumeChunkElapsedDeltaSeconds(
+                        chunkPos = chunkPos,
+                        fallbackSeconds = deltaSeconds,
+                        lastTickMap = droppedItemLastTickNanos
+                    )
+                },
+                onChunkEvents = onChunkEvents,
+                onDispatchComplete = onDispatchComplete,
+                chunkTimeRecorder = chunkTimeRecorder
+            )
+        }
         if (activeSimulationChunks != null) {
             val activeEntityChunks = HashSet<ChunkPos>()
             for (chunkPos in activeSimulationChunks) {

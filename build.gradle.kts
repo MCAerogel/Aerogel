@@ -24,6 +24,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
     implementation("com.google.code.gson:gson:2.11.0")
     implementation("org.jline:jline:3.26.3")
+    implementation("com.formdev:flatlaf:3.4.1")
     implementation("org.slf4j:slf4j-api:2.0.16")
     implementation("org.recast4j:recast:1.5.11")
     implementation("org.recast4j:detour:1.5.11")

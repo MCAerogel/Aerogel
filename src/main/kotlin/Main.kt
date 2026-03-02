@@ -36,6 +36,7 @@ import org.macaroon3145.network.transcoder.MinecraftVarIntFrameDecoder
 import org.macaroon3145.network.transcoder.MinecraftVarIntFrameEncoder
 import org.macaroon3145.perf.GameLoop
 import org.macaroon3145.perf.PerformanceMonitor
+import org.macaroon3145.ui.ServerDashboard
 import org.macaroon3145.world.DroppedItemSystem
 import org.macaroon3145.world.BlockCollisionRegistry
 import org.macaroon3145.world.EntityHitboxRegistry
@@ -109,6 +110,9 @@ fun main() {
     ServerConfig.maxTps = props.getProperty("max-tps")?.toDoubleOrNull()
         ?.takeIf { it == -1.0 || it > 0.0 }
         ?: 20.0
+    ServerConfig.maxPlayers = props.getProperty("max-players")?.toIntOrNull()
+        ?.coerceAtLeast(1)
+        ?: 20
     ServerConfig.timeScale = (
         props.getProperty("time-scale")
             ?: props.getProperty("dropped-item-physics-time-scale")
@@ -185,6 +189,7 @@ fun main() {
         ServerI18n.style("${ServerI18n.tr("aerogel.unit.seconds.short")})", ServerI18n.Color.GREEN)
     )
     startConsoleCommandLoop()
+    ServerDashboard.start()
     PerformanceMonitor.start()
     GameLoop.start()
 }
