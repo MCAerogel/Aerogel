@@ -1,0 +1,13 @@
+{
+  "values": [
+    "#minecraft:replaceable",
+    "#minecraft:flowers",
+    "#minecraft:small_flowers",
+    "#minecraft:crops",
+    "#minecraft:bee_growables",
+    "#minecraft:air",
+    "#minecraft:fire",
+    "#minecraft:cave_vines",
+    "#minecraft:climbable"
+  ]
+}

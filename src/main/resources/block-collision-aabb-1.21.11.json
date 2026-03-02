@@ -1,0 +1,42 @@
+{
+  "version": "1.21.11",
+  "resolverByBlockKey": {
+    "minecraft:snow": "snow",
+    "minecraft:moss_carpet": "carpet",
+    "minecraft:chain": "chain",
+    "minecraft:end_rod": "end_rod",
+    "minecraft:farmland": "partial_15_16",
+    "minecraft:dirt_path": "partial_15_16",
+    "minecraft:grass_path": "partial_15_16",
+    "minecraft:enchanting_table": "enchanting_table",
+    "minecraft:daylight_detector": "daylight_detector",
+    "minecraft:hopper": "hopper",
+    "minecraft:brewing_stand": "brewing_stand",
+    "minecraft:cauldron": "cauldron",
+    "minecraft:water_cauldron": "cauldron",
+    "minecraft:lava_cauldron": "cauldron",
+    "minecraft:powder_snow_cauldron": "cauldron",
+    "minecraft:lightning_rod": "lightning_rod",
+    "minecraft:cocoa": "cocoa",
+    "minecraft:cake": "cake",
+    "minecraft:candle_cake": "cake"
+  },
+  "resolverBySuffix": {
+    "_slab": "slab",
+    "_stairs": "stairs",
+    "_carpet": "carpet",
+    "_fence_gate": "fence_gate",
+    "_fence": "fence",
+    "_wall": "wall",
+    "_pane": "pane",
+    "_trapdoor": "trapdoor",
+    "_door": "door",
+    "_pressure_plate": "pressure_plate",
+    "_button": "button",
+    "_bed": "bed",
+    "_anvil": "anvil",
+    "_candle": "candle",
+    "_amethyst_bud": "amethyst_bud",
+    "_amethyst_cluster": "amethyst_cluster"
+  }
+}

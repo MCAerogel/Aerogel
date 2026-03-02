@@ -25,14 +25,21 @@ import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.handler.HandshakeHandler
 import org.macaroon3145.network.handler.ChunkStreamingService
+import org.macaroon3145.network.handler.PlayPackets
 import org.macaroon3145.network.handler.PlayerSessionManager
 import org.macaroon3145.network.codec.BlockStateRegistry
+import org.macaroon3145.network.codec.BlockEntityTypeRegistry
 import org.macaroon3145.network.codec.ItemBlockStateRegistry
 import org.macaroon3145.network.codec.RegistryCodec
+import org.macaroon3145.network.command.EntitySelectorCompletions
 import org.macaroon3145.network.transcoder.MinecraftVarIntFrameDecoder
 import org.macaroon3145.network.transcoder.MinecraftVarIntFrameEncoder
 import org.macaroon3145.perf.GameLoop
 import org.macaroon3145.perf.PerformanceMonitor
+import org.macaroon3145.world.DroppedItemSystem
+import org.macaroon3145.world.BlockCollisionRegistry
+import org.macaroon3145.world.EntityHitboxRegistry
+import org.macaroon3145.world.World
 import org.macaroon3145.world.WorldManager
 import org.macaroon3145.world.VanillaMiningRules
 import java.nio.file.Files
@@ -44,6 +51,7 @@ import java.io.OutputStream
 import java.io.PrintStream
 import java.nio.charset.StandardCharsets
 import java.util.Properties
+import java.util.concurrent.Executors
 import java.util.logging.Formatter
 import java.util.logging.LogManager
 import java.util.logging.LogRecord
@@ -162,6 +170,12 @@ fun main() {
     serverChannel?.let {
         ServerLifecycle.registerNetworking(it, eventLoops.bossGroup, eventLoops.workerGroup)
     }
+    Runtime.getRuntime().addShutdownHook(
+        Thread(
+            { ServerLifecycle.stopServerForShutdownHook() },
+            "aerogel-shutdown-hook"
+        )
+    )
     val elapsedNanos = (System.nanoTime() - mainStartNanos) - StartupTiming.interactiveInputNanos()
     val elapsedMillis = elapsedNanos.coerceAtLeast(0L) / 1_000_000.0
     ServerI18n.logCustom(
@@ -176,10 +190,40 @@ fun main() {
 }
 
 private fun warmupPickBlockLookups() {
-    runCatching { ItemBlockStateRegistry.prewarm() }
-    runCatching { BlockStateRegistry.prewarm() }
-    runCatching { RegistryCodec.prewarm() }
-    runCatching { VanillaMiningRules.prewarm() }
+    runCatching {
+        DebugConsole.withSpinner(
+            progressMessage = ServerI18n.tr("aerogel.log.cache.preparing"),
+            doneMessage = ServerI18n.tr("aerogel.log.cache.prepared")
+        ) {
+            val tasks = listOf<() -> Unit>(
+                { ItemBlockStateRegistry.prewarm() },
+                { BlockStateRegistry.prewarm() },
+                { BlockEntityTypeRegistry.prewarm() },
+                { RegistryCodec.prewarm() },
+                { VanillaMiningRules.prewarm() },
+                { EntitySelectorCompletions.prewarm() },
+                { PlayPackets.prewarm() },
+                { World.prewarm() },
+                { DroppedItemSystem.prewarm() },
+                { BlockCollisionRegistry.prewarm() },
+                { EntityHitboxRegistry.prewarm() },
+                { PlayerSessionManager.prewarm() },
+                { PlayerSessionManager.prewarmFluidDependentDropCache() },
+                { PlayerSessionManager.prewarmFluidDependentRuntime() }
+            )
+            Executors.newVirtualThreadPerTaskExecutor().use { executor ->
+                val futures = tasks.map { task ->
+                    executor.submit<Unit> {
+                        runCatching { task() }
+                        Unit
+                    }
+                }
+                for (future in futures) {
+                    runCatching { future.get() }
+                }
+            }
+        }
+    }
 }
 
 private fun resolveWorldSeeds(props: Properties): LinkedHashMap<String, Long> {
@@ -254,29 +298,26 @@ private fun createFilteredPrintStream(
     suppress: (String) -> Boolean
 ): PrintStream {
     val filtered = object : OutputStream() {
-        private val lock = Any()
-        private val buffer = ByteArrayOutputStream(256)
+        private val localBuffer = ThreadLocal.withInitial { ByteArrayOutputStream(256) }
 
         override fun write(b: Int) {
-            synchronized(lock) {
-                if (b == '\n'.code) {
-                    flushLine()
-                } else if (b != '\r'.code) {
-                    buffer.write(b)
-                }
+            val buffer = localBuffer.get()
+            if (b == '\n'.code) {
+                flushLine(buffer)
+            } else if (b != '\r'.code) {
+                buffer.write(b)
             }
         }
 
         override fun flush() {
-            synchronized(lock) {
-                if (buffer.size() > 0) {
-                    flushLine()
-                }
-                original.flush()
+            val buffer = localBuffer.get()
+            if (buffer.size() > 0) {
+                flushLine(buffer)
             }
+            original.flush()
         }
 
-        private fun flushLine() {
+        private fun flushLine(buffer: ByteArrayOutputStream) {
             val line = buffer.toString(StandardCharsets.UTF_8)
             buffer.reset()
             if (suppress(line)) return

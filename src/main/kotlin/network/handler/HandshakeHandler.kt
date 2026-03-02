@@ -21,4 +21,8 @@ class HandshakeHandler : SimpleChannelInboundHandler<ByteBuf>() {
             2 -> ctx.pipeline().replace(this, "loginHandler", LoginHandler(handshake.protocolVersion))
         }
     }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        ctx.close()
+    }
 }

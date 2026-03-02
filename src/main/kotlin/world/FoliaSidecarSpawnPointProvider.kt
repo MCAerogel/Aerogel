@@ -7,7 +7,6 @@ import java.util.concurrent.ConcurrentHashMap
 
 object FoliaSidecarSpawnPointProvider {
     private val snapshotPath: Path = Path.of(".aerogel-cache/folia/runtime/ipc/world-spawns.tsv")
-    private val lock = Any()
     @Volatile private var lastLoadedMtime: Long = Long.MIN_VALUE
     @Volatile private var cached: Map<String, SpawnPoint> = emptyMap()
 
@@ -19,10 +18,8 @@ object FoliaSidecarSpawnPointProvider {
     private fun refreshIfNeeded() {
         if (!Files.isRegularFile(snapshotPath)) {
             if (cached.isNotEmpty()) {
-                synchronized(lock) {
-                    cached = emptyMap()
-                    lastLoadedMtime = Long.MIN_VALUE
-                }
+                cached = emptyMap()
+                lastLoadedMtime = Long.MIN_VALUE
             }
             return
         }
@@ -30,12 +27,10 @@ object FoliaSidecarSpawnPointProvider {
         val mtime = runCatching { Files.getLastModifiedTime(snapshotPath).toMillis() }.getOrNull() ?: return
         if (mtime == lastLoadedMtime) return
 
-        synchronized(lock) {
-            val currentMtime = runCatching { Files.getLastModifiedTime(snapshotPath).toMillis() }.getOrNull() ?: return
-            if (currentMtime == lastLoadedMtime) return
-            cached = loadSnapshot(snapshotPath)
-            lastLoadedMtime = currentMtime
-        }
+        val currentMtime = runCatching { Files.getLastModifiedTime(snapshotPath).toMillis() }.getOrNull() ?: return
+        if (currentMtime == lastLoadedMtime) return
+        cached = loadSnapshot(snapshotPath)
+        lastLoadedMtime = currentMtime
     }
 
     private fun loadSnapshot(path: Path): Map<String, SpawnPoint> {

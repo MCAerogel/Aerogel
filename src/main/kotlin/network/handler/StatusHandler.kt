@@ -50,4 +50,8 @@ class StatusHandler(private val protocolVersion: Int) : SimpleChannelInboundHand
         DataOutputStream(packet).writeLong(payload)
         ctx.writeAndFlush(packet.toByteArray())
     }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        ctx.close()
+    }
 }

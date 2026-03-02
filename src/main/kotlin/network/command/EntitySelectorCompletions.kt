@@ -32,6 +32,10 @@ object EntitySelectorCompletions {
         }
     }
 
+    fun prewarm() {
+        entityTypeValues.size
+    }
+
     fun suggest(prefix: String): List<String> {
         if (prefix.isEmpty()) return baseSelectors
         if (!prefix.startsWith("@")) return emptyList()

@@ -1,0 +1,37 @@
+{
+  "items": {
+    "minecraft:lava_bucket": 1000.0,
+    "minecraft:coal_block": 800.0,
+    "minecraft:blaze_rod": 120.0,
+    "minecraft:coal": 80.0,
+    "minecraft:charcoal": 80.0,
+    "minecraft:dried_kelp_block": 20.05,
+    "minecraft:bamboo_mosaic": 15.0,
+    "minecraft:crossbow": 15.0,
+    "minecraft:fishing_rod": 15.0,
+    "minecraft:ladder": 15.0,
+    "minecraft:bow": 15.0,
+    "minecraft:bowl": 5.0,
+    "minecraft:stick": 5.0,
+    "minecraft:bamboo": 2.5,
+    "minecraft:dead_bush": 5.0,
+    "minecraft:scaffolding": 10.0
+  },
+  "tags": {
+    "minecraft:logs": 15.0,
+    "minecraft:bamboo_blocks": 15.0,
+    "minecraft:planks": 15.0,
+    "minecraft:wooden_slabs": 7.5,
+    "minecraft:wooden_stairs": 15.0,
+    "minecraft:wooden_buttons": 5.0,
+    "minecraft:wooden_pressure_plates": 15.0,
+    "minecraft:wooden_trapdoors": 15.0,
+    "minecraft:doors": 10.0,
+    "minecraft:signs": 10.0,
+    "minecraft:hanging_signs": 15.0,
+    "minecraft:boats": 60.0,
+    "minecraft:wool": 5.0,
+    "minecraft:wool_carpets": 3.35
+  }
+}
+

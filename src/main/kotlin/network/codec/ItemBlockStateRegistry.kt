@@ -13,7 +13,6 @@ object ItemBlockStateRegistry {
         val resource = ItemBlockStateRegistry::class.java.classLoader
             .getResourceAsStream("item-to-blockstate-1.21.11.json")
             ?: error("Missing item-to-blockstate-1.21.11.json resource")
-
         val root = resource.bufferedReader().use { json.parseToJsonElement(it.readText()) }.jsonObject
         val entries = root["entries"]?.jsonObject ?: return@lazy emptyMap()
         val map = HashMap<Int, Int>(entries.size)

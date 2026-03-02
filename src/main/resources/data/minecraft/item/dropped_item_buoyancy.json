@@ -1,0 +1,11 @@
+{
+  "defaults": {
+    "buoyancy_per_tick": 0.0005,
+    "buoyancy_velocity_cap": 0.06,
+    "sink_per_tick": 0.0,
+    "horizontal_drag": 0.99,
+    "vertical_drag": 1.0
+  },
+  "items": {
+  }
+}

@@ -18,6 +18,10 @@ interface BlockStateLookupWorldGenerator {
     fun blockStateAt(worldKey: String, x: Int, y: Int, z: Int): Int
 
     fun blockStateAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? = null
+
+    fun rawBrightnessAt(worldKey: String, x: Int, y: Int, z: Int): Int = 0
+
+    fun rawBrightnessAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? = null
 }
 
 fun interface ChunkEntityProcessor {

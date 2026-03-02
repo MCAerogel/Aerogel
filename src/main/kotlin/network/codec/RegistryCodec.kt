@@ -16,7 +16,6 @@ object RegistryCodec {
         val resource = RegistryCodec::class.java.classLoader
             .getResourceAsStream("registry-codec-1.21.11.json")
             ?: error("Missing registry-codec-1.21.11.json resource")
-
         val root = resource.bufferedReader().use { json.parseToJsonElement(it.readText()) }.jsonObject
         root.entries.map { (registryId, registryBodyElement) ->
             val entries = registryBodyElement.jsonObject["entries"]!!.jsonArray.map { entryElement ->

@@ -37,28 +37,47 @@ object ServerLifecycle {
         }
 
         Thread({
-            DebugConsole.withSpinner(
-                progressMessage = ServerI18n.tr("aerogel.log.stop.progress"),
-                doneMessage = ServerI18n.tr("aerogel.log.stop.done")
-            ) {
-                GameLoop.stop()
-                PlayerSessionManager.shutdown()
-                runCatching { serverChannel?.close()?.syncUninterruptibly() }
-                val bossShutdown = runCatching {
-                    bossGroup?.shutdownGracefully(0L, 1L, TimeUnit.SECONDS)
-                }.getOrNull()
-                val workerShutdown = runCatching {
-                    workerGroup?.shutdownGracefully(0L, 1L, TimeUnit.SECONDS)
-                }.getOrNull()
-                runCatching { bossShutdown?.syncUninterruptibly() }
-                runCatching { workerShutdown?.syncUninterruptibly() }
-                runCatching { stopFoliaRuntime() }
-            }
+            runShutdownSequence(showSpinner = true)
             exitProcess(0)
         }, "aerogel-stop-sequence").apply {
             isDaemon = false
             start()
         }
         return true
+    }
+
+    fun stopServerForShutdownHook() {
+        if (!stopping.compareAndSet(false, true)) {
+            return
+        }
+        runShutdownSequence(showSpinner = false)
+    }
+
+    private fun runShutdownSequence(showSpinner: Boolean) {
+        val shutdownBody = {
+            GameLoop.stop()
+            PlayerSessionManager.shutdown()
+            runCatching { serverChannel?.close()?.syncUninterruptibly() }
+            val bossShutdown = runCatching {
+                bossGroup?.shutdownGracefully(0L, 1L, TimeUnit.SECONDS)
+            }.getOrNull()
+            val workerShutdown = runCatching {
+                workerGroup?.shutdownGracefully(0L, 1L, TimeUnit.SECONDS)
+            }.getOrNull()
+            runCatching { bossShutdown?.syncUninterruptibly() }
+            runCatching { workerShutdown?.syncUninterruptibly() }
+            runCatching { stopFoliaRuntime() }
+        }
+
+        if (showSpinner) {
+            DebugConsole.withSpinner(
+                progressMessage = ServerI18n.tr("aerogel.log.stop.progress"),
+                doneMessage = ServerI18n.tr("aerogel.log.stop.done")
+            ) {
+                shutdownBody()
+            }
+        } else {
+            shutdownBody()
+        }
     }
 }

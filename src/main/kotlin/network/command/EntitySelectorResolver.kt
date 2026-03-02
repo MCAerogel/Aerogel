@@ -80,12 +80,12 @@ object EntitySelectorResolver {
         val resolved = when (state) {
             is ResolveState.Success -> state.players
             is ResolveState.Error -> {
-                context.sendSourceTranslation(sender, state.translationKey)
+                context.sendSourceErrorTranslation(sender, state.translationKey)
                 return null
             }
         }
         if (single && resolved.size > 1) {
-            context.sendSourceTranslation(sender, "argument.entity.toomany")
+            context.sendSourceErrorTranslation(sender, "argument.entity.toomany")
             return null
         }
         return resolved

@@ -3,6 +3,7 @@ package org.macaroon3145.network.handler
 import io.netty.buffer.Unpooled
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelId
+import io.netty.channel.ChannelFuture
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
@@ -20,12 +21,27 @@ import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.network.codec.BlockEntityTypeRegistry
 import org.macaroon3145.network.codec.ItemBlockStateRegistry
 import org.macaroon3145.network.codec.RegistryCodec
+import org.macaroon3145.network.item.FurnaceFuelCache
+import org.macaroon3145.network.item.FoodItemCache
+import org.macaroon3145.network.recipe.CraftingRecipeCache
+import org.macaroon3145.network.recipe.SmeltingRecipeCache
 import org.macaroon3145.network.packet.PlayerSample
 import org.macaroon3145.world.BlockPos
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.DroppedItemSnapshot
 import org.macaroon3145.world.FallingBlockSnapshot
 import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
+import org.macaroon3145.world.AnimalDamageCause
+import org.macaroon3145.world.AnimalKind
+import org.macaroon3145.world.AnimalRideControl
+import org.macaroon3145.world.EntityLootDropCache
+import org.macaroon3145.world.AnimalSnapshot
+import org.macaroon3145.world.AnimalTemptSource
+import org.macaroon3145.world.AnimalLookSource
+import org.macaroon3145.world.BlockCollisionRegistry
+import org.macaroon3145.world.EntityHitboxRegistry
+import org.macaroon3145.world.ThrownItemKind
+import org.macaroon3145.world.ThrownItemSnapshot
 import org.macaroon3145.world.VanillaMiningRules
 import org.macaroon3145.world.WorldManager
 import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
@@ -38,17 +54,23 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.DoubleAdder
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.min
+import kotlin.math.max
 import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.math.roundToLong
 import org.slf4j.LoggerFactory
 
@@ -61,7 +83,9 @@ data class DroppedItemTrackerState(
     var lastVz: Double,
     var lastOnGround: Boolean,
     var secondsSinceHardSync: Double,
-    var relativeMoveAccumulatorSeconds: Double
+    var lastYaw: Float = 0f,
+    var lastPitch: Float = 0f,
+    var lastHeadYaw: Float = 0f
 )
 
 data class PlayerSession(
@@ -75,6 +99,9 @@ data class PlayerSession(
     @Volatile var x: Double,
     @Volatile var y: Double,
     @Volatile var z: Double,
+    @Volatile var clientEyeX: Double,
+    @Volatile var clientEyeY: Double,
+    @Volatile var clientEyeZ: Double,
     @Volatile var velocityX: Double,
     @Volatile var velocityY: Double,
     @Volatile var velocityZ: Double,
@@ -88,11 +115,26 @@ data class PlayerSession(
     @Volatile var health: Float,
     @Volatile var food: Int,
     @Volatile var saturation: Float,
+    @Volatile var foodExhaustion: Float,
+    @Volatile var regenAccumulatorSeconds: Double,
+    @Volatile var usingItemHand: Int,
+    @Volatile var usingItemId: Int,
+    @Volatile var usingItemRemainingSeconds: Double,
+    @Volatile var usingItemSoundKey: String?,
+    @Volatile var usingItemSoundDelaySeconds: Double,
     @Volatile var fallDistance: Double,
+    @Volatile var attackStrengthTickerTicks: Double,
+    @Volatile var hurtInvulnerableSeconds: Double,
+    @Volatile var lastHurtAmount: Float,
     @Volatile var dead: Boolean,
     @Volatile var sneaking: Boolean,
     @Volatile var sprinting: Boolean,
     @Volatile var swimming: Boolean,
+    @Volatile var inputForward: Boolean,
+    @Volatile var inputBackward: Boolean,
+    @Volatile var inputLeft: Boolean,
+    @Volatile var inputRight: Boolean,
+    @Volatile var inputJump: Boolean,
     @Volatile var selectedBlockStateId: Int,
     @Volatile var selectedHotbarSlot: Int,
     @Volatile var pendingPickedBlockStateId: Int,
@@ -108,7 +150,24 @@ data class PlayerSession(
     val hotbarBlockEntityTypeIds: IntArray,
     val hotbarBlockEntityNbtPayloads: Array<ByteArray?>,
     @Volatile var inventoryStateId: Int,
+    @Volatile var openContainerId: Int,
+    @Volatile var openContainerType: Int,
+    @Volatile var openFurnaceX: Int,
+    @Volatile var openFurnaceY: Int,
+    @Volatile var openFurnaceZ: Int,
+    @Volatile var nextContainerId: Int,
+    @Volatile var cursorItemId: Int,
+    @Volatile var cursorItemCount: Int,
+    @Volatile var quickCraftActive: Boolean,
+    @Volatile var quickCraftContainerId: Int,
+    @Volatile var quickCraftMouseButton: Int,
+    val quickCraftSlots: MutableSet<Int>,
+    val playerCraftItemIds: IntArray,
+    val playerCraftItemCounts: IntArray,
+    val tableCraftItemIds: IntArray,
+    val tableCraftItemCounts: IntArray,
     @Volatile var gameMode: Int,
+    @Volatile var flying: Boolean,
     @Volatile var requestedViewDistance: Int,
     @Volatile var chunkRadius: Int,
     @Volatile var centerChunkX: Int,
@@ -119,12 +178,25 @@ data class PlayerSession(
     val droppedItemTrackerStates: MutableMap<Int, DroppedItemTrackerState>,
     val visibleFallingBlockEntityIds: MutableSet<Int>,
     val fallingBlockTrackerStates: MutableMap<Int, DroppedItemTrackerState>,
+    val visibleThrownItemEntityIds: MutableSet<Int>,
+    val thrownItemTrackerStates: MutableMap<Int, DroppedItemTrackerState>,
+    val visibleAnimalEntityIds: MutableSet<Int>,
+    val animalTrackerStates: MutableMap<Int, DroppedItemTrackerState>,
     val generatingChunks: MutableSet<ChunkPos>,
     val chunkStreamVersion: AtomicInteger,
     val nextTeleportId: AtomicInteger,
     val chunkStreamInFlight: AtomicBoolean,
     val pendingChunkTarget: AtomicReference<ChunkStreamTarget?>,
-    @Volatile var lastChunkMsptActionBarAtNanos: Long
+    @Volatile var lastChunkMsptActionBarAtNanos: Long,
+    @Volatile var ridingAnimalEntityId: Int
+    ,
+    @Volatile var lastClientVehicleX: Double,
+    @Volatile var lastClientVehicleY: Double,
+    @Volatile var lastClientVehicleZ: Double,
+    @Volatile var lastClientVehicleYaw: Float,
+    @Volatile var lastClientVehiclePitch: Float,
+    @Volatile var lastClientVehicleOnGround: Boolean,
+    @Volatile var lastClientVehiclePacketAtNanos: Long
 )
 
 data class ChunkStreamTarget(
@@ -140,6 +212,32 @@ private data class WorldTimeState(
     var broadcastAccumulatorSeconds: Double
 )
 
+private data class FurnaceKey(
+    val worldKey: String,
+    val x: Int,
+    val y: Int,
+    val z: Int
+)
+
+private data class WorldChunkKey(
+    val worldKey: String,
+    val chunkPos: ChunkPos
+)
+
+private data class FurnaceState(
+    var inputItemId: Int,
+    var inputCount: Int,
+    var fuelItemId: Int,
+    var fuelCount: Int,
+    var resultItemId: Int,
+    var resultCount: Int,
+    var burnRemainingSeconds: Double,
+    var burnTotalSeconds: Double,
+    var cookProgressSeconds: Double,
+    var cookTotalSeconds: Double,
+    var dirty: Boolean
+)
+
 data class CommandSuggestionWindow(
     val start: Int,
     val length: Int,
@@ -147,13 +245,57 @@ data class CommandSuggestionWindow(
 )
 
 object PlayerSessionManager {
+    private data class TickSimulationContext(
+        val sessionsByWorld: Map<String, List<PlayerSession>>,
+        val activeChunksByWorld: Map<String, Set<ChunkPos>>
+    )
+
+    private data class WorldPhysicsEvents(
+        val droppedItems: org.macaroon3145.world.DroppedItemTickEvents,
+        val fallingBlocks: org.macaroon3145.world.FallingBlockTickEvents,
+        val thrownItems: org.macaroon3145.world.ThrownItemTickEvents,
+        val animals: org.macaroon3145.world.AnimalTickEvents
+    )
+
+    private data class ChannelFlushState(
+        val scheduled: AtomicBoolean = AtomicBoolean(false),
+        val pendingPackets: ConcurrentLinkedQueue<ByteArray> = ConcurrentLinkedQueue()
+    )
+
+private data class PendingAnimalRemoval(
+    val worldKey: String,
+    val entityId: Int,
+    val dueAtNanos: Long
+)
+
+private data class PigBoostState(
+    var elapsedSeconds: Double,
+    var durationSeconds: Double
+)
+
     private val logger = LoggerFactory.getLogger(PlayerSessionManager::class.java)
     private val gamemodeCompletionCandidates = listOf("survival", "creative", "adventure", "spectator")
     private val nextEntityId = AtomicInteger(1)
     private val sessions = ConcurrentHashMap<ChannelId, PlayerSession>()
     private val contexts = ConcurrentHashMap<ChannelId, ChannelHandlerContext>()
+    private val channelFlushStates = ConcurrentHashMap<ChannelId, ChannelFlushState>()
+    private val pendingAnimalRemovals = ConcurrentLinkedQueue<PendingAnimalRemoval>()
+    private val pendingAnimalRemovalKeys = ConcurrentHashMap.newKeySet<String>()
+    private val saddledAnimalEntityIds = ConcurrentHashMap.newKeySet<Int>()
+    private val animalRiderEntityIdByAnimalEntityId = ConcurrentHashMap<Int, Int>()
+    private val animalEntityIdByRiderEntityId = ConcurrentHashMap<Int, Int>()
+    private val pigBoostStatesByAnimalEntityId = ConcurrentHashMap<Int, PigBoostState>()
     private val worldTimes = ConcurrentHashMap<String, WorldTimeState>()
-    private val droppedItemDispatchRunning = AtomicBoolean(false)
+    private val furnaceStates = ConcurrentHashMap<FurnaceKey, FurnaceState>()
+    private val activeFurnaceKeys = ConcurrentHashMap.newKeySet<FurnaceKey>()
+    private val activeFurnaceKeysByWorld = ConcurrentHashMap<String, MutableSet<FurnaceKey>>()
+    private val pendingFurnaceResyncKeys = ConcurrentLinkedQueue<FurnaceKey>()
+    private val pendingFurnaceResyncSet = ConcurrentHashMap.newKeySet<FurnaceKey>()
+    private val furnaceChunkLastTickNanos = ConcurrentHashMap<WorldChunkKey, Long>()
+    private val pushingChunkLastTickNanos = ConcurrentHashMap<WorldChunkKey, Long>()
+    private val furnaceChunkInFlight = ConcurrentHashMap<WorldChunkKey, AtomicBoolean>()
+    private val pushingChunkInFlight = ConcurrentHashMap<WorldChunkKey, AtomicBoolean>()
+    private val chunkProcessingTickSequence = java.util.concurrent.atomic.AtomicLong(0L)
     private val commandExecutor = Executors.newFixedThreadPool(2) { runnable ->
         Thread(runnable, "aerogel-command-worker").apply {
             isDaemon = true
@@ -161,9 +303,9 @@ object PlayerSessionManager {
         }
     }
     private val operatorFilePath: Path = Path.of("op.txt")
-    private val operatorFileLock = Any()
-    private val persistedOperatorUuids = ConcurrentHashMap.newKeySet<UUID>()
+        private val persistedOperatorUuids = ConcurrentHashMap.newKeySet<UUID>()
     private val operatorUuids = ConcurrentHashMap.newKeySet<java.util.UUID>()
+    private val fluidDependentDropCache = ConcurrentHashMap<Int, List<org.macaroon3145.world.VanillaDrop>>()
     private val commandDispatcher = CommandDispatcher.default()
     private val commandContext = object : CommandContext {
         override fun sendConsoleMessage(message: String) {
@@ -242,8 +384,6 @@ object PlayerSessionManager {
             PlayerSessionManager.addWorldTimeAndBroadcast(worldKey, deltaTicks)
         override fun stopServer(): Boolean = ServerLifecycle.stopServer()
     }
-    @Volatile
-    private var droppedItemDispatchThread: Thread? = null
     private val itemKeyById: List<String> by lazy {
         val resource = PlayerSessionManager::class.java.classLoader
             .getResourceAsStream("item-id-map-1.21.11.json")
@@ -260,11 +400,51 @@ object PlayerSessionManager {
         }
         out
     }
+    private val itemIdByKey: Map<String, Int> by lazy {
+        val out = HashMap<String, Int>(itemKeyById.size)
+        for ((id, key) in itemKeyById.withIndex()) {
+            if (key.isEmpty()) continue
+            out[key] = id
+        }
+        out
+    }
     private val creativeNoBreakItemIds: Set<Int> by lazy {
+        val fromSwordTag = loadItemTag("swords")
+            .mapNotNullTo(HashSet()) { itemIdByKey[it] }
+        if (fromSwordTag.isNotEmpty()) return@lazy fromSwordTag
+
+        // Fallback for environments where item tags are unavailable.
         val itemRegistry = RegistryCodec.allRegistries().firstOrNull { it.id == "minecraft:item" } ?: return@lazy emptySet()
-        itemRegistry.entries.withIndex()
-            .filter { (_, entry) -> entry.key.endsWith("_sword") }
-            .mapTo(HashSet()) { it.index }
+        itemRegistry.entries.asSequence()
+            .map { it.key }
+            .filter { it.endsWith("_sword") }
+            .mapNotNullTo(HashSet()) { key ->
+                itemIdByKey[key] ?: itemIdByKey["minecraft:$key"]
+            }
+    }
+    private val snowballItemId: Int by lazy { itemIdByKey["minecraft:snowball"] ?: -1 }
+    private val eggItemId: Int by lazy { itemIdByKey["minecraft:egg"] ?: -1 }
+    private val blueEggItemId: Int by lazy { itemIdByKey["minecraft:blue_egg"] ?: -1 }
+    private val brownEggItemId: Int by lazy { itemIdByKey["minecraft:brown_egg"] ?: -1 }
+    private val pigSpawnEggItemId: Int by lazy { itemIdByKey["minecraft:pig_spawn_egg"] ?: -1 }
+    private val saddleItemId: Int by lazy { itemIdByKey["minecraft:saddle"] ?: -1 }
+    private val carrotOnAStickItemId: Int by lazy { itemIdByKey["minecraft:carrot_on_a_stick"] ?: -1 }
+    private val pigFoodItemIds: Set<Int> by lazy {
+        loadItemTag("pig_food")
+            .mapNotNullTo(HashSet()) { itemIdByKey[it] }
+    }
+    private val waterBucketItemId: Int by lazy { itemIdByKey["minecraft:water_bucket"] ?: -1 }
+    private val emptyBucketItemId: Int by lazy { itemIdByKey["minecraft:bucket"] ?: -1 }
+    private val pigTemptItemIds: Set<Int> by lazy {
+        val tagged = loadItemTag("pig_food")
+            .mapNotNullTo(HashSet()) { itemIdByKey[it] }
+        itemIdByKey["minecraft:carrot_on_a_stick"]?.let { tagged.add(it) }
+        tagged
+    }
+    private val waterSourceStateId: Int by lazy {
+        BlockStateRegistry.stateId("minecraft:water", mapOf("level" to "0"))
+            ?: BlockStateRegistry.defaultStateId("minecraft:water")
+            ?: 0
     }
 
     private data class PickedBlockData(
@@ -276,6 +456,59 @@ object PlayerSessionManager {
 
     init {
         loadPersistedOperators()
+    }
+
+    fun prewarm() {
+        // Shift lazy lookups to startup.
+        itemKeyById.size
+        itemIdByKey.size
+        creativeNoBreakItemIds.size
+        waterBucketItemId
+        emptyBucketItemId
+        snowballItemId
+        eggItemId
+        blueEggItemId
+        brownEggItemId
+        pigSpawnEggItemId
+        pigTemptItemIds.size
+        waterSourceStateId
+        CraftingRecipeCache.prewarm(itemIdByKey)
+        SmeltingRecipeCache.prewarm(itemIdByKey)
+        FoodItemCache.prewarm(itemIdByKey)
+        FurnaceFuelCache.prewarm(itemIdByKey)
+        EntityLootDropCache.prewarm(itemIdByKey, AnimalKind.entries.map { it.entityTypeKey })
+        WATER_BUCKET_REPLACEABLE_BLOCK_KEYS.size
+        PLAYER_SMALL_FALL_SOUND_ID
+        PLAYER_BIG_FALL_SOUND_ID
+        PLAYER_HURT_SOUND_ID
+        PLAYER_ATTACK_STRONG_SOUND_ID
+        PLAYER_ATTACK_KNOCKBACK_SOUND_ID
+        PLAYER_ATTACK_CRIT_SOUND_ID
+        PLAYER_ATTACK_SWEEP_SOUND_ID
+        PLAYER_ATTACK_WEAK_SOUND_ID
+        SNOWBALL_THROW_SOUND_ID
+        EGG_THROW_SOUND_ID
+        FALL_DAMAGE_TYPE_ID
+        PLAYER_ATTACK_DAMAGE_TYPE_ID
+    }
+
+    fun prewarmFluidDependentDropCache() {
+        val world = runCatching { WorldManager.defaultWorld() }.getOrNull() ?: return
+        for (stateId in BlockStateRegistry.allStateIds()) {
+            if (stateId <= 0) continue
+            val drops = runCatching {
+                VanillaMiningRules.resolveDrops(world, stateId, -1, 0, 64, 0)
+            }.getOrDefault(emptyList())
+            fluidDependentDropCache.putIfAbsent(stateId, drops)
+        }
+    }
+
+    fun prewarmFluidDependentRuntime() {
+        val world = runCatching { WorldManager.defaultWorld() }.getOrNull() ?: return
+        val seed = BlockPos(0, 64, 0)
+        runCatching {
+            breakDependentBlocksForFluidByChunk(world, listOf(seed))
+        }
     }
 
     data class JoinResult(
@@ -326,6 +559,9 @@ object PlayerSessionManager {
             x = spawnX,
             y = spawnY,
             z = spawnZ,
+            clientEyeX = spawnX,
+            clientEyeY = spawnY,
+            clientEyeZ = spawnZ,
             velocityX = 0.0,
             velocityY = 0.0,
             velocityZ = 0.0,
@@ -339,11 +575,26 @@ object PlayerSessionManager {
             health = MAX_PLAYER_HEALTH,
             food = DEFAULT_PLAYER_FOOD,
             saturation = DEFAULT_PLAYER_SATURATION,
+            foodExhaustion = 0f,
+            regenAccumulatorSeconds = 0.0,
+            usingItemHand = -1,
+            usingItemId = -1,
+            usingItemRemainingSeconds = 0.0,
+            usingItemSoundKey = null,
+            usingItemSoundDelaySeconds = 0.0,
             fallDistance = 0.0,
+            attackStrengthTickerTicks = INITIAL_ATTACK_STRENGTH_TICKS,
+            hurtInvulnerableSeconds = 0.0,
+            lastHurtAmount = 0f,
             dead = false,
             sneaking = false,
             sprinting = false,
             swimming = false,
+            inputForward = false,
+            inputBackward = false,
+            inputLeft = false,
+            inputRight = false,
+            inputJump = false,
             selectedBlockStateId = 0,
             selectedHotbarSlot = 0,
             pendingPickedBlockStateId = 0,
@@ -359,7 +610,24 @@ object PlayerSessionManager {
             hotbarBlockEntityTypeIds = IntArray(9) { -1 },
             hotbarBlockEntityNbtPayloads = arrayOfNulls(9),
             inventoryStateId = 0,
+            openContainerId = 0,
+            openContainerType = CONTAINER_TYPE_PLAYER_INVENTORY,
+            openFurnaceX = 0,
+            openFurnaceY = 0,
+            openFurnaceZ = 0,
+            nextContainerId = 1,
+            cursorItemId = -1,
+            cursorItemCount = 0,
+            quickCraftActive = false,
+            quickCraftContainerId = -1,
+            quickCraftMouseButton = 0,
+            quickCraftSlots = ConcurrentHashMap.newKeySet(),
+            playerCraftItemIds = IntArray(4) { -1 },
+            playerCraftItemCounts = IntArray(4) { 0 },
+            tableCraftItemIds = IntArray(9) { -1 },
+            tableCraftItemCounts = IntArray(9) { 0 },
             gameMode = ServerConfig.defaultGameMode.coerceIn(0, 3),
+            flying = false,
             requestedViewDistance = requestedViewDistance.coerceAtLeast(0),
             chunkRadius = effectiveRadius,
             centerChunkX = spawnChunkX,
@@ -370,12 +638,24 @@ object PlayerSessionManager {
             droppedItemTrackerStates = ConcurrentHashMap(),
             visibleFallingBlockEntityIds = ConcurrentHashMap.newKeySet(),
             fallingBlockTrackerStates = ConcurrentHashMap(),
+            visibleThrownItemEntityIds = ConcurrentHashMap.newKeySet(),
+            thrownItemTrackerStates = ConcurrentHashMap(),
+            visibleAnimalEntityIds = ConcurrentHashMap.newKeySet(),
+            animalTrackerStates = ConcurrentHashMap(),
             generatingChunks = ConcurrentHashMap.newKeySet(),
             chunkStreamVersion = AtomicInteger(0),
             nextTeleportId = AtomicInteger(2),
             chunkStreamInFlight = AtomicBoolean(false),
             pendingChunkTarget = AtomicReference(null),
-            lastChunkMsptActionBarAtNanos = 0L
+            lastChunkMsptActionBarAtNanos = 0L,
+            ridingAnimalEntityId = -1,
+            lastClientVehicleX = spawnX,
+            lastClientVehicleY = spawnY,
+            lastClientVehicleZ = spawnZ,
+            lastClientVehicleYaw = 0f,
+            lastClientVehiclePitch = 0f,
+            lastClientVehicleOnGround = true,
+            lastClientVehiclePacketAtNanos = 0L
         )
         if (persistedOperatorUuids.contains(session.profile.uuid)) {
             operatorUuids.add(profile.uuid)
@@ -384,7 +664,6 @@ object PlayerSessionManager {
         val existing = sessions.values.filter { it.worldKey == worldKey && it.channelId != session.channelId }
         sessions[session.channelId] = session
         contexts[session.channelId] = ctx
-        ensureDroppedItemDispatchLoop()
         return JoinResult(session, existing)
     }
 
@@ -475,8 +754,725 @@ object PlayerSessionManager {
 
     fun tick(deltaSeconds: Double) {
         if (deltaSeconds <= 0.0) return
+        val tickSequence = chunkProcessingTickSequence.incrementAndGet()
+        val gameplayDeltaSeconds = computePhysicsDeltaSeconds(deltaSeconds)
+        tickPlayerHurtInvulnerability(gameplayDeltaSeconds)
+        tickAttackStrengthCooldowns(gameplayDeltaSeconds)
+        tickUsingItems(gameplayDeltaSeconds)
+        tickNaturalRegeneration(deltaSeconds)
         advanceAndBroadcastWorldTime(deltaSeconds)
+        val simulationContext = buildTickSimulationContext()
+        val physicsDeltaSeconds = gameplayDeltaSeconds
+        if (simulationContext != null && physicsDeltaSeconds > 0.0) {
+            updateRetainedBaseWorldChunks(simulationContext.sessionsByWorld)
+            scheduleDroppedItemEvents(
+                tickSequence = tickSequence,
+                deltaSeconds = deltaSeconds,
+                physicsDeltaSeconds = physicsDeltaSeconds,
+                context = simulationContext
+            )
+            scheduleFluidEvents(
+                tickSequence = tickSequence,
+                physicsDeltaSeconds = physicsDeltaSeconds,
+                context = simulationContext
+            )
+            tickFurnaces(tickSequence, physicsDeltaSeconds, simulationContext)
+            scheduleEntityPushing(tickSequence, simulationContext, physicsDeltaSeconds)
+        }
+        flushPendingAnimalRemovals()
+        drainPendingFurnaceResyncs()
+        maybeSendChunkMsptActionBar(System.nanoTime())
     }
+
+    private fun tickAttackStrengthCooldowns(deltaSeconds: Double) {
+        if (!deltaSeconds.isFinite() || deltaSeconds <= 0.0) return
+        val tickDelta = deltaSeconds * MINECRAFT_TICKS_PER_SECOND
+        if (!tickDelta.isFinite() || tickDelta <= 0.0) return
+        for (session in sessions.values) {
+            val next = (session.attackStrengthTickerTicks + tickDelta).coerceAtMost(MAX_ATTACK_STRENGTH_TICKER)
+            session.attackStrengthTickerTicks = next
+        }
+    }
+
+    private fun tickPlayerHurtInvulnerability(deltaSeconds: Double) {
+        if (!deltaSeconds.isFinite() || deltaSeconds <= 0.0) return
+        for (session in sessions.values) {
+            if (session.hurtInvulnerableSeconds <= 0.0) continue
+            session.hurtInvulnerableSeconds = (session.hurtInvulnerableSeconds - deltaSeconds).coerceAtLeast(0.0)
+            if (session.hurtInvulnerableSeconds <= 0.0) {
+                session.lastHurtAmount = 0f
+            }
+        }
+    }
+
+    private fun computePhysicsDeltaSeconds(deltaSeconds: Double): Double {
+        val timeScale = ServerConfig.timeScale
+        if (timeScale <= 0.0) return 0.0
+        val scaled = deltaSeconds * timeScale
+        if (scaled.isNaN() || scaled.isInfinite()) return 0.0
+        return scaled.coerceAtLeast(0.0)
+    }
+
+    private fun tickUsingItems(deltaSeconds: Double) {
+        if (!deltaSeconds.isFinite() || deltaSeconds <= 0.0) return
+        for (session in sessions.values) {
+            if (session.usingItemRemainingSeconds <= 0.0) continue
+            if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) {
+                stopUsingItem(session)
+                continue
+            }
+            session.usingItemSoundDelaySeconds -= deltaSeconds
+            var soundLoops = 0
+            while (session.usingItemSoundDelaySeconds <= 0.0 &&
+                session.usingItemRemainingSeconds > 0.0 &&
+                soundLoops < MAX_ITEM_USE_SOUND_LOOPS_PER_TICK
+            ) {
+                val soundKey = session.usingItemSoundKey
+                if (!soundKey.isNullOrEmpty()) {
+                    broadcastFoodUseProgressSound(session, soundKey)
+                }
+                session.usingItemSoundDelaySeconds += FOOD_USE_SOUND_INTERVAL_SECONDS
+                soundLoops++
+            }
+            session.usingItemRemainingSeconds -= deltaSeconds
+            if (session.usingItemRemainingSeconds > 0.0) continue
+
+            val hand = session.usingItemHand
+            val expectedItemId = session.usingItemId
+            stopUsingItem(session)
+            if (hand !in 0..1 || expectedItemId < 0) continue
+            finishConsumingFoodItem(session, hand, expectedItemId)
+        }
+    }
+
+    private fun tickFurnaces(tickSequence: Long, deltaSeconds: Double, context: TickSimulationContext?) {
+        if (!deltaSeconds.isFinite() || deltaSeconds <= 0.0) return
+        val simulation = context ?: return
+        val activeByWorld = HashMap<String, MutableList<FurnaceKey>>()
+        for (key in activeFurnaceKeys) {
+            activeByWorld.computeIfAbsent(key.worldKey) { ArrayList() }.add(key)
+        }
+        if (activeByWorld.isEmpty()) {
+            furnaceChunkLastTickNanos.clear()
+            return
+        }
+        pruneInactiveWorldChunkTimingState(activeByWorld.keys, furnaceChunkLastTickNanos)
+        for ((worldKey, worldActiveKeys) in activeByWorld) {
+            val activeChunks = simulation.activeChunksByWorld[worldKey] ?: continue
+            if (activeChunks.isEmpty()) {
+                pruneIdleWorldChunkTimingState(worldKey, emptySet(), furnaceChunkLastTickNanos)
+                continue
+            }
+            val world = WorldManager.world(worldKey) ?: continue
+            val byChunk = HashMap<ChunkPos, MutableList<BlockPos>>()
+            for (key in worldActiveKeys) {
+                val chunkPos = ChunkPos(
+                    ChunkStreamingService.chunkXFromBlockX(key.x.toDouble()),
+                    ChunkStreamingService.chunkZFromBlockZ(key.z.toDouble())
+                )
+                if (chunkPos !in activeChunks) continue
+                byChunk.computeIfAbsent(chunkPos) { ArrayList() }.add(BlockPos(key.x, key.y, key.z))
+            }
+            if (byChunk.isEmpty()) {
+                pruneIdleWorldChunkTimingState(worldKey, emptySet(), furnaceChunkLastTickNanos)
+                continue
+            }
+            pruneIdleWorldChunkTimingState(worldKey, byChunk.keys, furnaceChunkLastTickNanos)
+            for ((chunkPos, positions) in byChunk) {
+                val positionSnapshot = positions.toList()
+                val worldChunkKey = WorldChunkKey(worldKey, chunkPos)
+                if (!tryAcquireWorldChunkInFlight(worldChunkKey, furnaceChunkInFlight)) {
+                    continue
+                }
+                world.submitOnChunkActor(chunkPos) {
+                    try {
+                        val frame = world.beginChunkProcessingFrame(tickSequence)
+                        val startedAt = System.nanoTime()
+                        val chunkDeltaSeconds = consumeChunkElapsedDeltaSeconds(
+                            worldChunkKey = worldChunkKey,
+                            fallbackSeconds = deltaSeconds,
+                            lastTickMap = furnaceChunkLastTickNanos
+                        )
+                        if (chunkDeltaSeconds <= 0.0) {
+                            world.recordChunkProcessingNanos(
+                                frame = frame,
+                                chunkPos = chunkPos,
+                                elapsedNanos = System.nanoTime() - startedAt
+                            )
+                            world.finishChunkProcessingFrame(
+                                frame = frame,
+                                activeChunks = setOf(chunkPos),
+                                includeZeroForInactive = false,
+                                accumulateIntoLast = true
+                            )
+                            return@submitOnChunkActor
+                        }
+                        for (pos in positionSnapshot) {
+                            val key = FurnaceKey(worldKey, pos.x, pos.y, pos.z)
+                            val furnace = furnaceStates[key]
+                            if (furnace == null) {
+                                activeFurnaceKeys.remove(key)
+                                continue
+                            }
+                            if (tickSingleFurnaceState(furnace, chunkDeltaSeconds)) {
+                                enqueueFurnaceResync(key)
+                            }
+                            refreshFurnaceActivity(key, furnace)
+                        }
+                        world.recordChunkProcessingNanos(
+                            frame = frame,
+                            chunkPos = chunkPos,
+                            elapsedNanos = System.nanoTime() - startedAt
+                        )
+                        world.finishChunkProcessingFrame(
+                            frame = frame,
+                            activeChunks = setOf(chunkPos),
+                            includeZeroForInactive = false,
+                            accumulateIntoLast = true
+                        )
+                    } finally {
+                        releaseWorldChunkInFlight(worldChunkKey, furnaceChunkInFlight)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun consumeChunkElapsedDeltaSeconds(
+        worldChunkKey: WorldChunkKey,
+        fallbackSeconds: Double,
+        lastTickMap: ConcurrentHashMap<WorldChunkKey, Long>
+    ): Double {
+        val nowNanos = System.nanoTime()
+        val previous = lastTickMap.put(worldChunkKey, nowNanos)
+        if (previous == null) {
+            return if (fallbackSeconds.isFinite() && fallbackSeconds > 0.0) fallbackSeconds else 0.0
+        }
+        val elapsedSeconds = ((nowNanos - previous).coerceAtLeast(0L)) / 1_000_000_000.0
+        if (!elapsedSeconds.isFinite() || elapsedSeconds <= 0.0) return 0.0
+        return elapsedSeconds
+    }
+
+    private fun tryAcquireWorldChunkInFlight(
+        key: WorldChunkKey,
+        inFlight: ConcurrentHashMap<WorldChunkKey, AtomicBoolean>
+    ): Boolean {
+        return inFlight.computeIfAbsent(key) { AtomicBoolean(false) }.compareAndSet(false, true)
+    }
+
+    private fun releaseWorldChunkInFlight(
+        key: WorldChunkKey,
+        inFlight: ConcurrentHashMap<WorldChunkKey, AtomicBoolean>
+    ) {
+        inFlight[key]?.set(false)
+    }
+
+    private fun pruneIdleWorldChunkTimingState(
+        worldKey: String,
+        activeChunks: Collection<ChunkPos>,
+        lastTickMap: ConcurrentHashMap<WorldChunkKey, Long>
+    ) {
+        if (lastTickMap.isEmpty()) return
+        val active = if (activeChunks is Set<ChunkPos>) activeChunks else HashSet(activeChunks)
+        val iterator = lastTickMap.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.key.worldKey != worldKey) continue
+            if (entry.key.chunkPos !in active) {
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun pruneInactiveWorldChunkTimingState(
+        activeWorldKeys: Set<String>,
+        lastTickMap: ConcurrentHashMap<WorldChunkKey, Long>
+    ) {
+        if (lastTickMap.isEmpty()) return
+        if (activeWorldKeys.isEmpty()) {
+            lastTickMap.clear()
+            return
+        }
+        val iterator = lastTickMap.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.key.worldKey !in activeWorldKeys) {
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun enqueueFurnaceResync(key: FurnaceKey) {
+        if (!pendingFurnaceResyncSet.add(key)) return
+        pendingFurnaceResyncKeys.add(key)
+    }
+
+    private fun drainPendingFurnaceResyncs() {
+        while (true) {
+            val key = pendingFurnaceResyncKeys.poll() ?: break
+            pendingFurnaceResyncSet.remove(key)
+            resyncOpenFurnaceViewers(key)
+        }
+    }
+
+    private fun tickSingleFurnaceState(furnace: FurnaceState, deltaSeconds: Double): Boolean {
+        run {
+            val recipe = currentSmeltingRecipe(furnace)
+            val canSmelt = canSmeltNow(furnace, recipe)
+            var dirty = false
+
+            if (furnace.burnRemainingSeconds > 0.0) {
+                furnace.burnRemainingSeconds = (furnace.burnRemainingSeconds - deltaSeconds).coerceAtLeast(0.0)
+                dirty = true
+            }
+
+            if (canSmelt && furnace.burnRemainingSeconds <= 0.0) {
+                val fuelBurnSeconds = fuelBurnSeconds(furnace.fuelItemId)
+                if (fuelBurnSeconds > 0.0 && furnace.fuelCount > 0) {
+                    furnace.fuelCount -= 1
+                    if (furnace.fuelCount <= 0) {
+                        furnace.fuelItemId = -1
+                        furnace.fuelCount = 0
+                    }
+                    furnace.burnRemainingSeconds = fuelBurnSeconds
+                    furnace.burnTotalSeconds = fuelBurnSeconds
+                    dirty = true
+                }
+            }
+
+            if (canSmelt && furnace.burnRemainingSeconds > 0.0 && recipe != null) {
+                if (furnace.cookTotalSeconds <= 0.0) {
+                    furnace.cookTotalSeconds = recipe.cookSeconds.coerceAtLeast(MIN_FURNACE_COOK_SECONDS)
+                }
+                furnace.cookProgressSeconds += deltaSeconds
+                dirty = true
+                while (furnace.cookProgressSeconds + 1.0e-9 >= furnace.cookTotalSeconds) {
+                    if (!canSmeltNow(furnace, recipe)) {
+                        furnace.cookProgressSeconds = 0.0
+                        break
+                    }
+                    smeltOneItem(furnace, recipe)
+                    furnace.cookProgressSeconds -= furnace.cookTotalSeconds
+                    dirty = true
+                }
+            } else if (furnace.cookProgressSeconds > 0.0) {
+                furnace.cookProgressSeconds = 0.0
+                dirty = true
+            }
+
+            return dirty
+        }
+    }
+
+    private fun refreshFurnaceActivity(key: FurnaceKey, furnace: FurnaceState) {
+        val active = run {
+            shouldTickFurnaceLocked(furnace)
+        }
+        if (active) {
+            activeFurnaceKeys.add(key)
+            activeFurnaceKeysByWorld.computeIfAbsent(key.worldKey) { ConcurrentHashMap.newKeySet() }.add(key)
+        } else {
+            activeFurnaceKeys.remove(key)
+            activeFurnaceKeysByWorld[key.worldKey]?.let { set ->
+                set.remove(key)
+                if (set.isEmpty()) {
+                    activeFurnaceKeysByWorld.remove(key.worldKey, set)
+                }
+            }
+        }
+    }
+
+    private fun shouldTickFurnaceLocked(furnace: FurnaceState): Boolean {
+        if (furnace.burnRemainingSeconds > 0.0) return true
+        val recipe = currentSmeltingRecipe(furnace) ?: return false
+        if (!canSmeltNow(furnace, recipe)) return false
+        return furnace.fuelCount > 0 && fuelBurnSeconds(furnace.fuelItemId) > 0.0
+    }
+
+    private fun tickNaturalRegeneration(deltaSeconds: Double) {
+        if (!deltaSeconds.isFinite() || deltaSeconds <= 0.0) return
+        for (session in sessions.values) {
+            if (session.dead) continue
+            if (session.gameMode == GAME_MODE_SPECTATOR) continue
+            if (session.health >= MAX_PLAYER_HEALTH) {
+                session.regenAccumulatorSeconds = 0.0
+                continue
+            }
+
+            session.regenAccumulatorSeconds += deltaSeconds
+            if (!session.regenAccumulatorSeconds.isFinite()) {
+                session.regenAccumulatorSeconds = 0.0
+                continue
+            }
+
+            var changed = false
+            var loops = 0
+            while (loops < MAX_PLAYER_REGEN_LOOPS_PER_TICK) {
+                val canSaturatedRegen = session.food >= SATURATED_REGEN_FOOD_THRESHOLD && session.saturation > 0f
+                val canNormalRegen = session.food >= NORMAL_REGEN_FOOD_THRESHOLD
+                val intervalSeconds = when {
+                    canSaturatedRegen -> SATURATED_REGEN_INTERVAL_SECONDS
+                    canNormalRegen -> NORMAL_REGEN_INTERVAL_SECONDS
+                    else -> {
+                        session.regenAccumulatorSeconds = 0.0
+                        break
+                    }
+                }
+                if (session.regenAccumulatorSeconds + REGEN_TIME_EPSILON < intervalSeconds) break
+                session.regenAccumulatorSeconds -= intervalSeconds
+
+                val healAmount = if (canSaturatedRegen) {
+                    min(session.saturation, SATURATED_REGEN_MAX_EXHAUSTION) / SATURATED_REGEN_MAX_EXHAUSTION
+                } else {
+                    NORMAL_REGEN_HEAL_AMOUNT
+                }
+                if (healAmount <= 0f) {
+                    loops++
+                    continue
+                }
+
+                val previousHealth = session.health
+                val nextHealth = (previousHealth + healAmount).coerceAtMost(MAX_PLAYER_HEALTH)
+                if (nextHealth <= previousHealth) {
+                    loops++
+                    continue
+                }
+                session.health = nextHealth
+                applyFoodExhaustion(
+                    session = session,
+                    exhaustion = if (canSaturatedRegen) healAmount * SATURATED_REGEN_MAX_EXHAUSTION else NORMAL_REGEN_EXHAUSTION
+                )
+                changed = true
+                if (session.health >= MAX_PLAYER_HEALTH) {
+                    session.regenAccumulatorSeconds = 0.0
+                    break
+                }
+                loops++
+            }
+
+            if (changed) {
+                sendHealthPacket(session)
+            }
+        }
+    }
+
+    private fun applyFoodExhaustion(session: PlayerSession, exhaustion: Float) {
+        if (exhaustion <= 0f || !exhaustion.isFinite()) return
+        session.foodExhaustion += exhaustion
+        while (session.foodExhaustion >= FOOD_EXHAUSTION_PER_LEVEL) {
+            session.foodExhaustion -= FOOD_EXHAUSTION_PER_LEVEL
+            if (session.saturation > 0f) {
+                session.saturation = (session.saturation - 1f).coerceAtLeast(0f)
+            } else if (session.food > 0) {
+                session.food -= 1
+            }
+        }
+        if (session.food <= 0) {
+            session.food = 0
+            session.saturation = 0f
+        }
+    }
+
+    private fun buildTickSimulationContext(): TickSimulationContext? {
+        if (sessions.isEmpty()) return null
+        if (WorldManager.allWorlds().isEmpty()) return null
+
+        val sessionsByWorld = HashMap<String, MutableList<PlayerSession>>()
+        for (session in sessions.values) {
+            if (WorldManager.world(session.worldKey) == null) continue
+            sessionsByWorld
+                .computeIfAbsent(session.worldKey) { ArrayList() }
+                .add(session)
+        }
+        if (sessionsByWorld.isEmpty()) return null
+
+        val activeByWorld = HashMap<String, Set<ChunkPos>>(sessionsByWorld.size)
+        for ((worldKey, worldSessions) in sessionsByWorld) {
+            val activeChunks = collectActiveSimulationChunks(worldSessions)
+            if (activeChunks.isEmpty()) continue
+            activeByWorld[worldKey] = activeChunks
+        }
+        if (activeByWorld.isEmpty()) return null
+
+        val immutableSessionsByWorld = HashMap<String, List<PlayerSession>>(sessionsByWorld.size)
+        for ((worldKey, worldSessions) in sessionsByWorld) {
+            immutableSessionsByWorld[worldKey] = worldSessions
+        }
+
+        return TickSimulationContext(
+            sessionsByWorld = immutableSessionsByWorld,
+            activeChunksByWorld = activeByWorld
+        )
+    }
+
+    private fun isOpenSpawnSpace(stateId: Int): Boolean {
+        if (stateId <= 0) return true
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return true
+        if (parsed.blockKey == "minecraft:water" || parsed.blockKey == "minecraft:lava") return false
+        return parsed.blockKey in NON_SUPPORT_BLOCK_KEYS
+    }
+
+    private fun applyPlayerPlayerPushing(worldSessions: List<PlayerSession>, deltaSeconds: Double) {
+        for (i in 0 until worldSessions.size) {
+            val a = worldSessions[i]
+            if (a.dead || a.gameMode == GAME_MODE_SPECTATOR) continue
+            val aMinY = a.y
+            val aMaxY = a.y + playerCollisionHeight(a)
+            for (j in (i + 1) until worldSessions.size) {
+                val b = worldSessions[j]
+                if (b.dead || b.gameMode == GAME_MODE_SPECTATOR) continue
+                val bMinY = b.y
+                val bMaxY = b.y + playerCollisionHeight(b)
+                if (aMaxY <= bMinY || aMinY >= bMaxY) continue
+                applyHorizontalPushPair(
+                    ax = a.x,
+                    az = a.z,
+                    ar = PLAYER_HITBOX_HALF_WIDTH,
+                    bx = b.x,
+                    bz = b.z,
+                    br = PLAYER_HITBOX_HALF_WIDTH,
+                    deltaSeconds = deltaSeconds
+                ) { pushAX, pushAZ, pushBX, pushBZ ->
+                    applyPlayerPushImpulse(a, pushAX, pushAZ)
+                    applyPlayerPushImpulse(b, pushBX, pushBZ)
+                }
+            }
+        }
+    }
+
+    private fun applyPlayerAnimalPushing(
+        world: org.macaroon3145.world.World,
+        worldSessions: List<PlayerSession>,
+        animals: List<AnimalSnapshot>,
+        deltaSeconds: Double
+    ) {
+        for (player in worldSessions) {
+            if (player.dead || player.gameMode == GAME_MODE_SPECTATOR) continue
+            val playerMinY = player.y
+            val playerMaxY = player.y + playerCollisionHeight(player)
+            for (animal in animals) {
+                val animalMinY = animal.y
+                val animalMaxY = animal.y + animal.hitboxHeight
+                if (playerMaxY <= animalMinY || playerMinY >= animalMaxY) continue
+                applyHorizontalPushPair(
+                    ax = player.x,
+                    az = player.z,
+                    ar = PLAYER_HITBOX_HALF_WIDTH,
+                    bx = animal.x,
+                    bz = animal.z,
+                    br = animal.hitboxWidth * 0.5,
+                    deltaSeconds = deltaSeconds
+                ) { _, _, pushAX, pushAZ ->
+                    world.addAnimalHorizontalImpulse(
+                        animal.entityId,
+                        pushAX,
+                        pushAZ
+                    )
+                }
+            }
+        }
+    }
+
+    private fun playerCollisionHeight(session: PlayerSession): Double {
+        return when {
+            session.swimming -> 0.6
+            session.sneaking -> 1.5
+            else -> 1.8
+        }
+    }
+
+    private fun applyAnimalAnimalPushing(
+        world: org.macaroon3145.world.World,
+        animals: List<AnimalSnapshot>,
+        deltaSeconds: Double
+    ) {
+        for (i in 0 until animals.size) {
+            val a = animals[i]
+            for (j in (i + 1) until animals.size) {
+                val b = animals[j]
+                applyHorizontalPushPair(
+                    ax = a.x,
+                    az = a.z,
+                    ar = a.hitboxWidth * 0.5,
+                    bx = b.x,
+                    bz = b.z,
+                    br = b.hitboxWidth * 0.5,
+                    deltaSeconds = deltaSeconds
+                ) { pushAX, pushAZ, pushBX, pushBZ ->
+                    world.addAnimalHorizontalImpulse(a.entityId, pushAX, pushAZ)
+                    world.addAnimalHorizontalImpulse(b.entityId, pushBX, pushBZ)
+                }
+            }
+        }
+    }
+
+    private fun collectAnimalTemptSources(worldSessions: List<PlayerSession>): List<AnimalTemptSource> {
+        if (worldSessions.isEmpty() || pigTemptItemIds.isEmpty()) return emptyList()
+        val out = ArrayList<AnimalTemptSource>(worldSessions.size)
+        for (session in worldSessions) {
+            if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) continue
+            val selectedSlot = session.selectedHotbarSlot.coerceIn(0, 8)
+            val mainHandItemId = session.hotbarItemIds[selectedSlot]
+            val mainHandCount = session.hotbarItemCounts[selectedSlot]
+            val holdingPigFoodMain = mainHandCount > 0 && mainHandItemId in pigTemptItemIds
+            val holdingPigFoodOffhand = session.offhandItemCount > 0 && session.offhandItemId in pigTemptItemIds
+            if (!holdingPigFoodMain && !holdingPigFoodOffhand) continue
+            out.add(
+                AnimalTemptSource(
+                    x = session.x,
+                    y = session.clientEyeY,
+                    z = session.z,
+                    range = PIG_TEMPT_RANGE_BLOCKS
+                )
+            )
+        }
+        return out
+    }
+
+    private fun collectAnimalLookSources(worldSessions: List<PlayerSession>): List<AnimalLookSource> {
+        if (worldSessions.isEmpty()) return emptyList()
+        val out = ArrayList<AnimalLookSource>(worldSessions.size)
+        for (session in worldSessions) {
+            if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) continue
+            out.add(
+                AnimalLookSource(
+                    x = session.x,
+                    y = session.clientEyeY,
+                    z = session.z
+                )
+            )
+        }
+        return out
+    }
+
+    private fun collectAnimalRideControls(
+        world: org.macaroon3145.world.World,
+        worldSessions: List<PlayerSession>,
+        deltaSeconds: Double
+    ): List<AnimalRideControl> {
+        if (worldSessions.isEmpty()) return emptyList()
+        val out = ArrayList<AnimalRideControl>(worldSessions.size)
+        for (session in worldSessions) {
+            val animalEntityId = session.ridingAnimalEntityId
+            if (animalEntityId < 0) continue
+            if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) {
+                dismountPlayerFromAnimal(session)
+                continue
+            }
+            if (animalEntityId !in saddledAnimalEntityIds) {
+                dismountPlayerFromAnimal(session)
+                continue
+            }
+            val animal = world.animalSnapshot(animalEntityId)
+            if (animal == null || animal.kind != AnimalKind.PIG) {
+                dismountPlayerFromAnimal(session)
+                continue
+            }
+            val mappedAnimalEntityId = animalEntityIdByRiderEntityId[session.entityId]
+            val mappedRiderEntityId = animalRiderEntityIdByAnimalEntityId[animalEntityId]
+            if (mappedAnimalEntityId != animalEntityId || mappedRiderEntityId != session.entityId) {
+                dismountPlayerFromAnimal(session)
+                continue
+            }
+            val canControlPig = isHoldingPigControlItem(session)
+            if (!canControlPig) {
+                continue
+            }
+            val forwardInput = 1.0
+            val boost = currentPigBoostMultiplier(animalEntityId, deltaSeconds)
+            val hasClientVehiclePose = hasFreshClientVehiclePose(session)
+            out.add(
+                AnimalRideControl(
+                    entityId = animalEntityId,
+                    riderYaw = session.yaw,
+                    riderPitch = session.pitch,
+                    forwardInput = forwardInput,
+                    boostMultiplier = boost,
+                    hasClientVehiclePose = hasClientVehiclePose,
+                    clientVehicleX = session.lastClientVehicleX,
+                    clientVehicleY = session.lastClientVehicleY,
+                    clientVehicleZ = session.lastClientVehicleZ,
+                    clientVehicleYaw = session.lastClientVehicleYaw,
+                    clientVehiclePitch = session.lastClientVehiclePitch,
+                    clientVehicleOnGround = session.lastClientVehicleOnGround
+                )
+            )
+        }
+        return out
+    }
+
+    private fun hasFreshClientVehiclePose(session: PlayerSession): Boolean {
+        val stampedAt = session.lastClientVehiclePacketAtNanos
+        if (stampedAt <= 0L) return false
+        val age = System.nanoTime() - stampedAt
+        return age in 0..MAX_CLIENT_VEHICLE_POSE_AGE_NANOS
+    }
+
+    private fun isHoldingPigControlItem(session: PlayerSession): Boolean {
+        if (carrotOnAStickItemId < 0) return false
+        val selectedSlot = session.selectedHotbarSlot.coerceIn(0, 8)
+        if (session.hotbarItemCounts[selectedSlot] > 0 && session.hotbarItemIds[selectedSlot] == carrotOnAStickItemId) {
+            return true
+        }
+        return session.offhandItemCount > 0 && session.offhandItemId == carrotOnAStickItemId
+    }
+
+    private fun currentPigBoostMultiplier(animalEntityId: Int, deltaSeconds: Double): Double {
+        val state = pigBoostStatesByAnimalEntityId[animalEntityId] ?: return 1.0
+        val duration = state.durationSeconds
+        if (duration <= 0.0 || !duration.isFinite()) {
+            pigBoostStatesByAnimalEntityId.remove(animalEntityId, state)
+            return 1.0
+        }
+        val nextElapsed = (state.elapsedSeconds + deltaSeconds.coerceAtLeast(0.0))
+        if (!nextElapsed.isFinite() || nextElapsed >= duration) {
+            pigBoostStatesByAnimalEntityId.remove(animalEntityId, state)
+            return 1.0
+        }
+        state.elapsedSeconds = nextElapsed
+        val progress = (nextElapsed / duration).coerceIn(0.0, 1.0)
+        return 1.0 + (1.15 * sin(Math.PI * progress))
+    }
+
+    private inline fun applyHorizontalPushPair(
+        ax: Double,
+        az: Double,
+        ar: Double,
+        bx: Double,
+        bz: Double,
+        br: Double,
+        deltaSeconds: Double,
+        apply: (Double, Double, Double, Double) -> Unit
+    ) {
+        val dx = bx - ax
+        val dz = bz - az
+        val minDist = ar + br
+        val distSq = dx * dx + dz * dz
+        if (distSq >= minDist * minDist || minDist <= 0.0) return
+        // Vanilla Entity.push(Entity):
+        // absMax(dx,dz) -> sqrt -> normalize -> scale by min(1, 1/dist) -> *0.05 per tick.
+        var absMax = maxOf(abs(dx), abs(dz))
+        if (absMax < VANILLA_ENTITY_PUSH_MIN_DISTANCE) return
+        absMax = sqrt(absMax)
+        if (!absMax.isFinite() || absMax <= 1.0e-9) return
+        var nx = dx / absMax
+        var nz = dz / absMax
+        var scalar = 1.0 / absMax
+        if (scalar > 1.0) scalar = 1.0
+        nx *= scalar
+        nz *= scalar
+        val tickScale = (deltaSeconds * 20.0).coerceAtLeast(0.0)
+        val pushX = nx * VANILLA_ENTITY_PUSH_STRENGTH_PER_TICK * tickScale
+        val pushZ = nz * VANILLA_ENTITY_PUSH_STRENGTH_PER_TICK * tickScale
+        apply(-pushX, -pushZ, pushX, pushZ)
+    }
+
+    private fun applyPlayerPushImpulse(session: PlayerSession, impulseX: Double, impulseZ: Double) {
+        if (impulseX == 0.0 && impulseZ == 0.0) return
+        session.velocityX = (session.velocityX + impulseX).coerceIn(-ENTITY_PUSH_MAX_PLAYER_VELOCITY, ENTITY_PUSH_MAX_PLAYER_VELOCITY)
+        session.velocityZ = (session.velocityZ + impulseZ).coerceIn(-ENTITY_PUSH_MAX_PLAYER_VELOCITY, ENTITY_PUSH_MAX_PLAYER_VELOCITY)
+    }
+
 
     fun worldTimeSnapshot(worldKey: String): Pair<Long, Long> {
         val state = worldTimes.computeIfAbsent(worldKey) {
@@ -486,7 +1482,7 @@ object PlayerSessionManager {
                 broadcastAccumulatorSeconds = 0.0
             )
         }
-        synchronized(state) {
+        run {
             return state.worldAgeTicks.toLong() to state.timeOfDayTicks.toLong()
         }
     }
@@ -500,7 +1496,7 @@ object PlayerSessionManager {
                 broadcastAccumulatorSeconds = 0.0
             )
         }
-        synchronized(state) {
+        run {
             return state.worldAgeTicks.toLong() to state.timeOfDayTicks.toLong()
         }
     }
@@ -516,8 +1512,8 @@ object PlayerSessionManager {
         }
         val worldAge: Long
         val timeOfDay: Long
-        synchronized(state) {
-            state.timeOfDayTicks = normalizeTimeOfDayTicks(timeOfDayTicks.toDouble())
+        run {
+            state.timeOfDayTicks = timeOfDayTicks.toDouble().coerceAtLeast(0.0)
             state.broadcastAccumulatorSeconds = 0.0
             worldAge = state.worldAgeTicks.toLong()
             timeOfDay = state.timeOfDayTicks.toLong()
@@ -537,23 +1533,15 @@ object PlayerSessionManager {
         }
         val worldAge: Long
         val timeOfDay: Long
-        synchronized(state) {
+        run {
             state.worldAgeTicks = (state.worldAgeTicks + deltaTicks).coerceAtLeast(0.0)
-            state.timeOfDayTicks = normalizeTimeOfDayTicks(state.timeOfDayTicks + deltaTicks)
+            state.timeOfDayTicks = (state.timeOfDayTicks + deltaTicks).coerceAtLeast(0.0)
             state.broadcastAccumulatorSeconds = 0.0
             worldAge = state.worldAgeTicks.toLong()
             timeOfDay = state.timeOfDayTicks.toLong()
         }
         broadcastWorldTimePacket(worldKey, worldAge, timeOfDay)
         return worldAge to timeOfDay
-    }
-
-    private fun normalizeTimeOfDayTicks(rawTicks: Double): Double {
-        var normalized = rawTicks % MINECRAFT_DAY_TICKS
-        if (normalized < 0.0) {
-            normalized += MINECRAFT_DAY_TICKS
-        }
-        return normalized
     }
 
     private fun broadcastWorldTimePacket(worldKey: String, worldAge: Long, timeOfDay: Long) {
@@ -566,71 +1554,212 @@ object PlayerSessionManager {
         }
     }
 
-    private fun drainDroppedItemEvents(deltaSeconds: Double) {
-        if (deltaSeconds <= 0.0) return
-        val timeScale = ServerConfig.timeScale
-        if (timeScale <= 0.0) return
-        val physicsDeltaSeconds = (deltaSeconds * timeScale)
-            .coerceAtMost(MAX_DROPPED_ITEM_DELTA_SECONDS)
-        if (physicsDeltaSeconds <= 0.0) return
-        if (sessions.isEmpty()) return
-        val worlds = WorldManager.allWorlds()
-        if (worlds.isEmpty()) return
-
-        val sessionsByWorld = HashMap<String, MutableList<PlayerSession>>()
-        for (session in sessions.values) {
-            sessionsByWorld
-                .computeIfAbsent(session.worldKey) { ArrayList() }
-                .add(session)
-        }
-        updateRetainedBaseWorldChunks(sessionsByWorld)
-
-        data class WorldPhysicsEvents(
-            val world: org.macaroon3145.world.World,
-            val droppedItems: org.macaroon3145.world.DroppedItemTickEvents,
-            val fallingBlocks: org.macaroon3145.world.FallingBlockTickEvents
-        )
-        val ready = ArrayList<WorldPhysicsEvents>()
-        for (world in worlds) {
-            val worldSessions = sessionsByWorld[world.key]
-            if (worldSessions.isNullOrEmpty()) continue
-            val activeSimulationChunks = collectActiveSimulationChunks(worldSessions)
-            if (activeSimulationChunks.isEmpty()) continue
-            val chunkProcessingFrame = world.beginChunkProcessingFrame()
-            val droppedEvents = if (world.hasDroppedItems()) {
-                world.tickDroppedItems(
-                    physicsDeltaSeconds,
-                    activeSimulationChunks
-                ) { chunkPos, elapsedNanos ->
-                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
-                }
-            } else {
-                org.macaroon3145.world.DroppedItemTickEvents(emptyList(), emptyList(), emptyList())
-            }
-            val fallingEvents = if (world.hasFallingBlocks()) {
-                world.tickFallingBlocks(
-                    physicsDeltaSeconds,
-                    activeSimulationChunks
-                ) { chunkPos, elapsedNanos ->
-                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
-                }
-            } else {
-                org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
-            }
-            world.finishChunkProcessingFrame(chunkProcessingFrame, activeSimulationChunks)
-            ready.add(WorldPhysicsEvents(world, droppedEvents, fallingEvents))
-        }
-        for (physics in ready) {
-            val world = physics.world
-            val droppedEvents = physics.droppedItems
-            val fallingEvents = physics.fallingBlocks
-            val worldSessions = sessionsByWorld[world.key] ?: continue
+    private fun scheduleDroppedItemEvents(
+        tickSequence: Long,
+        deltaSeconds: Double,
+        physicsDeltaSeconds: Double,
+        context: TickSimulationContext
+    ) {
+        for ((worldKey, activeSimulationChunks) in context.activeChunksByWorld) {
+            val world = WorldManager.world(worldKey)
+            if (world == null) continue
+            val worldSessions = context.sessionsByWorld[world.key]
+            if (worldSessions == null) continue
             if (worldSessions.isEmpty()) continue
+            val sessionsSnapshot = worldSessions.toList()
+            val pendingAsync = AtomicInteger(1)
+            val done = {
+                pendingAsync.decrementAndGet()
+            }
+            try {
+                world.setAnimalTemptSources(collectAnimalTemptSources(sessionsSnapshot))
+                world.setAnimalLookSources(collectAnimalLookSources(sessionsSnapshot))
+                world.setAnimalRideControls(
+                    collectAnimalRideControls(
+                        world = world,
+                        worldSessions = sessionsSnapshot,
+                        deltaSeconds = physicsDeltaSeconds
+                    )
+                )
+                val chunkProcessingFrame = world.beginChunkProcessingFrame(tickSequence)
+                pendingAsync.incrementAndGet()
+                val droppedEvents = world.tickDroppedItems(
+                    physicsDeltaSeconds,
+                    activeSimulationChunks,
+                    onChunkEvents = { chunkEvents ->
+                        dispatchWorldPhysicsEvents(
+                            world = world,
+                            worldSessions = sessionsSnapshot,
+                            events = WorldPhysicsEvents(
+                                droppedItems = chunkEvents,
+                                fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
+                                thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
+                                animals = org.macaroon3145.world.AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+                            ),
+                            deltaSeconds = deltaSeconds
+                        )
+                    },
+                    onDispatchComplete = { done() }
+                ) { chunkPos, elapsedNanos ->
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                }
+                val fallingEvents = world.tickFallingBlocks(
+                    physicsDeltaSeconds,
+                    activeSimulationChunks
+                ) { chunkPos, elapsedNanos ->
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                }
+                val thrownEvents = world.tickThrownItems(
+                    physicsDeltaSeconds,
+                    activeSimulationChunks
+                ) { chunkPos, elapsedNanos ->
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                }
+                pendingAsync.incrementAndGet()
+                val animalEvents = world.tickAnimals(
+                    physicsDeltaSeconds,
+                    activeSimulationChunks,
+                    onChunkEvents = { chunkEvents ->
+                        dispatchWorldPhysicsEvents(
+                            world = world,
+                            worldSessions = sessionsSnapshot,
+                            events = WorldPhysicsEvents(
+                                droppedItems = org.macaroon3145.world.DroppedItemTickEvents(emptyList(), emptyList(), emptyList()),
+                                fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
+                                thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
+                                animals = chunkEvents
+                            ),
+                            deltaSeconds = deltaSeconds
+                        )
+                    },
+                    onDispatchComplete = { done() }
+                ) { chunkPos, elapsedNanos ->
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                }
+                world.finishChunkProcessingFrame(
+                    frame = chunkProcessingFrame,
+                    activeChunks = activeSimulationChunks,
+                    includeZeroForInactive = false,
+                    accumulateIntoLast = true
+                )
+                dispatchWorldPhysicsEvents(
+                    world = world,
+                    worldSessions = sessionsSnapshot,
+                    events = WorldPhysicsEvents(
+                        droppedItems = droppedEvents,
+                        fallingBlocks = fallingEvents,
+                        thrownItems = thrownEvents,
+                        animals = animalEvents
+                    ),
+                    deltaSeconds = deltaSeconds
+                )
+            } catch (_: Throwable) {}
+            done()
+        }
+    }
 
-            val outboundByContext = HashMap<ChannelHandlerContext, MutableList<ByteArray>>()
-            val pickedRemovals = collectDroppedItemPickups(world, worldSessions, outboundByContext)
+    private fun dispatchWorldPhysicsEvents(
+        world: org.macaroon3145.world.World,
+        worldSessions: List<PlayerSession>,
+        events: WorldPhysicsEvents,
+        deltaSeconds: Double
+    ) {
+        val droppedEvents = events.droppedItems
+        val fallingEvents = events.fallingBlocks
+        val thrownEvents = events.thrownItems
+        val animalEvents = events.animals
 
-            for (removed in droppedEvents.removed) {
+        val outboundByContext = HashMap<ChannelHandlerContext, MutableList<ByteArray>>()
+        val pickedRemovals = collectDroppedItemPickups(world, worldSessions, outboundByContext)
+        val thrownRemoved = ArrayList(thrownEvents.removed)
+        val thrownHitIds = HashSet<Int>()
+        collectThrownItemPlayerHits(world, worldSessions, thrownEvents.spawned, thrownRemoved, thrownHitIds)
+        collectThrownItemPlayerHits(world, worldSessions, thrownEvents.updated, thrownRemoved, thrownHitIds)
+        val pickedEntityIds = pickedRemovals.asSequence()
+            .map { it.entityId }
+            .toHashSet()
+        val droppedRemovedByChunk = droppedEvents.removed
+            .asSequence()
+            .filterNot { it.entityId in pickedEntityIds }
+            .groupBy { it.chunkPos }
+        val pickupsByChunk = pickedRemovals.groupBy {
+            ChunkPos(ChunkStreamingService.chunkXFromBlockX(it.x), ChunkStreamingService.chunkZFromBlockZ(it.z))
+        }
+        fun liveDroppedSnapshotOrNull(snapshot: DroppedItemSnapshot): DroppedItemSnapshot? {
+            val live = world.droppedItemSnapshot(snapshot.entityId) ?: return null
+            if (live.uuid != snapshot.uuid) return null
+            return live
+        }
+        val droppedSpawnedByChunk = droppedEvents.spawned
+            .asSequence()
+            .filterNot { it.entityId in pickedEntityIds }
+            .mapNotNull { liveDroppedSnapshotOrNull(it) }
+            .groupBy { it.chunkPos }
+        val droppedUpdatedByChunk = droppedEvents.updated
+            .asSequence()
+            .filterNot { it.entityId in pickedEntityIds }
+            .mapNotNull { liveDroppedSnapshotOrNull(it) }
+            .groupBy { it.chunkPos }
+        val fallingRemovedByChunk = fallingEvents.removed.groupBy { it.chunkPos }
+        val fallingLandedByChunk = fallingEvents.landed.groupBy { it.chunkPos }
+        val fallingSpawnedByChunk = fallingEvents.spawned.groupBy { it.chunkPos }
+        val fallingUpdatedByChunk = fallingEvents.updated.groupBy { it.chunkPos }
+        val thrownRemovedByChunk = thrownRemoved.groupBy { it.chunkPos }
+        val thrownSpawnedByChunk = thrownEvents.spawned
+            .asSequence()
+            .filterNot { it.entityId in thrownHitIds }
+            .groupBy { it.chunkPos }
+        val thrownUpdatedByChunk = thrownEvents.updated
+            .asSequence()
+            .filterNot { it.entityId in thrownHitIds }
+            .groupBy { it.chunkPos }
+        val animalRemovedByChunk = animalEvents.removed.groupBy { it.chunkPos }
+        val animalSpawnedByChunk = animalEvents.spawned.groupBy { it.chunkPos }
+        val animalUpdatedByChunk = animalEvents.updated.groupBy { it.chunkPos }
+        val animalDamagedByChunk = animalEvents.damaged.groupBy { it.chunkPos }
+
+        val chunksInOrder = LinkedHashSet<ChunkPos>()
+        chunksInOrder.addAll(pickupsByChunk.keys)
+        chunksInOrder.addAll(droppedRemovedByChunk.keys)
+        chunksInOrder.addAll(droppedSpawnedByChunk.keys)
+        chunksInOrder.addAll(droppedUpdatedByChunk.keys)
+        chunksInOrder.addAll(fallingRemovedByChunk.keys)
+        chunksInOrder.addAll(fallingLandedByChunk.keys)
+        chunksInOrder.addAll(fallingSpawnedByChunk.keys)
+        chunksInOrder.addAll(fallingUpdatedByChunk.keys)
+        chunksInOrder.addAll(thrownRemovedByChunk.keys)
+        chunksInOrder.addAll(thrownSpawnedByChunk.keys)
+        chunksInOrder.addAll(thrownUpdatedByChunk.keys)
+        chunksInOrder.addAll(animalRemovedByChunk.keys)
+        chunksInOrder.addAll(animalSpawnedByChunk.keys)
+        chunksInOrder.addAll(animalUpdatedByChunk.keys)
+        chunksInOrder.addAll(animalDamagedByChunk.keys)
+
+        for (chunkPos in chunksInOrder) {
+            for (pickup in pickupsByChunk[chunkPos].orEmpty()) {
+                val takePacket = PlayPackets.takeItemEntityPacket(
+                    collectedEntityId = pickup.entityId,
+                    collectorEntityId = pickup.collectorEntityId,
+                    pickupItemCount = pickup.pickupItemCount
+                )
+                val removePacket = PlayPackets.removeEntitiesPacket(intArrayOf(pickup.entityId))
+                for (session in worldSessions) {
+                    val isCollector = session.entityId == pickup.collectorEntityId
+                    val wasVisible = session.visibleDroppedItemEntityIds.contains(pickup.entityId)
+                    val inBroadcastRange = isWithinPickupBroadcastRange(session, pickup)
+                    if (!isCollector && !wasVisible && !inBroadcastRange) continue
+                    if (wasVisible || isCollector) {
+                        session.visibleDroppedItemEntityIds.remove(pickup.entityId)
+                    }
+                    session.droppedItemTrackerStates.remove(pickup.entityId)
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    enqueueDroppedItemPacket(outboundByContext, ctx, takePacket)
+                    enqueueDroppedItemPacket(outboundByContext, ctx, removePacket)
+                }
+            }
+
+            for (removed in droppedRemovedByChunk[chunkPos].orEmpty()) {
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
                     if (!session.visibleDroppedItemEntityIds.remove(removed.entityId)) continue
@@ -640,47 +1769,26 @@ object PlayerSessionManager {
                     enqueueDroppedItemPacket(outboundByContext, ctx, packet)
                 }
             }
-            for (pickup in pickedRemovals) {
-                val takePacket = PlayPackets.takeItemEntityPacket(
-                    collectedEntityId = pickup.entityId,
-                    collectorEntityId = pickup.collectorEntityId,
-                    pickupItemCount = pickup.pickupItemCount
-                )
-                val removePacket = PlayPackets.removeEntitiesPacket(intArrayOf(pickup.entityId))
-                for (session in worldSessions) {
-                    val isCollector = session.entityId == pickup.collectorEntityId
-                    val wasVisible = session.visibleDroppedItemEntityIds.remove(pickup.entityId)
-                    if (!isCollector && !wasVisible) continue
-                    if (!isCollector && !isWithinPickupBroadcastRange(session, pickup)) continue
-                    session.droppedItemTrackerStates.remove(pickup.entityId)
-                    val ctx = contexts[session.channelId] ?: continue
-                    if (!ctx.channel().isActive) continue
-                    enqueueDroppedItemPacket(outboundByContext, ctx, takePacket)
-                    enqueueDroppedItemPacket(outboundByContext, ctx, removePacket)
-                }
-            }
-
-            for (snapshot in droppedEvents.spawned) {
-                val current = world.droppedItemSnapshot(snapshot.entityId) ?: continue
+            for (snapshot in droppedSpawnedByChunk[chunkPos].orEmpty()) {
                 syncDroppedItemSnapshot(
-                    snapshot = current,
+                    snapshot = snapshot,
                     worldSessions = worldSessions,
                     outboundByContext = outboundByContext,
                     sendPositionUpdate = false,
                     deltaSeconds = deltaSeconds
                 )
             }
-            for (snapshot in droppedEvents.updated) {
-                val current = world.droppedItemSnapshot(snapshot.entityId) ?: continue
+            for (snapshot in droppedUpdatedByChunk[chunkPos].orEmpty()) {
                 syncDroppedItemSnapshot(
-                    snapshot = current,
+                    snapshot = snapshot,
                     worldSessions = worldSessions,
                     outboundByContext = outboundByContext,
                     sendPositionUpdate = true,
                     deltaSeconds = deltaSeconds
                 )
             }
-            for (removed in fallingEvents.removed) {
+
+            for (removed in fallingRemovedByChunk[chunkPos].orEmpty()) {
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
                     if (!session.visibleFallingBlockEntityIds.remove(removed.entityId)) continue
@@ -690,7 +1798,7 @@ object PlayerSessionManager {
                     enqueueDroppedItemPacket(outboundByContext, ctx, packet)
                 }
             }
-            for (landed in fallingEvents.landed) {
+            for (landed in fallingLandedByChunk[chunkPos].orEmpty()) {
                 val packet = PlayPackets.blockChangePacket(landed.blockX, landed.blockY, landed.blockZ, landed.blockStateId)
                 for (session in worldSessions) {
                     if (!session.loadedChunks.contains(landed.chunkPos)) continue
@@ -699,20 +1807,18 @@ object PlayerSessionManager {
                     enqueueDroppedItemPacket(outboundByContext, ctx, packet)
                 }
             }
-            for (snapshot in fallingEvents.spawned) {
-                val current = world.fallingBlockSnapshot(snapshot.entityId) ?: continue
+            for (snapshot in fallingSpawnedByChunk[chunkPos].orEmpty()) {
                 syncFallingBlockSnapshot(
-                    snapshot = current,
+                    snapshot = snapshot,
                     worldSessions = worldSessions,
                     outboundByContext = outboundByContext,
                     sendPositionUpdate = false,
                     deltaSeconds = deltaSeconds
                 )
             }
-            for (snapshot in fallingEvents.updated) {
-                val current = world.fallingBlockSnapshot(snapshot.entityId) ?: continue
+            for (snapshot in fallingUpdatedByChunk[chunkPos].orEmpty()) {
                 syncFallingBlockSnapshot(
-                    snapshot = current,
+                    snapshot = snapshot,
                     worldSessions = worldSessions,
                     outboundByContext = outboundByContext,
                     sendPositionUpdate = true,
@@ -720,18 +1826,728 @@ object PlayerSessionManager {
                 )
             }
 
-            for ((ctx, packets) in outboundByContext) {
-                if (packets.isEmpty()) continue
-                val packetBatch = packets.toTypedArray()
-                ctx.executor().execute {
-                    if (!ctx.channel().isActive) return@execute
-                    for (packet in packetBatch) {
-                        ctx.write(packet)
+            for (removed in thrownRemovedByChunk[chunkPos].orEmpty()) {
+                val impactPacket = if (removed.hit) {
+                    PlayPackets.entityPositionSyncPacket(
+                        entityId = removed.entityId,
+                        x = removed.x,
+                        y = removed.y,
+                        z = removed.z,
+                        yaw = 0f,
+                        pitch = 0f,
+                        onGround = false
+                    )
+                } else {
+                    null
+                }
+                val breakParticlesPacket = if (removed.hit) {
+                    PlayPackets.entityEventPacket(
+                        entityId = removed.entityId,
+                        eventId = ENTITY_EVENT_THROWN_ITEM_BREAK_PARTICLES
+                    )
+                } else {
+                    null
+                }
+                val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
+                for (session in worldSessions) {
+                    if (!session.visibleThrownItemEntityIds.remove(removed.entityId)) continue
+                    session.thrownItemTrackerStates.remove(removed.entityId)
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    if (impactPacket != null) {
+                        enqueueDroppedItemPacket(outboundByContext, ctx, impactPacket)
                     }
-                    ctx.flush()
+                    if (breakParticlesPacket != null) {
+                        enqueueDroppedItemPacket(outboundByContext, ctx, breakParticlesPacket)
+                    }
+                    enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+                }
+            }
+            for (snapshot in thrownSpawnedByChunk[chunkPos].orEmpty()) {
+                syncThrownItemSnapshot(
+                    snapshot = snapshot,
+                    worldSessions = worldSessions,
+                    outboundByContext = outboundByContext,
+                    sendPositionUpdate = false,
+                    deltaSeconds = deltaSeconds
+                )
+            }
+            for (snapshot in thrownUpdatedByChunk[chunkPos].orEmpty()) {
+                syncThrownItemSnapshot(
+                    snapshot = snapshot,
+                    worldSessions = worldSessions,
+                    outboundByContext = outboundByContext,
+                    sendPositionUpdate = true,
+                    deltaSeconds = deltaSeconds
+                )
+            }
+
+            for (removed in animalRemovedByChunk[chunkPos].orEmpty()) {
+                dismountAnimalRider(world.key, removed.entityId)
+                val wasSaddled = saddledAnimalEntityIds.remove(removed.entityId)
+                pigBoostStatesByAnimalEntityId.remove(removed.entityId)
+                if (removed.died) {
+                    spawnAnimalDeathDrops(world, removed, null, dropSaddle = wasSaddled)
+                }
+                val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
+                for (session in worldSessions) {
+                    if (!session.visibleAnimalEntityIds.contains(removed.entityId)) continue
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    if (removed.died) {
+                        enqueueDroppedItemPacket(
+                            outboundByContext,
+                            ctx,
+                            PlayPackets.entityEventPacket(removed.entityId, ENTITY_EVENT_DEATH_ANIMATION)
+                        )
+                        enqueueDroppedItemPacket(
+                            outboundByContext,
+                            ctx,
+                            PlayPackets.soundPacketByKey(
+                                soundKey = removed.kind.deathSoundKey,
+                                soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+                                x = removed.x,
+                                y = removed.y + 0.5,
+                                z = removed.z,
+                                volume = 1.0f,
+                                pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
+                                seed = ThreadLocalRandom.current().nextLong()
+                            )
+                        )
+                        scheduleAnimalRemoval(world.key, removed.entityId)
+                        continue
+                    }
+                    session.visibleAnimalEntityIds.remove(removed.entityId)
+                    session.animalTrackerStates.remove(removed.entityId)
+                    enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+                }
+            }
+            for (snapshot in animalSpawnedByChunk[chunkPos].orEmpty()) {
+                syncAnimalSnapshot(
+                    snapshot = snapshot,
+                    worldSessions = worldSessions,
+                    outboundByContext = outboundByContext,
+                    sendPositionUpdate = false,
+                    deltaSeconds = deltaSeconds
+                )
+                val spawnSoundPacket = PlayPackets.soundPacketByKey(
+                    soundKey = snapshot.kind.ambientSoundKey,
+                    soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+                    x = snapshot.x,
+                    y = snapshot.y + snapshot.hitboxHeight * 0.5,
+                    z = snapshot.z,
+                    volume = 1.0f,
+                    pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
+                    seed = ThreadLocalRandom.current().nextLong()
+                )
+                for (session in worldSessions) {
+                    if (!session.visibleAnimalEntityIds.contains(snapshot.entityId)) continue
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    enqueueDroppedItemPacket(outboundByContext, ctx, spawnSoundPacket)
+                }
+            }
+            for (snapshot in animalUpdatedByChunk[chunkPos].orEmpty()) {
+                syncAnimalSnapshot(
+                    snapshot = snapshot,
+                    worldSessions = worldSessions,
+                    outboundByContext = outboundByContext,
+                    sendPositionUpdate = true,
+                    deltaSeconds = deltaSeconds
+                )
+            }
+            for (damage in animalDamagedByChunk[chunkPos].orEmpty()) {
+                val damageTypeId = when (damage.cause) {
+                    AnimalDamageCause.FALL -> FALL_DAMAGE_TYPE_ID
+                    AnimalDamageCause.PLAYER_ATTACK -> PLAYER_ATTACK_DAMAGE_TYPE_ID
+                    AnimalDamageCause.GENERIC -> PLAYER_ATTACK_DAMAGE_TYPE_ID
+                }
+                val hurtAnimation = PlayPackets.hurtAnimationPacket(damage.entityId, 0f)
+                val damageEvent = PlayPackets.damageEventPacket(damage.entityId, damageTypeId)
+                val soundSnapshot = if (damage.died) null else world.animalSnapshot(damage.entityId)
+                val damageSoundPackets = if (soundSnapshot != null) {
+                    val packets = ArrayList<ByteArray>(2)
+                    val soundKeys = animalDamageSoundKeys(damage)
+                    for (soundKey in soundKeys) {
+                        packets.add(
+                            PlayPackets.soundPacketByKey(
+                                soundKey = soundKey,
+                                soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+                                x = soundSnapshot.x,
+                                y = soundSnapshot.y + soundSnapshot.hitboxHeight * 0.5,
+                                z = soundSnapshot.z,
+                                volume = 1.0f,
+                                pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
+                                seed = ThreadLocalRandom.current().nextLong()
+                            )
+                        )
+                    }
+                    packets
+                } else {
+                    emptyList()
+                }
+                for (session in worldSessions) {
+                    if (!session.visibleAnimalEntityIds.contains(damage.entityId)) continue
+                    val ctx = contexts[session.channelId] ?: continue
+                    if (!ctx.channel().isActive) continue
+                    enqueueDroppedItemPacket(outboundByContext, ctx, hurtAnimation)
+                    enqueueDroppedItemPacket(outboundByContext, ctx, damageEvent)
+                    for (soundPacket in damageSoundPackets) {
+                        enqueueDroppedItemPacket(outboundByContext, ctx, soundPacket)
+                    }
+                }
+            }
+            flushQueuedPackets(outboundByContext)
+        }
+    }
+
+    private fun flushQueuedPackets(outboundByContext: MutableMap<ChannelHandlerContext, MutableList<ByteArray>>) {
+        if (outboundByContext.isEmpty()) return
+        for ((ctx, packets) in outboundByContext) {
+            if (packets.isEmpty()) continue
+            for (packet in packets) {
+                enqueueChannelFlushPacket(ctx, packet)
+            }
+        }
+        outboundByContext.clear()
+    }
+
+    private fun enqueueChannelFlushPacket(ctx: ChannelHandlerContext, packet: ByteArray) {
+        val channelId = ctx.channel().id()
+        val state = channelFlushStates.computeIfAbsent(channelId) { ChannelFlushState() }
+        state.pendingPackets.add(packet)
+        scheduleChannelFlushDrain(ctx, state)
+    }
+
+    private fun scheduleChannelFlushDrain(ctx: ChannelHandlerContext, state: ChannelFlushState) {
+        if (!state.scheduled.compareAndSet(false, true)) return
+        ctx.executor().execute {
+            try {
+                if (!ctx.channel().isActive) {
+                    state.pendingPackets.clear()
+                    channelFlushStates.remove(ctx.channel().id(), state)
+                    return@execute
+                }
+                while (true) {
+                    var wroteAny = false
+                    while (true) {
+                        val packet = state.pendingPackets.poll() ?: break
+                        ctx.write(packet)
+                        wroteAny = true
+                    }
+                    if (wroteAny) {
+                        ctx.flush()
+                    }
+                    state.scheduled.set(false)
+                    if (!ctx.channel().isActive) {
+                        state.pendingPackets.clear()
+                        channelFlushStates.remove(ctx.channel().id(), state)
+                        return@execute
+                    }
+                    if (state.pendingPackets.isEmpty()) {
+                        return@execute
+                    }
+                    if (!state.scheduled.compareAndSet(false, true)) {
+                        return@execute
+                    }
+                }
+            } catch (_: Throwable) {
+                state.scheduled.set(false)
+            }
+        }
+    }
+
+    private fun scheduleFluidEvents(
+        tickSequence: Long,
+        physicsDeltaSeconds: Double,
+        context: TickSimulationContext
+    ) {
+        for ((worldKey, activeSimulationChunks) in context.activeChunksByWorld) {
+            val world = WorldManager.world(worldKey)
+            if (world == null) continue
+            try {
+                val chunkProcessingFrame = world.beginChunkProcessingFrame(tickSequence)
+                val fluidEvents = world.tickFluids(
+                    physicsDeltaSeconds,
+                    activeSimulationChunks,
+                    onChunkChanged = { changedList ->
+                        if (changedList.isEmpty()) return@tickFluids
+                        val fluidBreakSeeds = ArrayList<BlockPos>(changedList.size)
+                        for (changed in changedList) {
+                            maybeSpawnFluidBrokenBlockDrops(world, changed)
+                            fluidBreakSeeds.add(BlockPos(changed.x, changed.y, changed.z))
+                        }
+                        broadcastFluidChanges(world.key, changedList)
+                        scheduleFluidDependentBreakRounds(
+                            world = world,
+                            removedCenters = fluidBreakSeeds
+                        ) {}
+                    },
+                    onDispatchComplete = {}
+                ) { chunkPos, elapsedNanos ->
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos)
+                }
+                world.finishChunkProcessingFrame(
+                    frame = chunkProcessingFrame,
+                    activeChunks = activeSimulationChunks,
+                    includeZeroForInactive = false,
+                    accumulateIntoLast = true
+                )
+                if (fluidEvents.changed.isEmpty()) {
+                    continue
+                }
+                val fluidBreakSeeds = ArrayList<BlockPos>(fluidEvents.changed.size)
+                for (changed in fluidEvents.changed) {
+                    maybeSpawnFluidBrokenBlockDrops(world, changed)
+                    fluidBreakSeeds.add(BlockPos(changed.x, changed.y, changed.z))
+                }
+                broadcastFluidChanges(world.key, fluidEvents.changed)
+                scheduleFluidDependentBreakRounds(
+                    world = world,
+                    removedCenters = fluidBreakSeeds
+                ) {
+                    // Completion for already-drained events is handled by tickFluids onDispatchComplete.
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun broadcastFluidChanges(worldKey: String, changes: List<org.macaroon3145.world.FluidBlockChange>) {
+        if (changes.isEmpty()) return
+        for (change in changes) {
+            broadcastBlockChangeToLoadedPlayers(
+                worldKey = worldKey,
+                chunkPos = change.chunkPos,
+                x = change.x,
+                y = change.y,
+                z = change.z,
+                stateId = change.stateId
+            )
+        }
+    }
+
+    private fun scheduleEntityPushing(_tickSequence: Long, context: TickSimulationContext, deltaSeconds: Double) {
+        if (deltaSeconds <= 0.0) return
+        if (context.sessionsByWorld.isEmpty()) {
+            pushingChunkLastTickNanos.clear()
+            return
+        }
+        pruneInactiveWorldChunkTimingState(context.sessionsByWorld.keys, pushingChunkLastTickNanos)
+        for ((worldKey, worldSessions) in context.sessionsByWorld) {
+            val world = WorldManager.world(worldKey)
+            if (world == null) continue
+            val sessionsSnapshot = worldSessions.toList()
+            try {
+                val animals = world.animalSnapshots()
+                if (sessionsSnapshot.isEmpty()) {
+                    pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
+                    continue
+                }
+
+                    val playerChunkByEntityId = HashMap<Int, ChunkPos>(sessionsSnapshot.size)
+                    val playersByChunk = HashMap<ChunkPos, MutableList<PlayerSession>>()
+                    for (session in sessionsSnapshot) {
+                        val chunkPos = ChunkPos(
+                            ChunkStreamingService.chunkXFromBlockX(session.x),
+                            ChunkStreamingService.chunkZFromBlockZ(session.z)
+                        )
+                        playerChunkByEntityId[session.entityId] = chunkPos
+                        playersByChunk.computeIfAbsent(chunkPos) { ArrayList() }.add(session)
+                    }
+
+                    val animalChunkByEntityId = HashMap<Int, ChunkPos>(animals.size)
+                    val animalsByChunk = HashMap<ChunkPos, MutableList<AnimalSnapshot>>()
+                    for (animal in animals) {
+                        val chunkPos = animal.chunkPos
+                        animalChunkByEntityId[animal.entityId] = chunkPos
+                        animalsByChunk.computeIfAbsent(chunkPos) { ArrayList() }.add(animal)
+                    }
+
+                    val chunksToProcess = HashSet<ChunkPos>()
+                    chunksToProcess.addAll(playersByChunk.keys)
+                    chunksToProcess.addAll(animalsByChunk.keys)
+                    if (chunksToProcess.isEmpty()) {
+                        pruneIdleWorldChunkTimingState(worldKey, emptySet(), pushingChunkLastTickNanos)
+                        continue
+                    }
+                    pruneIdleWorldChunkTimingState(worldKey, chunksToProcess, pushingChunkLastTickNanos)
+
+                    val playerImpulseX = ConcurrentHashMap<Int, DoubleAdder>()
+                    val playerImpulseZ = ConcurrentHashMap<Int, DoubleAdder>()
+                    val animalImpulseX = ConcurrentHashMap<Int, DoubleAdder>()
+                    val animalImpulseZ = ConcurrentHashMap<Int, DoubleAdder>()
+                    val scheduledChunks = ArrayList<ChunkPos>(chunksToProcess.size)
+                    for (chunkPos in chunksToProcess) {
+                        val key = WorldChunkKey(worldKey, chunkPos)
+                        if (tryAcquireWorldChunkInFlight(key, pushingChunkInFlight)) {
+                            scheduledChunks.add(chunkPos)
+                        }
+                    }
+                    if (scheduledChunks.isEmpty()) {
+                        continue
+                    }
+                    val remaining = AtomicInteger(scheduledChunks.size)
+                    val finalized = AtomicBoolean(false)
+                    val finalizeIfDone = fun() {
+                        if (!finalized.compareAndSet(false, true)) {
+                            return
+                        }
+                        val playerImpulses = HashMap<Int, Pair<Double, Double>>()
+                        for ((entityId, xAdder) in playerImpulseX) {
+                            val x = xAdder.sum()
+                            val z = playerImpulseZ[entityId]?.sum() ?: 0.0
+                            if (x == 0.0 && z == 0.0) continue
+                            playerImpulses[entityId] = x to z
+                        }
+                        val animalImpulses = HashMap<Int, Pair<Double, Double>>()
+                        for ((entityId, xAdder) in animalImpulseX) {
+                            val x = xAdder.sum()
+                            val z = animalImpulseZ[entityId]?.sum() ?: 0.0
+                            if (x == 0.0 && z == 0.0) continue
+                            animalImpulses[entityId] = x to z
+                        }
+                        applyPushingImmediately(worldKey, playerImpulses, animalImpulses)
+                    }
+
+                for (chunkPos in scheduledChunks) {
+                    world.submitOnChunkActor(chunkPos) {
+                        val worldChunkKey = WorldChunkKey(worldKey, chunkPos)
+                        try {
+                            val chunkDeltaSeconds = consumeChunkElapsedDeltaSeconds(
+                                worldChunkKey = worldChunkKey,
+                                fallbackSeconds = deltaSeconds,
+                                lastTickMap = pushingChunkLastTickNanos
+                            )
+                            if (chunkDeltaSeconds <= 0.0) {
+                                return@submitOnChunkActor
+                            }
+                            applyChunkScopedPushing(
+                                chunkPos = chunkPos,
+                                deltaSeconds = chunkDeltaSeconds,
+                                playersByChunk = playersByChunk,
+                                animalsByChunk = animalsByChunk,
+                                playerChunkByEntityId = playerChunkByEntityId,
+                                animalChunkByEntityId = animalChunkByEntityId,
+                                playerImpulseX = playerImpulseX,
+                                playerImpulseZ = playerImpulseZ,
+                                animalImpulseX = animalImpulseX,
+                                animalImpulseZ = animalImpulseZ
+                            )
+                        } finally {
+                            releaseWorldChunkInFlight(worldChunkKey, pushingChunkInFlight)
+                            if (remaining.decrementAndGet() == 0) {
+                                finalizeIfDone()
+                            }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun applyChunkScopedPushing(
+        chunkPos: ChunkPos,
+        deltaSeconds: Double,
+        playersByChunk: Map<ChunkPos, List<PlayerSession>>,
+        animalsByChunk: Map<ChunkPos, List<AnimalSnapshot>>,
+        playerChunkByEntityId: Map<Int, ChunkPos>,
+        animalChunkByEntityId: Map<Int, ChunkPos>,
+        playerImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
+        playerImpulseZ: ConcurrentHashMap<Int, DoubleAdder>,
+        animalImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
+        animalImpulseZ: ConcurrentHashMap<Int, DoubleAdder>
+    ) {
+        val nearbyPlayers = collectNeighborPlayers(chunkPos, playersByChunk)
+        val nearbyAnimals = collectNeighborAnimals(chunkPos, animalsByChunk)
+
+        for (i in 0 until nearbyPlayers.size) {
+            val a = nearbyPlayers[i]
+            if (a.dead || a.gameMode == GAME_MODE_SPECTATOR) continue
+            val aChunk = playerChunkByEntityId[a.entityId] ?: continue
+            val aMinY = a.y
+            val aMaxY = a.y + playerCollisionHeight(a)
+            for (j in (i + 1) until nearbyPlayers.size) {
+                val b = nearbyPlayers[j]
+                if (b.dead || b.gameMode == GAME_MODE_SPECTATOR) continue
+                val bChunk = playerChunkByEntityId[b.entityId] ?: continue
+                if (ownerChunkForPair(aChunk, bChunk) != chunkPos) continue
+                val bMinY = b.y
+                val bMaxY = b.y + playerCollisionHeight(b)
+                if (aMaxY <= bMinY || aMinY >= bMaxY) continue
+                applyHorizontalPushPair(
+                    ax = a.x, az = a.z, ar = PLAYER_HITBOX_HALF_WIDTH,
+                    bx = b.x, bz = b.z, br = PLAYER_HITBOX_HALF_WIDTH,
+                    deltaSeconds = deltaSeconds
+                ) { pushAX, pushAZ, pushBX, pushBZ ->
+                    addImpulse(playerImpulseX, playerImpulseZ, a.entityId, pushAX, pushAZ)
+                    addImpulse(playerImpulseX, playerImpulseZ, b.entityId, pushBX, pushBZ)
                 }
             }
         }
+
+        for (player in nearbyPlayers) {
+            if (player.dead || player.gameMode == GAME_MODE_SPECTATOR) continue
+            val playerChunk = playerChunkByEntityId[player.entityId] ?: continue
+            val playerMinY = player.y
+            val playerMaxY = player.y + playerCollisionHeight(player)
+            for (animal in nearbyAnimals) {
+                val animalChunk = animalChunkByEntityId[animal.entityId] ?: continue
+                if (ownerChunkForPair(playerChunk, animalChunk) != chunkPos) continue
+                val animalMinY = animal.y
+                val animalMaxY = animal.y + animal.hitboxHeight
+                if (playerMaxY <= animalMinY || playerMinY >= animalMaxY) continue
+                applyHorizontalPushPair(
+                    ax = player.x, az = player.z, ar = PLAYER_HITBOX_HALF_WIDTH,
+                    bx = animal.x, bz = animal.z, br = animal.hitboxWidth * 0.5,
+                    deltaSeconds = deltaSeconds
+                ) { _, _, pushAX, pushAZ ->
+                    addImpulse(animalImpulseX, animalImpulseZ, animal.entityId, pushAX, pushAZ)
+                }
+            }
+        }
+
+        for (i in 0 until nearbyAnimals.size) {
+            val a = nearbyAnimals[i]
+            val aChunk = animalChunkByEntityId[a.entityId] ?: continue
+            for (j in (i + 1) until nearbyAnimals.size) {
+                val b = nearbyAnimals[j]
+                val bChunk = animalChunkByEntityId[b.entityId] ?: continue
+                if (ownerChunkForPair(aChunk, bChunk) != chunkPos) continue
+                applyHorizontalPushPair(
+                    ax = a.x, az = a.z, ar = a.hitboxWidth * 0.5,
+                    bx = b.x, bz = b.z, br = b.hitboxWidth * 0.5,
+                    deltaSeconds = deltaSeconds
+                ) { pushAX, pushAZ, pushBX, pushBZ ->
+                    addImpulse(animalImpulseX, animalImpulseZ, a.entityId, pushAX, pushAZ)
+                    addImpulse(animalImpulseX, animalImpulseZ, b.entityId, pushBX, pushBZ)
+                }
+            }
+        }
+    }
+
+    private fun addImpulse(
+        mapX: ConcurrentHashMap<Int, DoubleAdder>,
+        mapZ: ConcurrentHashMap<Int, DoubleAdder>,
+        entityId: Int,
+        impulseX: Double,
+        impulseZ: Double
+    ) {
+        if (impulseX != 0.0) {
+            mapX.computeIfAbsent(entityId) { DoubleAdder() }.add(impulseX)
+        }
+        if (impulseZ != 0.0) {
+            mapZ.computeIfAbsent(entityId) { DoubleAdder() }.add(impulseZ)
+        }
+    }
+
+    private fun collectNeighborPlayers(
+        center: ChunkPos,
+        playersByChunk: Map<ChunkPos, List<PlayerSession>>
+    ): List<PlayerSession> {
+        val out = ArrayList<PlayerSession>()
+        for (dz in -1..1) {
+            for (dx in -1..1) {
+                out.addAll(playersByChunk[ChunkPos(center.x + dx, center.z + dz)].orEmpty())
+            }
+        }
+        return out
+    }
+
+    private fun collectNeighborAnimals(
+        center: ChunkPos,
+        animalsByChunk: Map<ChunkPos, List<AnimalSnapshot>>
+    ): List<AnimalSnapshot> {
+        val out = ArrayList<AnimalSnapshot>()
+        for (dz in -1..1) {
+            for (dx in -1..1) {
+                out.addAll(animalsByChunk[ChunkPos(center.x + dx, center.z + dz)].orEmpty())
+            }
+        }
+        return out
+    }
+
+    private fun ownerChunkForPair(a: ChunkPos, b: ChunkPos): ChunkPos {
+        return if (a.x < b.x || (a.x == b.x && a.z <= b.z)) a else b
+    }
+
+    private fun applyPushingImmediately(
+        worldKey: String,
+        playerImpulses: Map<Int, Pair<Double, Double>>,
+        animalImpulses: Map<Int, Pair<Double, Double>>
+    ) {
+        if (playerImpulses.isNotEmpty()) {
+            for ((_, session) in sessions) {
+                if (session.worldKey != worldKey) continue
+                val impulse = playerImpulses[session.entityId] ?: continue
+                applyPlayerPushImpulse(session, impulse.first, impulse.second)
+            }
+        }
+        if (animalImpulses.isNotEmpty()) {
+            val world = WorldManager.world(worldKey) ?: return
+            for ((entityId, impulse) in animalImpulses) {
+                world.addAnimalHorizontalImpulse(entityId, impulse.first, impulse.second)
+            }
+        }
+    }
+
+    private fun selectAnchorChunk(chunks: Set<ChunkPos>): ChunkPos? {
+        if (chunks.isEmpty()) return null
+        var selected: ChunkPos? = null
+        for (chunk in chunks) {
+            val current = selected
+            if (current == null || chunk.x < current.x || (chunk.x == current.x && chunk.z < current.z)) {
+                selected = chunk
+            }
+        }
+        return selected
+    }
+
+    private fun collectThrownItemPlayerHits(
+        world: org.macaroon3145.world.World,
+        worldSessions: List<PlayerSession>,
+        snapshots: List<ThrownItemSnapshot>,
+        removedOut: MutableList<org.macaroon3145.world.ThrownItemRemovedEvent>,
+        removedIds: MutableSet<Int>
+    ) {
+        for (snapshot in snapshots) {
+            if (snapshot.entityId in removedIds) continue
+            val current = world.thrownItemSnapshot(snapshot.entityId) ?: continue
+            var hitTarget: PlayerSession? = null
+            for (target in worldSessions) {
+                if (target.entityId == current.ownerEntityId) continue
+                if (target.dead) continue
+                if (target.gameMode == GAME_MODE_SPECTATOR) continue
+                if (!thrownItemHitsPlayer(current, target)) continue
+                hitTarget = target
+                break
+            }
+            if (hitTarget == null) continue
+            val (hitX, hitY, hitZ) = resolveThrownItemImpactOnPlayer(current, hitTarget)
+            val removed = world.removeThrownItem(
+                entityId = current.entityId,
+                hit = true,
+                x = hitX,
+                y = hitY,
+                z = hitZ
+            ) ?: continue
+            removedIds.add(current.entityId)
+            removedOut.add(removed)
+        }
+    }
+
+    private fun resolveThrownItemImpactOnPlayer(
+        snapshot: ThrownItemSnapshot,
+        target: PlayerSession
+    ): Triple<Double, Double, Double> {
+        val hitbox = expandedPlayerHitbox(target)
+        val minX = hitbox[0]
+        val maxX = hitbox[1]
+        val minY = hitbox[2]
+        val maxY = hitbox[3]
+        val minZ = hitbox[4]
+        val maxZ = hitbox[5]
+        val entryT = segmentAabbEntryTime(
+            x0 = snapshot.prevX,
+            y0 = snapshot.prevY,
+            z0 = snapshot.prevZ,
+            x1 = snapshot.x,
+            y1 = snapshot.y,
+            z1 = snapshot.z,
+            minX = minX,
+            maxX = maxX,
+            minY = minY,
+            maxY = maxY,
+            minZ = minZ,
+            maxZ = maxZ
+        )
+        val clampedT = entryT?.coerceIn(0.0, 1.0) ?: 1.0
+        val x = snapshot.prevX + (snapshot.x - snapshot.prevX) * clampedT
+        val y = snapshot.prevY + (snapshot.y - snapshot.prevY) * clampedT
+        val z = snapshot.prevZ + (snapshot.z - snapshot.prevZ) * clampedT
+        return Triple(x.coerceIn(minX, maxX), y.coerceIn(minY, maxY), z.coerceIn(minZ, maxZ))
+    }
+
+    private fun thrownItemHitsPlayer(snapshot: ThrownItemSnapshot, target: PlayerSession): Boolean {
+        val hitbox = expandedPlayerHitbox(target)
+        val minX = hitbox[0]
+        val maxX = hitbox[1]
+        val minY = hitbox[2]
+        val maxY = hitbox[3]
+        val minZ = hitbox[4]
+        val maxZ = hitbox[5]
+        if (snapshot.x in minX..maxX && snapshot.y in minY..maxY && snapshot.z in minZ..maxZ) return true
+        return segmentAabbEntryTime(
+            x0 = snapshot.prevX,
+            y0 = snapshot.prevY,
+            z0 = snapshot.prevZ,
+            x1 = snapshot.x,
+            y1 = snapshot.y,
+            z1 = snapshot.z,
+            minX = minX,
+            maxX = maxX,
+            minY = minY,
+            maxY = maxY,
+            minZ = minZ,
+            maxZ = maxZ
+        ) != null
+    }
+
+    private fun expandedPlayerHitbox(target: PlayerSession): DoubleArray {
+        val playerHeight = when {
+            target.swimming -> 0.6
+            target.sneaking -> 1.5
+            else -> 1.8
+        }
+        val minX = target.x - PLAYER_HITBOX_HALF_WIDTH - THROWN_ITEM_HITBOX_RADIUS
+        val maxX = target.x + PLAYER_HITBOX_HALF_WIDTH + THROWN_ITEM_HITBOX_RADIUS
+        val minY = target.y - THROWN_ITEM_HITBOX_RADIUS
+        val maxY = target.y + playerHeight + THROWN_ITEM_HITBOX_RADIUS
+        val minZ = target.z - PLAYER_HITBOX_HALF_WIDTH - THROWN_ITEM_HITBOX_RADIUS
+        val maxZ = target.z + PLAYER_HITBOX_HALF_WIDTH + THROWN_ITEM_HITBOX_RADIUS
+        return doubleArrayOf(minX, maxX, minY, maxY, minZ, maxZ)
+    }
+
+    private fun segmentAabbEntryTime(
+        x0: Double,
+        y0: Double,
+        z0: Double,
+        x1: Double,
+        y1: Double,
+        z1: Double,
+        minX: Double,
+        maxX: Double,
+        minY: Double,
+        maxY: Double,
+        minZ: Double,
+        maxZ: Double
+    ): Double? {
+        val epsilon = 1.0e-8
+        var tMin = 0.0
+        var tMax = 1.0
+
+        fun clip(p0: Double, p1: Double, min: Double, max: Double): Boolean {
+            val d = p1 - p0
+            if (kotlin.math.abs(d) <= epsilon) {
+                return p0 in min..max
+            }
+            val inv = 1.0 / d
+            var t1 = (min - p0) * inv
+            var t2 = (max - p0) * inv
+            if (t1 > t2) {
+                val tmp = t1
+                t1 = t2
+                t2 = tmp
+            }
+            if (t2 < tMin || t1 > tMax) return false
+            if (t1 > tMin) tMin = t1
+            if (t2 < tMax) tMax = t2
+            return tMin <= tMax
+        }
+
+        if (!clip(x0, x1, minX, maxX)) return null
+        if (!clip(y0, y1, minY, maxY)) return null
+        if (!clip(z0, z1, minZ, maxZ)) return null
+        return tMin.coerceIn(0.0, 1.0)
     }
 
     private fun updateRetainedBaseWorldChunks(sessionsByWorld: Map<String, List<PlayerSession>>) {
@@ -772,74 +2588,6 @@ object PlayerSessionManager {
         return active
     }
 
-    private fun ensureDroppedItemDispatchLoop() {
-        if (droppedItemDispatchRunning.get()) return
-        if (!droppedItemDispatchRunning.compareAndSet(false, true)) return
-        droppedItemDispatchThread = Thread(::runDroppedItemDispatchLoop, "aerogel-dropped-item-dispatch").apply {
-            isDaemon = true
-            start()
-        }
-    }
-
-    private fun runDroppedItemDispatchLoop() {
-        var lastConfiguredMaxTps = Double.NaN
-        var tickIntervalNanos = 50_000_000L
-        var uncapped = false
-        var nextDeadline = System.nanoTime()
-        var lastTickNanos = System.nanoTime()
-        while (droppedItemDispatchRunning.get()) {
-            val configuredMaxTps = ServerConfig.maxTps
-            if (configuredMaxTps != lastConfiguredMaxTps) {
-                lastConfiguredMaxTps = configuredMaxTps
-                if (configuredMaxTps == -1.0) {
-                    uncapped = true
-                } else {
-                    uncapped = false
-                    tickIntervalNanos = (1_000_000_000.0 / configuredMaxTps)
-                        .roundToLong()
-                        .coerceAtLeast(1L)
-                    nextDeadline = System.nanoTime() + tickIntervalNanos
-                }
-            }
-
-            if (!uncapped) {
-                var now = System.nanoTime()
-                var remaining = nextDeadline - now
-                if (remaining > DROPPED_ITEM_COARSE_PARK_THRESHOLD_NANOS) {
-                    val parkNanos = (remaining - DROPPED_ITEM_COARSE_PARK_GUARD_NANOS).coerceAtLeast(1L)
-                    LockSupport.parkNanos(parkNanos)
-                    now = System.nanoTime()
-                    remaining = nextDeadline - now
-                }
-                while (remaining > 0L) {
-                    Thread.onSpinWait()
-                    now = System.nanoTime()
-                    remaining = nextDeadline - now
-                }
-            }
-
-            val now = System.nanoTime()
-            val deltaSeconds = ((now - lastTickNanos).coerceAtLeast(0L) / 1_000_000_000.0)
-                .coerceAtMost(MAX_DROPPED_ITEM_DELTA_SECONDS)
-            lastTickNanos = now
-            try {
-                // Keep physics packet cadence stable: avoid bursty back-to-back substep dispatch
-                // that can amplify client-side arrival jitter under catch-up.
-                drainDroppedItemEvents(deltaSeconds)
-                maybeSendChunkMsptActionBar(now)
-            } catch (_: Throwable) {
-                // Keep dispatcher alive even if one cycle fails.
-            }
-            if (!uncapped) {
-                nextDeadline += tickIntervalNanos
-                val lateBy = System.nanoTime() - nextDeadline
-                if (lateBy > tickIntervalNanos * MAX_DROPPED_ITEM_LAG_TICKS_BEFORE_RESYNC) {
-                    nextDeadline = System.nanoTime() + tickIntervalNanos
-                }
-            }
-        }
-    }
-
     private fun advanceAndBroadcastWorldTime(deltaSeconds: Double) {
         val worlds = WorldManager.allWorlds()
         if (worlds.isEmpty()) return
@@ -855,9 +2603,9 @@ object PlayerSessionManager {
             var shouldBroadcast = false
             var worldAge = 0L
             var timeOfDay = 0L
-            synchronized(state) {
+            run {
                 state.worldAgeTicks += tickDelta
-                state.timeOfDayTicks = normalizeTimeOfDayTicks(state.timeOfDayTicks + tickDelta)
+                state.timeOfDayTicks += tickDelta
                 state.broadcastAccumulatorSeconds += deltaSeconds
                 if (state.broadcastAccumulatorSeconds >= WORLD_TIME_BROADCAST_INTERVAL_SECONDS) {
                     state.broadcastAccumulatorSeconds -= WORLD_TIME_BROADCAST_INTERVAL_SECONDS
@@ -900,6 +2648,15 @@ object PlayerSessionManager {
         onGround: Boolean
     ) {
         val session = sessions[channelId] ?: return
+        if (session.ridingAnimalEntityId >= 0) {
+            session.yaw = yaw
+            session.pitch = pitch
+            session.onGround = onGround
+            session.clientEyeX = session.x
+            session.clientEyeY = session.y + playerEyeOffset(session)
+            session.clientEyeZ = session.z
+            return
+        }
         val ctx = contexts[channelId]
         val world = WorldManager.world(session.worldKey)
         val previousX = session.x
@@ -919,7 +2676,16 @@ object PlayerSessionManager {
         session.yaw = yaw
         session.pitch = pitch
         session.onGround = onGround
-        updateFallDistance(session, wasOnGround, onGround, deltaY)
+        updateFallDistance(session, world, wasOnGround, onGround, deltaY)
+        applyMovementFoodExhaustion(
+            session = session,
+            world = world,
+            deltaX = deltaX,
+            deltaY = deltaY,
+            deltaZ = deltaZ,
+            wasOnGround = wasOnGround,
+            onGround = onGround
+        )
 
         val encodedX = encodeRelativePosition4096(x)
         val encodedY = encodeRelativePosition4096(y)
@@ -932,11 +2698,9 @@ object PlayerSessionManager {
                 dy < Short.MIN_VALUE.toLong() || dy > Short.MAX_VALUE.toLong() ||
                 dz < Short.MIN_VALUE.toLong() || dz > Short.MAX_VALUE.toLong()
 
-        // Do not infer swimming from jump/fall alone.
-        // Require an intentional low-profile input combination to avoid false swim pose on jump.
-        val inferredSwimming = session.sprinting && session.sneaking && !onGround
-        val swimmingChanged = session.swimming != inferredSwimming
-        session.swimming = inferredSwimming
+        session.clientEyeX = x
+        session.clientEyeY = y + playerEyeOffset(session)
+        session.clientEyeZ = z
 
         val packet = if (requiresTeleportSync) {
             PlayPackets.entityPositionSyncPacket(
@@ -963,22 +2727,12 @@ object PlayerSessionManager {
             entityId = session.entityId,
             headYaw = yaw
         )
-        val statePacket = if (swimmingChanged) {
-            PlayPackets.playerSharedFlagsMetadataPacket(
-                entityId = session.entityId,
-                sneaking = session.sneaking,
-                sprinting = session.sprinting,
-                swimming = session.swimming
-            )
-        } else null
-
         for ((id, other) in sessions) {
             if (id == channelId || other.worldKey != session.worldKey) continue
             val otherCtx = contexts[id] ?: continue
             if (otherCtx.channel().isActive) {
                 otherCtx.write(packet)
                 otherCtx.write(headLookPacket)
-                if (statePacket != null) otherCtx.write(statePacket)
                 otherCtx.flush()
             }
         }
@@ -1001,21 +2755,93 @@ object PlayerSessionManager {
         }
     }
 
-    private fun updateFallDistance(session: PlayerSession, wasOnGround: Boolean, onGround: Boolean, deltaY: Double) {
-        if (session.gameMode != GAME_MODE_SURVIVAL || session.dead) {
+    private fun applyMovementFoodExhaustion(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World?,
+        deltaX: Double,
+        deltaY: Double,
+        deltaZ: Double,
+        wasOnGround: Boolean,
+        onGround: Boolean
+    ) {
+        if (session.dead) return
+        if (session.gameMode != GAME_MODE_SURVIVAL) return
+        if (world == null) return
+        if (deltaX.isNaN() || deltaY.isNaN() || deltaZ.isNaN()) return
+        if (deltaX.isInfinite() || deltaY.isInfinite() || deltaZ.isInfinite()) return
+        val beforeFood = session.food
+        val beforeSaturation = session.saturation
+
+        val horizontalMeters = sqrt(deltaX * deltaX + deltaZ * deltaZ)
+        val totalMeters = sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ)
+        val horizontalCentimeters = (horizontalMeters * VANILLA_STAT_CENTIMETER_SCALE).roundToLong().coerceAtLeast(0L)
+        val totalCentimeters = (totalMeters * VANILLA_STAT_CENTIMETER_SCALE).roundToLong().coerceAtLeast(0L)
+
+        val feetInWater = isWaterAt(world, session.x, session.y, session.z)
+        val eyeInWater = isWaterAt(world, session.clientEyeX, session.clientEyeY, session.clientEyeZ)
+
+        when {
+            // Vanilla water movement exhaustion: 0.01 exhaustion per block moved in water.
+            eyeInWater -> {
+                if (totalCentimeters > 0L) {
+                    applyFoodExhaustion(session, (totalCentimeters.toFloat() * VANILLA_WATER_EXHAUSTION_PER_CENTIMETER))
+                }
+            }
+            feetInWater -> {
+                if (horizontalCentimeters > 0L) {
+                    applyFoodExhaustion(session, (horizontalCentimeters.toFloat() * VANILLA_WATER_EXHAUSTION_PER_CENTIMETER))
+                }
+            }
+            // Vanilla sprinting exhaustion: 0.1 exhaustion per block moved on ground while sprinting.
+            onGround && session.sprinting -> {
+                if (horizontalCentimeters > 0L) {
+                    applyFoodExhaustion(session, (horizontalCentimeters.toFloat() * VANILLA_SPRINT_EXHAUSTION_PER_CENTIMETER))
+                }
+            }
+        }
+
+        // Vanilla jump exhaustion.
+        if (wasOnGround && !onGround && deltaY > VANILLA_JUMP_MIN_ASCENT_METERS) {
+            applyFoodExhaustion(
+                session,
+                if (session.sprinting) VANILLA_SPRINT_JUMP_EXHAUSTION else VANILLA_JUMP_EXHAUSTION
+            )
+        }
+        if (session.food != beforeFood || session.saturation != beforeSaturation) {
+            sendHealthPacket(session)
+        }
+    }
+
+    private fun isWaterAt(world: org.macaroon3145.world.World, x: Double, y: Double, z: Double): Boolean {
+        val bx = floor(x).toInt()
+        val by = floor(y).toInt()
+        val bz = floor(z).toInt()
+        val stateId = world.blockStateAt(bx, by, bz)
+        if (stateId <= 0) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        return parsed.blockKey == "minecraft:water"
+    }
+
+    private fun updateFallDistance(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World?,
+        wasOnGround: Boolean,
+        onGround: Boolean,
+        deltaY: Double
+    ) {
+        if (session.dead || session.gameMode == GAME_MODE_SPECTATOR || (session.gameMode == GAME_MODE_CREATIVE && session.flying)) {
             session.fallDistance = 0.0
             return
         }
-        if (onGround) {
-            if (wasOnGround) {
-                session.fallDistance = 0.0
-            }
-            return
+        val inWater = world != null && isWaterAt(world, session.x, session.y, session.z)
+        if (!inWater && deltaY < 0.0) {
+            session.fallDistance += -deltaY
+        } else if (deltaY > 0.0) {
+            // Vanilla resets fall distance when jumping/upward impulse starts.
+            session.fallDistance = 0.0
         }
-        when {
-            deltaY < 0.0 -> session.fallDistance += -deltaY
-            deltaY > 0.0 -> session.fallDistance = 0.0
-            wasOnGround -> session.fallDistance = 0.0
+        if (onGround && wasOnGround) {
+            session.fallDistance = 0.0
         }
     }
 
@@ -1042,64 +2868,402 @@ object PlayerSessionManager {
         val attacker = sessions[attackerChannelId] ?: return
         if (attacker.dead) return
         if (attacker.gameMode == GAME_MODE_SPECTATOR) return
-
-        val target = sessions.values.firstOrNull { it.entityId == targetEntityId } ?: return
-        if (target.channelId == attackerChannelId) return
-        if (target.worldKey != attacker.worldKey) return
-        if (target.dead) return
-        if (target.gameMode == GAME_MODE_SPECTATOR) return
-        if (target.gameMode == GAME_MODE_CREATIVE) return
-
-        val dx = attacker.x - target.x
-        val dy = attacker.y - target.y
-        val dz = attacker.z - target.z
-        val distanceSq = dx * dx + dy * dy + dz * dz
-        if (distanceSq > MAX_PLAYER_MELEE_REACH_SQ) return
-
-        val attackStrengthScale = 1.0f
+        val world = WorldManager.world(attacker.worldKey) ?: return
+        val attackStrengthScale = playerAttackStrengthScale(attacker, 0.5f)
         val strongAttack = attackStrengthScale > VANILLA_STRONG_ATTACK_THRESHOLD
         val knockbackAttack = attacker.sprinting && strongAttack
-        val criticalAttack = strongAttack && canCriticalAttack(attacker, target)
-        val sweepAttack = canSweepAttack(attacker, strongAttack, criticalAttack, knockbackAttack)
-        var damage = meleeAttackDamage(attacker).coerceAtLeast(1.0f)
+        var playedSweep = false
+
+        val playerTarget = sessions.values.firstOrNull {
+            it.entityId == targetEntityId &&
+                it.channelId != attackerChannelId &&
+                it.worldKey == attacker.worldKey &&
+                !it.dead &&
+                it.gameMode != GAME_MODE_SPECTATOR &&
+                it.gameMode != GAME_MODE_CREATIVE
+        }
+        if (playerTarget != null) {
+            val dx = attacker.x - playerTarget.x
+            val dy = attacker.y - playerTarget.y
+            val dz = attacker.z - playerTarget.z
+            val distanceSq = dx * dx + dy * dy + dz * dz
+            if (distanceSq > MAX_PLAYER_MELEE_REACH_SQ) return
+            resetPlayerAttackStrengthTicker(attacker)
+
+            val criticalAttack = strongAttack && canCriticalAttack(attacker, playerTarget)
+            val sweepAttack = canSweepAttack(attacker, strongAttack, criticalAttack, knockbackAttack)
+            var damage = scaledPlayerBaseDamage(meleeAttackDamage(attacker).coerceAtLeast(1.0f), attackStrengthScale)
+            if (criticalAttack) {
+                damage *= VANILLA_CRITICAL_DAMAGE_MULTIPLIER
+            }
+
+            damagePlayer(
+                session = playerTarget,
+                amount = damage,
+                damageTypeId = PLAYER_ATTACK_DAMAGE_TYPE_ID,
+                hurtSoundId = PLAYER_HURT_SOUND_ID,
+                bigHurtSoundId = PLAYER_HURT_SOUND_ID,
+                deathMessage = PlayPackets.ChatComponent.Translate(
+                    key = "death.attack.player",
+                    args = listOf(
+                        playerNameComponent(playerTarget.profile),
+                        playerNameComponent(attacker.profile)
+                    )
+                )
+            )
+            if (criticalAttack) {
+                broadcastEntityAnimation(attacker.worldKey, playerTarget.entityId, ENTITY_ANIMATION_CRITICAL_HIT)
+            }
+
+            val knockbackStrength = BASE_PLAYER_KNOCKBACK + if (knockbackAttack) SPRINT_KNOCKBACK_BONUS else 0.0
+            applyVanillaKnockback(attacker, playerTarget, knockbackStrength)
+            if (sweepAttack) {
+                playedSweep = true
+                applySweepAttack(attacker, playerTarget, damageTypeId = PLAYER_ATTACK_DAMAGE_TYPE_ID)
+            }
+            playAttackFeedback(attacker, knockbackAttack, criticalAttack, strongAttack, playedSweep)
+            return
+        }
+
+        val animalTarget = world.animalSnapshot(targetEntityId) ?: return
+        val dx = attacker.x - animalTarget.x
+        val dy = attacker.y - animalTarget.y
+        val dz = attacker.z - animalTarget.z
+        val distanceSq = dx * dx + dy * dy + dz * dz
+        if (distanceSq > MAX_PLAYER_MELEE_REACH_SQ) return
+        resetPlayerAttackStrengthTicker(attacker)
+
+        val criticalAttack = strongAttack && canCriticalAttackAgainstPoint(attacker, animalTarget.x, animalTarget.y, animalTarget.z)
+        var damage = scaledPlayerBaseDamage(meleeAttackDamage(attacker).coerceAtLeast(1.0f), attackStrengthScale)
         if (criticalAttack) {
             damage *= VANILLA_CRITICAL_DAMAGE_MULTIPLIER
         }
-
-        damagePlayer(
-            session = target,
+        val damageResult = world.damageAnimal(
+            entityId = animalTarget.entityId,
             amount = damage,
-            damageTypeId = PLAYER_ATTACK_DAMAGE_TYPE_ID,
-            hurtSoundId = PLAYER_HURT_SOUND_ID,
-            bigHurtSoundId = PLAYER_HURT_SOUND_ID,
-            deathMessage = PlayPackets.ChatComponent.Translate(
-                key = "death.attack.player",
-                args = listOf(
-                    playerNameComponent(target.profile),
-                    playerNameComponent(attacker.profile)
+            cause = AnimalDamageCause.PLAYER_ATTACK
+        ) ?: return
+        if (criticalAttack) {
+            broadcastEntityAnimation(attacker.worldKey, animalTarget.entityId, ENTITY_ANIMATION_CRITICAL_HIT)
+        }
+        broadcastAnimalDamageFeedback(attacker.worldKey, damageResult.damage)
+        if (damageResult.removed?.died == true) {
+            val wasSaddled = damageResult.removed.entityId in saddledAnimalEntityIds
+            spawnAnimalDeathDrops(world, damageResult.removed, attacker, dropSaddle = wasSaddled)
+            broadcastAnimalDeath(attacker.worldKey, damageResult.removed)
+            broadcastAnimalRemoval(attacker.worldKey, damageResult.removed.entityId)
+        }
+
+        val knockbackStrength = if (knockbackAttack) ANIMAL_SPRINT_ATTACK_KNOCKBACK else ANIMAL_BASE_ATTACK_KNOCKBACK
+        applyAnimalKnockback(attacker, animalTarget, world, knockbackStrength)
+        playAttackFeedback(
+            attacker = attacker,
+            knockbackAttack = knockbackAttack,
+            criticalAttack = criticalAttack,
+            strongAttack = strongAttack,
+            sweepAttack = false
+        )
+    }
+
+    fun handlePlayerInteractEntity(channelId: ChannelId, targetEntityId: Int, hand: Int) {
+        if (hand !in 0..1) return
+        val session = sessions[channelId] ?: return
+        if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) return
+        val world = WorldManager.world(session.worldKey) ?: return
+        val animal = world.animalSnapshot(targetEntityId) ?: return
+        if (animal.kind != AnimalKind.PIG) return
+
+        val dx = session.x - animal.x
+        val dy = session.y - animal.y
+        val dz = session.z - animal.z
+        if ((dx * dx) + (dy * dy) + (dz * dz) > MAX_PLAYER_MELEE_REACH_SQ) return
+
+        val selectedSlot = session.selectedHotbarSlot.coerceIn(0, 8)
+        val itemId = if (hand == 1) session.offhandItemId else session.hotbarItemIds[selectedSlot]
+        val itemCount = if (hand == 1) session.offhandItemCount else session.hotbarItemCounts[selectedSlot]
+
+        // Keep breeding interaction precedence over riding/saddle behavior.
+        if (itemCount > 0 && itemId in pigFoodItemIds && itemId != carrotOnAStickItemId) {
+            return
+        }
+
+        if (itemCount > 0 && itemId == saddleItemId && saddleItemId >= 0 && animal.entityId !in saddledAnimalEntityIds) {
+            saddledAnimalEntityIds.add(animal.entityId)
+            if (session.gameMode != GAME_MODE_CREATIVE) {
+                consumePlacedItem(session, hand)
+            }
+            broadcastPigSaddleEquip(session.worldKey, animal.entityId, animal.x, animal.y, animal.z)
+            return
+        }
+
+        if (tryMountPig(session, animal.entityId)) {
+            return
+        }
+    }
+
+    fun handlePlayerDismountRequest(channelId: ChannelId) {
+        val session = sessions[channelId] ?: return
+        dismountPlayerFromAnimal(session)
+    }
+
+    fun captureClientVehicleMove(
+        channelId: ChannelId,
+        x: Double,
+        y: Double,
+        z: Double,
+        yaw: Float,
+        pitch: Float,
+        onGround: Boolean
+    ) {
+        val session = sessions[channelId] ?: return
+        if (session.ridingAnimalEntityId < 0) return
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite() || !yaw.isFinite() || !pitch.isFinite()) return
+        val dx = x - session.lastClientVehicleX
+        val dy = y - session.lastClientVehicleY
+        val dz = z - session.lastClientVehicleZ
+        val distSq = dx * dx + dy * dy + dz * dz
+        if (distSq > MAX_CLIENT_VEHICLE_POSE_DELTA_SQ) return
+        session.lastClientVehicleX = x
+        session.lastClientVehicleY = y
+        session.lastClientVehicleZ = z
+        session.lastClientVehicleYaw = yaw
+        session.lastClientVehiclePitch = pitch
+        session.lastClientVehicleOnGround = onGround
+        session.lastClientVehiclePacketAtNanos = System.nanoTime()
+    }
+
+    private fun tryMountPig(session: PlayerSession, animalEntityId: Int): Boolean {
+        if (session.sneaking) return false
+        if (session.ridingAnimalEntityId == animalEntityId) return true
+        if (animalEntityId !in saddledAnimalEntityIds) return false
+        val existingRider = animalRiderEntityIdByAnimalEntityId[animalEntityId]
+        if (existingRider != null && existingRider != session.entityId) return false
+        if (session.ridingAnimalEntityId >= 0) {
+            dismountPlayerFromAnimal(session)
+        }
+        animalRiderEntityIdByAnimalEntityId[animalEntityId] = session.entityId
+        animalEntityIdByRiderEntityId[session.entityId] = animalEntityId
+        session.ridingAnimalEntityId = animalEntityId
+        // Seed vehicle pose baseline from mounted entity so the first client vehicle packet
+        // is not rejected by the movement delta guard.
+        val mounted = WorldManager.world(session.worldKey)?.animalSnapshot(animalEntityId)
+        if (mounted != null) {
+            session.lastClientVehicleX = mounted.x
+            session.lastClientVehicleY = mounted.y
+            session.lastClientVehicleZ = mounted.z
+            session.lastClientVehicleYaw = mounted.yaw
+            session.lastClientVehiclePitch = mounted.pitch
+            session.lastClientVehicleOnGround = mounted.onGround
+            session.lastClientVehiclePacketAtNanos = System.nanoTime()
+        }
+        broadcastAnimalPassengers(session.worldKey, animalEntityId)
+        return true
+    }
+
+    private fun dismountPlayerFromAnimal(session: PlayerSession) {
+        val mountedAnimalEntityId =
+            animalEntityIdByRiderEntityId.remove(session.entityId)
+                ?: session.ridingAnimalEntityId.takeIf { it >= 0 }
+                ?: return
+        val world = WorldManager.world(session.worldKey)
+        val mountedAnimalSnapshot = world?.animalSnapshot(mountedAnimalEntityId)
+        val mappedRider = animalRiderEntityIdByAnimalEntityId[mountedAnimalEntityId]
+        if (mappedRider == session.entityId) {
+            animalRiderEntityIdByAnimalEntityId.remove(mountedAnimalEntityId)
+        }
+        session.ridingAnimalEntityId = -1
+        broadcastAnimalPassengers(session.worldKey, mountedAnimalEntityId)
+        if (world != null && mountedAnimalSnapshot != null && mountedAnimalSnapshot.kind == AnimalKind.PIG) {
+            val dismountPos = findPigDismountPosition(world, mountedAnimalSnapshot)
+            if (dismountPos != null) {
+                teleportPlayer(
+                    target = session,
+                    x = dismountPos.first,
+                    y = dismountPos.second,
+                    z = dismountPos.third,
+                    yaw = null,
+                    pitch = null
+                )
+            }
+        }
+    }
+
+    private fun findPigDismountPosition(
+        world: org.macaroon3145.world.World,
+        animal: AnimalSnapshot
+    ): Triple<Double, Double, Double>? {
+        val baseYaw = animal.yaw
+        val angles = floatArrayOf(
+            baseYaw + 90.0f,
+            baseYaw - 90.0f,
+            baseYaw + 135.0f,
+            baseYaw - 135.0f,
+            baseYaw + 180.0f,
+            baseYaw
+        )
+        val baseY = floor(animal.y + 1.0e-6)
+        for (angle in angles) {
+            val offset = passengerDismountOffset(
+                passengerWidth = PLAYER_HITBOX_HALF_WIDTH * 2.0,
+                vehicleWidth = animal.hitboxWidth,
+                yawDegrees = angle
+            )
+            val x = animal.x + offset.first
+            val z = animal.z + offset.second
+            for (yOffset in intArrayOf(0, 1, -1)) {
+                val y = baseY + yOffset
+                if (!hasSupportBelow(world, x, y, z)) continue
+                if (!isPlayerAabbClear(world, x, y, z, 1.8)) continue
+                return Triple(x, y, z)
+            }
+        }
+        return null
+    }
+
+    // Mirrors vanilla Entity#getPassengerDismountOffset shape (width-based radial offset).
+    private fun passengerDismountOffset(
+        passengerWidth: Double,
+        vehicleWidth: Double,
+        yawDegrees: Float
+    ): Pair<Double, Double> {
+        val half = ((passengerWidth + vehicleWidth) + 9.999999747378752e-6) / 2.0
+        val yawRad = Math.toRadians(yawDegrees.toDouble())
+        val sin = -sin(yawRad)
+        val cos = cos(yawRad)
+        val scale = max(abs(sin), abs(cos))
+        if (scale <= 1.0e-9) return 0.0 to half
+        return (sin * half / scale) to (cos * half / scale)
+    }
+
+    private fun hasSupportBelow(world: org.macaroon3145.world.World, x: Double, y: Double, z: Double): Boolean {
+        val blockX = floor(x).toInt()
+        val blockY = floor(y).toInt()
+        val blockZ = floor(z).toInt()
+        return isSupportBlock(world.blockStateAt(blockX, blockY - 1, blockZ))
+    }
+
+    private fun isPlayerAabbClear(
+        world: org.macaroon3145.world.World,
+        x: Double,
+        y: Double,
+        z: Double,
+        height: Double
+    ): Boolean {
+        val minX = x - PLAYER_HITBOX_HALF_WIDTH
+        val maxX = x + PLAYER_HITBOX_HALF_WIDTH
+        val minY = y
+        val maxY = y + height
+        val minZ = z - PLAYER_HITBOX_HALF_WIDTH
+        val maxZ = z + PLAYER_HITBOX_HALF_WIDTH
+
+        val startX = floor(minX).toInt()
+        val endX = floor(maxX - 1.0e-7).toInt()
+        val startY = floor(minY).toInt()
+        val endY = floor(maxY - 1.0e-7).toInt()
+        val startZ = floor(minZ).toInt()
+        val endZ = floor(maxZ - 1.0e-7).toInt()
+
+        for (bx in startX..endX) {
+            for (by in startY..endY) {
+                for (bz in startZ..endZ) {
+                    val stateId = world.blockStateAt(bx, by, bz)
+                    if (stateId == 0) continue
+                    if (isSupportBlock(stateId)) return false
+                }
+            }
+        }
+        return true
+    }
+
+    private fun dismountAnimalRider(worldKey: String, animalEntityId: Int) {
+        val riderEntityId = animalRiderEntityIdByAnimalEntityId.remove(animalEntityId) ?: return
+        animalEntityIdByRiderEntityId.remove(riderEntityId)
+        val rider = sessions.values.firstOrNull { it.entityId == riderEntityId && it.worldKey == worldKey }
+        if (rider != null) {
+            rider.ridingAnimalEntityId = -1
+            // Pig death/forced dismount path must re-anchor rider entity for observers.
+            // While mounted, rider movement packets are intentionally suppressed.
+            broadcastForcedDismountRiderSync(rider)
+        }
+        broadcastAnimalPassengers(worldKey, animalEntityId)
+    }
+
+    private fun broadcastForcedDismountRiderSync(rider: PlayerSession) {
+        val positionPacket = PlayPackets.entityPositionSyncPacket(
+            entityId = rider.entityId,
+            x = rider.x,
+            y = rider.y,
+            z = rider.z,
+            yaw = rider.yaw,
+            pitch = rider.pitch,
+            onGround = rider.onGround
+        )
+        val headLookPacket = PlayPackets.entityHeadLookPacket(
+            entityId = rider.entityId,
+            headYaw = rider.yaw
+        )
+        val statePacket = PlayPackets.playerSharedFlagsMetadataPacket(
+            entityId = rider.entityId,
+            sneaking = rider.sneaking,
+            sprinting = rider.sprinting,
+            swimming = rider.swimming
+        )
+        for ((_, other) in sessions) {
+            if (other.channelId == rider.channelId) continue
+            if (other.worldKey != rider.worldKey) continue
+            val ctx = contexts[other.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(positionPacket)
+            ctx.write(headLookPacket)
+            ctx.write(statePacket)
+            ctx.flush()
+        }
+    }
+
+    private fun broadcastAnimalPassengers(worldKey: String, animalEntityId: Int) {
+        val riderEntityId = animalRiderEntityIdByAnimalEntityId[animalEntityId]
+        val passengers = if (riderEntityId != null) intArrayOf(riderEntityId) else IntArray(0)
+        val packet = PlayPackets.setPassengersPacket(animalEntityId, passengers)
+        for ((_, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            if (other.entityId != riderEntityId && animalEntityId !in other.visibleAnimalEntityIds) continue
+            val ctx = contexts[other.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
+    private fun broadcastPigSaddleEquip(worldKey: String, animalEntityId: Int, x: Double, y: Double, z: Double) {
+        val saddleId = saddleItemId
+        if (saddleId < 0) return
+        val saddlePacket = PlayPackets.entityEquipmentPacket(
+            animalEntityId,
+            listOf(
+                PlayPackets.EquipmentEntry(
+                    slot = 7,
+                    encodedItemStack = PlayPackets.encodeItemStack(saddleId, 1)
                 )
             )
         )
-
-        val knockbackStrength = BASE_PLAYER_KNOCKBACK + if (knockbackAttack) SPRINT_KNOCKBACK_BONUS else 0.0
-        applyVanillaKnockback(attacker, target, knockbackStrength)
-        if (knockbackAttack) {
-            attacker.sprinting = false
-            updateAndBroadcastPlayerState(attacker.channelId, sprinting = false)
-            broadcastAttackSound(attacker, PLAYER_ATTACK_KNOCKBACK_SOUND_ID)
-        } else if (criticalAttack) {
-            broadcastAttackSound(attacker, PLAYER_ATTACK_CRIT_SOUND_ID)
-        } else if (sweepAttack) {
-            // Vanilla does not play strong/weak when sweep triggers.
-        } else if (strongAttack) {
-            broadcastAttackSound(attacker, PLAYER_ATTACK_STRONG_SOUND_ID)
-        } else {
-            broadcastAttackSound(attacker, PLAYER_ATTACK_WEAK_SOUND_ID)
-        }
-
-        if (sweepAttack) {
-            broadcastAttackSound(attacker, PLAYER_ATTACK_SWEEP_SOUND_ID)
-            applySweepAttack(attacker, target, damageTypeId = PLAYER_ATTACK_DAMAGE_TYPE_ID)
+        val soundPacket = PlayPackets.soundPacketByKey(
+            soundKey = "minecraft:entity.pig.saddle",
+            soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+            x = x,
+            y = y + 0.5,
+            z = z,
+            volume = 0.5f,
+            pitch = 1.0f,
+            seed = ThreadLocalRandom.current().nextLong()
+        )
+        for ((_, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            if (animalEntityId !in other.visibleAnimalEntityIds) continue
+            val ctx = contexts[other.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(saddlePacket)
+            ctx.write(soundPacket)
+            ctx.flush()
         }
     }
 
@@ -1107,6 +3271,34 @@ object PlayerSessionManager {
         val heldItemId = attacker.hotbarItemIds[attacker.selectedHotbarSlot.coerceIn(0, 8)]
         val heldItemKey = heldItemKey(heldItemId) ?: return BASE_UNARMED_DAMAGE
         return vanillaAttackDamageByItemKey(heldItemKey)
+    }
+
+    private fun playerAttackStrengthScale(session: PlayerSession, partialTicks: Float): Float {
+        val delayTicks = playerAttackStrengthDelayTicks(session)
+        if (!delayTicks.isFinite() || delayTicks <= 1.0e-6f) return 1.0f
+        // Vanilla increments attackStrengthTicker in whole ticks.
+        // Keep delta-time accumulation, but quantize to whole ticks for damage scaling parity.
+        val wholeTicks = floor(session.attackStrengthTickerTicks).toFloat()
+        val scaled = ((wholeTicks + partialTicks) / delayTicks)
+        return scaled.coerceIn(0.0f, 1.0f)
+    }
+
+    private fun resetPlayerAttackStrengthTicker(session: PlayerSession) {
+        session.attackStrengthTickerTicks = 0.0
+    }
+
+    private fun playerAttackStrengthDelayTicks(session: PlayerSession): Float {
+        val heldItemId = session.hotbarItemIds[session.selectedHotbarSlot.coerceIn(0, 8)]
+        val heldItemKey = heldItemKey(heldItemId)
+        val attackSpeed = vanillaAttackSpeedByItemKey(heldItemKey)
+        if (!attackSpeed.isFinite() || attackSpeed <= 1.0e-6f) return DEFAULT_ATTACK_STRENGTH_DELAY_TICKS
+        return (MINECRAFT_TICKS_PER_SECOND.toFloat() / attackSpeed).coerceAtLeast(1.0f)
+    }
+
+    private fun scaledPlayerBaseDamage(baseDamage: Float, attackStrengthScale: Float): Float {
+        val clamped = attackStrengthScale.coerceIn(0.0f, 1.0f)
+        val factor = 0.2f + (clamped * clamped) * 0.8f
+        return baseDamage * factor
     }
 
     private fun heldItemKey(itemId: Int): String? {
@@ -1163,12 +3355,52 @@ object PlayerSessionManager {
         }
     }
 
+    private fun vanillaAttackSpeedByItemKey(itemKey: String?): Float {
+        if (itemKey.isNullOrEmpty()) return BASE_UNARMED_ATTACK_SPEED
+        val key = itemKey.substringAfter("minecraft:")
+        return when {
+            key.endsWith("_sword") -> 1.6f
+            key.endsWith("_axe") -> when {
+                key.startsWith("wooden_") -> 0.8f
+                key.startsWith("stone_") -> 0.8f
+                key.startsWith("iron_") -> 0.9f
+                key.startsWith("diamond_") -> 1.0f
+                key.startsWith("netherite_") -> 1.0f
+                key.startsWith("golden_") -> 1.0f
+                else -> 0.8f
+            }
+            key.endsWith("_pickaxe") -> 1.2f
+            key.endsWith("_shovel") -> 1.0f
+            key.endsWith("_hoe") -> when {
+                key.startsWith("wooden_") -> 1.0f
+                key.startsWith("stone_") -> 2.0f
+                key.startsWith("iron_") -> 3.0f
+                key.startsWith("diamond_") -> 4.0f
+                key.startsWith("netherite_") -> 4.0f
+                key.startsWith("golden_") -> 1.0f
+                else -> 1.0f
+            }
+            key == "trident" -> 1.1f
+            else -> BASE_UNARMED_ATTACK_SPEED
+        }
+    }
+
     private fun canCriticalAttack(attacker: PlayerSession, target: PlayerSession): Boolean {
         return attacker.fallDistance > 0.0 &&
             !attacker.onGround &&
             !attacker.sprinting &&
+            !attacker.swimming &&
             !attacker.dead &&
             !target.dead
+    }
+
+    private fun canCriticalAttackAgainstPoint(attacker: PlayerSession, targetX: Double, targetY: Double, targetZ: Double): Boolean {
+        if (attacker.dead || attacker.onGround || attacker.sprinting || attacker.swimming) return false
+        if (attacker.fallDistance <= 0.0) return false
+        val dx = attacker.x - targetX
+        val dy = attacker.y - targetY
+        val dz = attacker.z - targetZ
+        return dx * dx + dy * dy + dz * dz <= MAX_PLAYER_MELEE_REACH_SQ
     }
 
     private fun canSweepAttack(
@@ -1185,14 +3417,41 @@ object PlayerSessionManager {
         return heldItemKey.endsWith("_sword")
     }
 
+    private fun playAttackFeedback(
+        attacker: PlayerSession,
+        knockbackAttack: Boolean,
+        criticalAttack: Boolean,
+        strongAttack: Boolean,
+        sweepAttack: Boolean
+    ) {
+        if (knockbackAttack) {
+            attacker.sprinting = false
+            updateAndBroadcastPlayerState(attacker.channelId, sprinting = false)
+            broadcastAttackSound(attacker, PLAYER_ATTACK_KNOCKBACK_SOUND_ID)
+            return
+        }
+        if (criticalAttack) {
+            broadcastAttackSound(attacker, PLAYER_ATTACK_CRIT_SOUND_ID)
+            return
+        }
+        if (sweepAttack) {
+            broadcastAttackSound(attacker, PLAYER_ATTACK_SWEEP_SOUND_ID)
+            return
+        }
+        if (strongAttack) {
+            broadcastAttackSound(attacker, PLAYER_ATTACK_STRONG_SOUND_ID)
+            return
+        }
+        broadcastAttackSound(attacker, PLAYER_ATTACK_WEAK_SOUND_ID)
+    }
+
     private fun applyVanillaKnockback(attacker: PlayerSession, target: PlayerSession, strength: Double) {
         if (strength <= 0.0) return
 
-        // Do not use packet-to-packet position delta as knockback base velocity.
-        // It over-amplifies knockback under jitter and low packet rates.
-        val horizontalBaseX = 0.0
-        val horizontalBaseY = 0.0
-        val horizontalBaseZ = 0.0
+        // Match vanilla LivingEntity#knockback: use target's current motion as base.
+        val horizontalBaseX = target.velocityX
+        val horizontalBaseY = target.velocityY
+        val horizontalBaseZ = target.velocityZ
         val yawRad = Math.toRadians(attacker.yaw.toDouble())
         val knockDirX = sin(yawRad)
         val knockDirZ = -cos(yawRad)
@@ -1203,7 +3462,8 @@ object PlayerSessionManager {
         val normalizedZ = knockDirZ / norm
         val nextVx = (horizontalBaseX * 0.5) - (normalizedX * strength)
         val nextVz = (horizontalBaseZ * 0.5) - (normalizedZ * strength)
-        val nextVy = if (target.onGround) {
+        val groundedForKnockback = target.onGround || kotlin.math.abs(horizontalBaseY) <= 1.0e-6
+        val nextVy = if (groundedForKnockback) {
             minOf(0.4, (horizontalBaseY * 0.5) + strength)
         } else {
             horizontalBaseY
@@ -1247,6 +3507,62 @@ object PlayerSessionManager {
         }
     }
 
+    private fun applyAnimalKnockback(
+        attacker: PlayerSession,
+        target: AnimalSnapshot,
+        world: org.macaroon3145.world.World,
+        strength: Double
+    ) {
+        if (strength <= 0.0) return
+        val yawRad = Math.toRadians(attacker.yaw.toDouble())
+        val knockDirX = sin(yawRad)
+        val knockDirZ = -cos(yawRad)
+        val norm = sqrt((knockDirX * knockDirX) + (knockDirZ * knockDirZ))
+        if (norm <= 1.0e-6) return
+
+        val normalizedX = knockDirX / norm
+        val normalizedZ = knockDirZ / norm
+        // Match vanilla LivingEntity#knockback:
+        // newVel = oldVel/2 - normalizedDir*strength, and Y boost only when on ground.
+        val nextVx = (target.vx * 0.5) - (normalizedX * strength)
+        val nextVz = (target.vz * 0.5) - (normalizedZ * strength)
+        val groundedForKnockback = target.onGround || kotlin.math.abs(target.vy) <= 1.0e-6
+        val nextVy = if (groundedForKnockback) {
+            // AnimalSystem integrates gravity before movement; compensate one tick so effective lift matches vanilla.
+            minOf(0.4 + KNOCKBACK_Y_PRE_GRAVITY_COMPENSATION, (target.vy * 0.5) + strength + KNOCKBACK_Y_PRE_GRAVITY_COMPENSATION)
+        } else {
+            target.vy
+        }
+        if (!world.setAnimalVelocity(target.entityId, nextVx, nextVy, nextVz)) return
+        broadcastAnimalVelocity(attacker.worldKey, target.entityId, nextVx, nextVy, nextVz)
+        broadcastAttackKnockbackAt(
+            worldKey = attacker.worldKey,
+            x = target.x,
+            y = target.y + target.hitboxHeight * 0.5,
+            z = target.z
+        )
+    }
+
+    private fun broadcastAttackKnockbackAt(worldKey: String, x: Double, y: Double, z: Double) {
+        val packet = PlayPackets.soundPacketByKey(
+            soundKey = "minecraft:entity.player.attack.knockback",
+            soundSourceId = PLAYERS_SOUND_SOURCE_ID,
+            x = x,
+            y = y,
+            z = z,
+            volume = 1.0f,
+            pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
+            seed = ThreadLocalRandom.current().nextLong()
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
     private fun broadcastEntityVelocity(session: PlayerSession, vx: Double, vy: Double, vz: Double) {
         val velocityPacket = PlayPackets.entityVelocityPacket(
             entityId = session.entityId,
@@ -1256,6 +3572,22 @@ object PlayerSessionManager {
         )
         for ((id, other) in sessions) {
             if (other.worldKey != session.worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(velocityPacket)
+            ctx.flush()
+        }
+    }
+
+    private fun broadcastAnimalVelocity(worldKey: String, entityId: Int, vx: Double, vy: Double, vz: Double) {
+        val velocityPacket = PlayPackets.entityVelocityPacket(
+            entityId = entityId,
+            vx = vx,
+            vy = vy,
+            vz = vz
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != worldKey) continue
             val ctx = contexts[id] ?: continue
             if (!ctx.channel().isActive) continue
             ctx.write(velocityPacket)
@@ -1282,6 +3614,219 @@ object PlayerSessionManager {
         }
     }
 
+    private fun broadcastEntityAnimation(worldKey: String, entityId: Int, animationType: Int) {
+        val packet = PlayPackets.entityAnimationPacket(entityId, animationType)
+        for ((id, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
+    private fun broadcastAnimalDamageFeedback(worldKey: String, damage: org.macaroon3145.world.AnimalDamagedEvent) {
+        val damageTypeId = when (damage.cause) {
+            AnimalDamageCause.FALL -> FALL_DAMAGE_TYPE_ID
+            AnimalDamageCause.PLAYER_ATTACK -> PLAYER_ATTACK_DAMAGE_TYPE_ID
+            AnimalDamageCause.GENERIC -> PLAYER_ATTACK_DAMAGE_TYPE_ID
+        }
+        val hurtAnimationPacket = PlayPackets.hurtAnimationPacket(damage.entityId, 0f)
+        val damageEventPacket = PlayPackets.damageEventPacket(damage.entityId, damageTypeId)
+        val snapshot = WorldManager.world(worldKey)?.animalSnapshot(damage.entityId)
+        val damageSoundPackets = snapshot?.let {
+            val packets = ArrayList<ByteArray>(2)
+            for (soundKey in animalDamageSoundKeys(damage)) {
+                packets.add(
+                    PlayPackets.soundPacketByKey(
+                        soundKey = soundKey,
+                        soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+                        x = it.x,
+                        y = it.y + it.hitboxHeight * 0.5,
+                        z = it.z,
+                        volume = 1.0f,
+                        pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
+                        seed = ThreadLocalRandom.current().nextLong()
+                    )
+                )
+            }
+            packets
+        } ?: emptyList()
+        for ((id, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(hurtAnimationPacket)
+            ctx.write(damageEventPacket)
+            for (soundPacket in damageSoundPackets) {
+                ctx.write(soundPacket)
+            }
+            ctx.flush()
+        }
+    }
+
+    private fun animalDamageSoundKeys(damage: org.macaroon3145.world.AnimalDamagedEvent): List<String> {
+        return when (damage.cause) {
+            AnimalDamageCause.FALL -> {
+                if (damage.died) {
+                    listOf(if (damage.amount > 4.0f) ANIMAL_BIG_FALL_SOUND_KEY else ANIMAL_SMALL_FALL_SOUND_KEY)
+                } else {
+                    listOf(
+                        if (damage.amount > 4.0f) ANIMAL_BIG_FALL_SOUND_KEY else ANIMAL_SMALL_FALL_SOUND_KEY,
+                        damage.kind.hurtSoundKey
+                    )
+                }
+            }
+            AnimalDamageCause.PLAYER_ATTACK, AnimalDamageCause.GENERIC -> {
+                if (damage.died) emptyList() else listOf(damage.kind.hurtSoundKey)
+            }
+        }
+    }
+
+    private fun broadcastAnimalDeath(worldKey: String, removed: org.macaroon3145.world.AnimalRemovedEvent) {
+        val packet = PlayPackets.entityEventPacket(removed.entityId, ENTITY_EVENT_DEATH_ANIMATION)
+        val deathSoundPacket = PlayPackets.soundPacketByKey(
+            soundKey = removed.kind.deathSoundKey,
+            soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+            x = removed.x,
+            y = removed.y + 0.5,
+            z = removed.z,
+            volume = 1.0f,
+            pitch = (0.9f + ThreadLocalRandom.current().nextFloat() * 0.2f),
+            seed = ThreadLocalRandom.current().nextLong()
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.write(deathSoundPacket)
+            ctx.flush()
+        }
+    }
+
+    private fun broadcastAnimalRemoval(worldKey: String, entityId: Int) {
+        scheduleAnimalRemoval(worldKey, entityId)
+    }
+
+    private fun spawnAnimalDeathDrops(
+        world: org.macaroon3145.world.World,
+        removed: org.macaroon3145.world.AnimalRemovedEvent,
+        attacker: PlayerSession?,
+        dropSaddle: Boolean
+    ) {
+        when (removed.kind) {
+            AnimalKind.PIG -> spawnPigDeathDrops(world, removed, attacker, dropSaddle)
+        }
+    }
+
+    private fun spawnPigDeathDrops(
+        world: org.macaroon3145.world.World,
+        removed: org.macaroon3145.world.AnimalRemovedEvent,
+        attacker: PlayerSession?,
+        dropSaddle: Boolean
+    ) {
+        val random = ThreadLocalRandom.current()
+        if (dropSaddle && saddleItemId >= 0) {
+            world.spawnDroppedItem(
+                entityId = allocateEntityId(),
+                itemId = saddleItemId,
+                itemCount = 1,
+                x = removed.x,
+                y = removed.y + 0.1,
+                z = removed.z,
+                vx = random.nextDouble(BLOCK_DROP_HORIZONTAL_SPEED_MIN, BLOCK_DROP_HORIZONTAL_SPEED_MAX),
+                vy = BLOCK_DROP_VERTICAL_SPEED,
+                vz = random.nextDouble(BLOCK_DROP_HORIZONTAL_SPEED_MIN, BLOCK_DROP_HORIZONTAL_SPEED_MAX),
+                pickupDelaySeconds = BLOCK_DROP_PICKUP_DELAY_SECONDS
+            )
+        }
+        val rule = EntityLootDropCache.rule(AnimalKind.PIG.entityTypeKey) ?: return
+        val itemId = if (shouldPigDropCooked(attacker)) {
+            rule.cookedItemId ?: rule.rawItemId
+        } else {
+            rule.rawItemId
+        }
+        if (itemId < 0) return
+
+        val minBase = rule.minCount.coerceAtLeast(0)
+        val maxBase = rule.maxCount.coerceAtLeast(minBase)
+        val baseCount = if (maxBase > minBase) random.nextInt(minBase, maxBase + 1) else maxBase
+        val lootingLevel = playerMainHandLootingLevel(attacker)
+        val lootingBonus = if (lootingLevel > 0) {
+            val minLoot = (rule.lootingMinBonusPerLevel * lootingLevel).coerceAtLeast(0)
+            val maxLoot = (rule.lootingMaxBonusPerLevel * lootingLevel).coerceAtLeast(minLoot)
+            if (maxLoot > minLoot) random.nextInt(minLoot, maxLoot + 1) else maxLoot
+        } else {
+            0
+        }
+        val totalCount = (baseCount + lootingBonus).coerceAtLeast(1)
+
+        world.spawnDroppedItem(
+            entityId = allocateEntityId(),
+            itemId = itemId,
+            itemCount = totalCount,
+            x = removed.x,
+            y = removed.y + 0.1,
+            z = removed.z,
+            vx = random.nextDouble(BLOCK_DROP_HORIZONTAL_SPEED_MIN, BLOCK_DROP_HORIZONTAL_SPEED_MAX),
+            vy = BLOCK_DROP_VERTICAL_SPEED,
+            vz = random.nextDouble(BLOCK_DROP_HORIZONTAL_SPEED_MIN, BLOCK_DROP_HORIZONTAL_SPEED_MAX),
+            pickupDelaySeconds = BLOCK_DROP_PICKUP_DELAY_SECONDS
+        )
+    }
+
+    private fun playerMainHandLootingLevel(attacker: PlayerSession?): Int {
+        // Current inventory/session model does not retain item enchantments.
+        return 0
+    }
+
+    private fun shouldPigDropCooked(attacker: PlayerSession?): Boolean {
+        // Current animal state does not expose burn state and player items do not carry enchant metadata.
+        return false
+    }
+
+    private fun scheduleAnimalRemoval(worldKey: String, entityId: Int) {
+        val key = "$worldKey:$entityId"
+        if (!pendingAnimalRemovalKeys.add(key)) return
+        pendingAnimalRemovals.add(
+            PendingAnimalRemoval(
+                worldKey = worldKey,
+                entityId = entityId,
+                dueAtNanos = System.nanoTime() + (ANIMAL_DEATH_REMOVE_DELAY_SECONDS * 1_000_000_000L).toLong()
+            )
+        )
+    }
+
+    private fun flushPendingAnimalRemovals() {
+        if (pendingAnimalRemovals.isEmpty()) return
+        val now = System.nanoTime()
+        val removalsByContext = HashMap<ChannelHandlerContext, MutableList<Int>>()
+        while (true) {
+            val next = pendingAnimalRemovals.peek() ?: break
+            if (next.dueAtNanos > now) break
+            pendingAnimalRemovals.poll() ?: continue
+            dismountAnimalRider(next.worldKey, next.entityId)
+            saddledAnimalEntityIds.remove(next.entityId)
+            pigBoostStatesByAnimalEntityId.remove(next.entityId)
+            WorldManager.world(next.worldKey)?.removeAnimal(next.entityId, died = true)
+            for ((id, other) in sessions) {
+                if (other.worldKey != next.worldKey) continue
+                if (!other.visibleAnimalEntityIds.remove(next.entityId)) continue
+                other.animalTrackerStates.remove(next.entityId)
+                val ctx = contexts[id] ?: continue
+                if (!ctx.channel().isActive) continue
+                removalsByContext.computeIfAbsent(ctx) { ArrayList() }.add(next.entityId)
+            }
+            pendingAnimalRemovalKeys.remove("${next.worldKey}:${next.entityId}")
+        }
+        for ((ctx, entityIds) in removalsByContext) {
+            if (entityIds.isEmpty()) continue
+            val packet = PlayPackets.removeEntitiesPacket(entityIds.toIntArray())
+            enqueueChannelFlushPacket(ctx, packet)
+        }
+    }
+
     private fun damagePlayer(
         session: PlayerSession,
         amount: Float,
@@ -1292,14 +3837,23 @@ object PlayerSessionManager {
     ) {
         if (session.dead || amount <= 0f) return
         if (session.gameMode == GAME_MODE_SPECTATOR || session.gameMode == GAME_MODE_CREATIVE) return
-        val nextHealth = (session.health - amount).coerceAtLeast(0f)
+        val effectiveAmount = effectiveDamageAfterPlayerInvulnerability(session, amount)
+        if (effectiveAmount <= DAMAGE_EPSILON) return
+        val nextHealth = (session.health - effectiveAmount).coerceAtLeast(0f)
         if (nextHealth == session.health) return
         session.health = nextHealth
-        broadcastDamageFeedback(session, amount, damageTypeId, hurtSoundId, bigHurtSoundId)
+        session.hurtInvulnerableSeconds = HURT_INVULNERABILITY_SECONDS
+        session.lastHurtAmount = amount
+        broadcastDamageFeedback(session, effectiveAmount, damageTypeId, hurtSoundId, bigHurtSoundId)
         sendHealthPacket(session)
         if (nextHealth <= 0f) {
             handlePlayerDeath(session, deathMessage)
         }
+    }
+
+    private fun effectiveDamageAfterPlayerInvulnerability(session: PlayerSession, incomingAmount: Float): Float {
+        if (session.hurtInvulnerableSeconds <= 0.0) return incomingAmount
+        return 0f
     }
 
     private fun broadcastDamageFeedback(
@@ -1341,6 +3895,7 @@ object PlayerSessionManager {
 
     private fun handlePlayerDeath(session: PlayerSession, deathMessage: PlayPackets.ChatComponent) {
         if (session.dead) return
+        dismountPlayerFromAnimal(session)
         session.dead = true
         session.fallDistance = 0.0
         broadcastDeathAnimation(session)
@@ -1361,15 +3916,33 @@ object PlayerSessionManager {
         }
     }
 
+    private fun broadcastEntityEventInWorld(session: PlayerSession, eventId: Int) {
+        val packet = PlayPackets.entityEventPacket(
+            entityId = session.entityId,
+            eventId = eventId
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != session.worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
     private fun respawnPlayer(session: PlayerSession) {
         val world = WorldManager.world(session.worldKey) ?: WorldManager.defaultWorld()
         val spawn = FoliaSidecarSpawnPointProvider.spawnPointFor(world.key)
             ?: world.spawnPointForPlayer(session.profile.uuid)
         val ctx = contexts[session.channelId]
+        dismountPlayerFromAnimal(session)
         session.dead = false
         session.health = MAX_PLAYER_HEALTH
         session.food = DEFAULT_PLAYER_FOOD
         session.saturation = DEFAULT_PLAYER_SATURATION
+        session.foodExhaustion = 0f
+        session.regenAccumulatorSeconds = 0.0
+        stopUsingItem(session)
         session.fallDistance = 0.0
         session.sneaking = false
         session.sprinting = false
@@ -1409,6 +3982,10 @@ object PlayerSessionManager {
         session.droppedItemTrackerStates.clear()
         session.visibleFallingBlockEntityIds.clear()
         session.fallingBlockTrackerStates.clear()
+        session.visibleThrownItemEntityIds.clear()
+        session.thrownItemTrackerStates.clear()
+        session.visibleAnimalEntityIds.clear()
+        session.animalTrackerStates.clear()
         val toUnload = ArrayList<ChunkPos>(session.loadedChunks)
         session.loadedChunks.clear()
         for (pos in toUnload) {
@@ -1449,6 +4026,7 @@ object PlayerSessionManager {
         if (sneaking != null) session.sneaking = sneaking
         if (sprinting != null) session.sprinting = sprinting
         if (swimming != null) session.swimming = swimming
+        session.clientEyeY = session.y + playerEyeOffset(session)
 
         val metadataPacket = PlayPackets.playerSharedFlagsMetadataPacket(
             entityId = session.entityId,
@@ -1462,6 +4040,53 @@ object PlayerSessionManager {
             val otherCtx = contexts[id] ?: continue
             if (!otherCtx.channel().isActive) continue
             otherCtx.writeAndFlush(metadataPacket)
+        }
+    }
+
+    fun updatePlayerInputState(
+        channelId: ChannelId,
+        forward: Boolean,
+        backward: Boolean,
+        left: Boolean,
+        right: Boolean,
+        jump: Boolean,
+        sneaking: Boolean,
+        sprinting: Boolean,
+        swimming: Boolean
+    ) {
+        val session = sessions[channelId] ?: return
+        val wasSneaking = session.sneaking
+        session.inputForward = forward
+        session.inputBackward = backward
+        session.inputLeft = left
+        session.inputRight = right
+        session.inputJump = jump
+        updateAndBroadcastPlayerState(
+            channelId = channelId,
+            sneaking = sneaking,
+            sprinting = sprinting,
+            swimming = swimming
+        )
+        // Some clients emit dismount intent via input sneak flag while mounted
+        // (without a distinct Entity Action packet in the same moment).
+        if (!wasSneaking && sneaking && session.ridingAnimalEntityId >= 0) {
+            handlePlayerDismountRequest(channelId)
+        }
+    }
+
+    fun updatePlayerFlyingState(channelId: ChannelId, flying: Boolean) {
+        val session = sessions[channelId] ?: return
+        session.flying = flying
+        if (session.gameMode == GAME_MODE_CREATIVE && flying) {
+            session.fallDistance = 0.0
+        }
+    }
+
+    private fun playerEyeOffset(session: PlayerSession): Double {
+        return when {
+            session.swimming -> 0.4
+            session.sneaking -> 1.27
+            else -> 1.62
         }
     }
 
@@ -1481,8 +4106,17 @@ object PlayerSessionManager {
     }
 
     fun leave(channelId: ChannelId) {
+        val existing = sessions[channelId]
+        if (existing != null) {
+            dismountPlayerFromAnimal(existing)
+            when (existing.openContainerType) {
+                CONTAINER_TYPE_CRAFTING_TABLE -> closeCraftingTable(existing)
+                CONTAINER_TYPE_FURNACE -> closeFurnace(existing)
+            }
+        }
         val removed = sessions.remove(channelId) ?: return
         contexts.remove(channelId)
+        channelFlushStates.remove(channelId)
 
         val removeEntitiesPacket = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
         val removeInfoPacket = PlayPackets.playerInfoRemovePacket(listOf(removed.profile.uuid))
@@ -1507,14 +4141,34 @@ object PlayerSessionManager {
     }
 
     fun shutdown() {
-        droppedItemDispatchRunning.set(false)
-        droppedItemDispatchThread?.interrupt()
-        droppedItemDispatchThread = null
+        val shutdownMessagePacket = PlayPackets.systemChatPacket(
+            PlayPackets.ChatComponent.Translate("multiplayer.disconnect.server_shutdown")
+        )
+        val notifyFutures = ArrayList<ChannelFuture>(contexts.size)
         for ((_, ctx) in contexts) {
-            runCatching { ctx.close() }
+            if (!ctx.channel().isActive) continue
+            val future = runCatching { ctx.writeAndFlush(shutdownMessagePacket) }.getOrNull() ?: continue
+            notifyFutures.add(future)
         }
+        for (future in notifyFutures) {
+            runCatching { future.syncUninterruptibly() }
+        }
+
+        val closeFutures = ArrayList<ChannelFuture>(contexts.size)
+        for ((_, ctx) in contexts) {
+            val future = runCatching { ctx.close() }.getOrNull() ?: continue
+            closeFutures.add(future)
+        }
+        for (future in closeFutures) {
+            runCatching { future.syncUninterruptibly() }
+        }
+        channelFlushStates.clear()
         contexts.clear()
         sessions.clear()
+        saddledAnimalEntityIds.clear()
+        animalRiderEntityIdByAnimalEntityId.clear()
+        animalEntityIdByRiderEntityId.clear()
+        pigBoostStatesByAnimalEntityId.clear()
     }
 
     fun broadcastChat(channelId: ChannelId, message: String) {
@@ -1525,6 +4179,7 @@ object PlayerSessionManager {
             dispatchCommandAsync(sender, clean)
             return
         }
+        ServerI18n.log("aerogel.log.chat.message", sender.profile.username, clean)
         val packet = PlayPackets.systemChatPacket(
             PlayPackets.ChatComponent.Text(
                 text = "<",
@@ -1729,12 +4384,14 @@ object PlayerSessionManager {
             }
             "gamemode" -> gamemodeCommandCompletions(activeArgIndex, activeArgPrefix)
             "tp", "teleport" -> tpCommandCompletions(sender, providedArgs, activeArgIndex, activeArgPrefix)
-            "time" -> timeCommandCompletions(providedArgs, activeArgIndex, activeArgPrefix)
+            "time" -> timeCommandCompletions(sender, providedArgs, activeArgIndex, activeArgPrefix)
+            "perf" -> perfCommandCompletions(activeArgIndex, activeArgPrefix)
             else -> emptyList()
         }
     }
 
     private fun timeCommandCompletions(
+        sender: PlayerSession?,
         providedArgs: List<String>,
         activeArgIndex: Int,
         activeArgPrefix: String
@@ -1756,7 +4413,7 @@ object PlayerSessionManager {
                 "query" -> queryKinds
                 else -> emptyList()
             }
-            2 -> if (subcommand in subcommands) worldKeys else emptyList()
+            2 -> if (sender == null && subcommand in subcommands) worldKeys else emptyList()
             else -> emptyList()
         }
         val appendUnitSuffix = shouldAppendTimeSetUnitSuffix(
@@ -1784,6 +4441,22 @@ object PlayerSessionManager {
         val base = ArrayList<String>(aliases.size)
         base.addAll(aliases)
         return base
+    }
+
+    private fun perfCommandCompletions(
+        activeArgIndex: Int,
+        activeArgPrefix: String
+    ): List<String> {
+        if (activeArgIndex != 0) return emptyList()
+        val candidates = WorldManager.allWorlds()
+            .asSequence()
+            .map { it.key.substringAfter(':', it.key) }
+            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+            .toList()
+        return candidates.asSequence()
+            .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+            .distinct()
+            .toList()
     }
 
     private fun gamemodeCommandCompletions(
@@ -1959,7 +4632,7 @@ object PlayerSessionManager {
     }
 
     private fun loadPersistedOperators() {
-        synchronized(operatorFileLock) {
+        run {
             persistedOperatorUuids.clear()
             if (!Files.exists(operatorFilePath)) return
             try {
@@ -1989,7 +4662,7 @@ object PlayerSessionManager {
     }
 
     private fun savePersistedOperators() {
-        synchronized(operatorFileLock) {
+        run {
             try {
                 val uuidLines = persistedOperatorUuids.asSequence()
                     .map(UUID::toString)
@@ -2112,17 +4785,28 @@ object PlayerSessionManager {
             val ctx = contexts[session.channelId] ?: continue
             if (!ctx.channel().isActive) continue
             val world = WorldManager.world(session.worldKey) ?: continue
-            val mspt = world.chunkMspt(session.centerChunkX, session.centerChunkZ)
+            val isIdle = world.isChunkIdle(session.centerChunkX, session.centerChunkZ)
+            val message = if (isIdle) {
+                String.format(
+                    Locale.ROOT,
+                    "Chunk (%d, %d) 유휴 상태",
+                    session.centerChunkX,
+                    session.centerChunkZ
+                )
+            } else {
+                val mspt = world.chunkMspt(session.centerChunkX, session.centerChunkZ)
+                val tps = world.chunkTps(session.centerChunkX, session.centerChunkZ)
+                String.format(
+                    Locale.ROOT,
+                    "Chunk (%d, %d) MSPT: %.3f ms | TPS: %.2f",
+                    session.centerChunkX,
+                    session.centerChunkZ,
+                    mspt,
+                    tps
+                )
+            }
             val packet = PlayPackets.systemChatPacket(
-                PlayPackets.ChatComponent.Text(
-                    String.format(
-                        Locale.ROOT,
-                        "Chunk (%d, %d) MSPT: %.3f ms",
-                        session.centerChunkX,
-                        session.centerChunkZ,
-                        mspt
-                    )
-                ),
+                PlayPackets.ChatComponent.Text(message),
                 overlay = true
             )
             session.lastChunkMsptActionBarAtNanos = nowNanos
@@ -2561,11 +5245,1811 @@ object PlayerSessionManager {
         return normalizedPending
     }
 
+    fun handleContainerClick(
+        channelId: ChannelId,
+        containerId: Int,
+        _stateId: Int,
+        slot: Int,
+        button: Int,
+        clickType: Int
+    ) {
+        val session = sessions[channelId] ?: return
+        if (clickType == CLICK_TYPE_QUICK_CRAFT) {
+            val shouldResync = handleQuickCraftDrag(session, containerId, slot, button)
+            if (shouldResync) {
+                resyncContainerForSession(session, containerId)
+            }
+            return
+        }
+        resetQuickCraftDrag(session)
+        if (clickType == CLICK_TYPE_QUICK_MOVE) {
+            handleQuickMoveClick(session, containerId, slot)
+            resyncContainerForSession(session, containerId)
+            return
+        }
+        if (clickType == CLICK_TYPE_SWAP) {
+            handleHotbarSwapClick(session, containerId, slot, button)
+            resyncContainerForSession(session, containerId)
+            return
+        }
+        if (clickType == CLICK_TYPE_PICKUP_ALL) {
+            handlePickupAllDoubleClick(session, containerId, slot, button)
+            resyncContainerForSession(session, containerId)
+            return
+        }
+        // Support vanilla pickup clicks only; other modes are safely ignored with a full resync.
+        if (clickType != CLICK_TYPE_PICKUP) {
+            resyncContainerForSession(session, containerId)
+            return
+        }
+        when {
+            containerId == PLAYER_INVENTORY_CONTAINER_ID -> {
+                handlePlayerInventoryPickupClick(session, slot, button)
+                resyncContainerForSession(session, PLAYER_INVENTORY_CONTAINER_ID)
+            }
+            session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && session.openContainerId == containerId -> {
+                handleCraftingTablePickupClick(session, slot, button)
+                resyncContainerForSession(session, containerId)
+            }
+            session.openContainerType == CONTAINER_TYPE_FURNACE && session.openContainerId == containerId -> {
+                handleFurnacePickupClick(session, containerId, slot, button)
+                resyncContainerForSession(session, containerId)
+            }
+            else -> {
+                // stale container id from client
+                resyncContainerForSession(
+                    session,
+                    when (session.openContainerType) {
+                        CONTAINER_TYPE_CRAFTING_TABLE, CONTAINER_TYPE_FURNACE -> session.openContainerId
+                        else -> PLAYER_INVENTORY_CONTAINER_ID
+                    }
+                )
+            }
+        }
+    }
+
+    private fun handleQuickCraftDrag(
+        session: PlayerSession,
+        containerId: Int,
+        slot: Int,
+        button: Int
+    ): Boolean {
+        val stage = button and 3
+        val mouseButton = (button shr 2) and 3
+        when (stage) {
+            0 -> {
+                if (!isQuickCraftContainerValid(session, containerId)) {
+                    resetQuickCraftDrag(session)
+                    return true
+                }
+                if (mouseButton !in 0..1) {
+                    resetQuickCraftDrag(session)
+                    return true
+                }
+                session.quickCraftActive = true
+                session.quickCraftContainerId = containerId
+                session.quickCraftMouseButton = mouseButton
+                session.quickCraftSlots.clear()
+                return false
+            }
+            1 -> {
+                if (!session.quickCraftActive || session.quickCraftContainerId != containerId) return true
+                if (session.cursorItemId < 0 || session.cursorItemCount <= 0) return true
+                if (!isQuickCraftTargetSlot(session, containerId, slot)) return true
+                session.quickCraftSlots.add(slot)
+                return false
+            }
+            2 -> {
+                if (!session.quickCraftActive || session.quickCraftContainerId != containerId) {
+                    resetQuickCraftDrag(session)
+                    return true
+                }
+                applyQuickCraftDrag(session, containerId)
+                resetQuickCraftDrag(session)
+                return true
+            }
+            else -> {
+                resetQuickCraftDrag(session)
+                return true
+            }
+        }
+    }
+
+    private fun applyQuickCraftDrag(session: PlayerSession, containerId: Int) {
+        if (session.cursorItemId < 0 || session.cursorItemCount <= 0) return
+        val targets = session.quickCraftSlots.toList().sorted()
+        if (targets.isEmpty()) return
+        if (session.quickCraftMouseButton == 1) {
+            for (slot in targets) {
+                if (session.cursorItemCount <= 0) break
+                quickCraftPlaceIntoSlot(session, containerId, slot, 1)
+            }
+            return
+        }
+        // Left-drag: distribute as evenly as possible across tracked slots.
+        var placedAny: Boolean
+        do {
+            placedAny = false
+            for (slot in targets) {
+                if (session.cursorItemCount <= 0) break
+                val placed = quickCraftPlaceIntoSlot(session, containerId, slot, 1)
+                if (placed > 0) placedAny = true
+            }
+        } while (placedAny && session.cursorItemCount > 0)
+    }
+
+    private fun quickCraftPlaceIntoSlot(
+        session: PlayerSession,
+        containerId: Int,
+        slot: Int,
+        maxToPlace: Int
+    ): Int {
+        if (maxToPlace <= 0) return 0
+        if (session.cursorItemId < 0 || session.cursorItemCount <= 0) return 0
+        val placeCap = maxToPlace.coerceAtMost(session.cursorItemCount)
+        if (placeCap <= 0) return 0
+
+        val (currentId, currentCount) = readContainerSlot(session, containerId, slot) ?: return 0
+        if (currentId < 0 || currentCount <= 0) {
+            writeContainerSlot(session, containerId, slot, session.cursorItemId, placeCap)
+            session.cursorItemCount -= placeCap
+            if (session.cursorItemCount <= 0) {
+                session.cursorItemId = -1
+                session.cursorItemCount = 0
+            }
+            onContainerSlotMutated(session, containerId, slot)
+            return placeCap
+        }
+        if (currentId != session.cursorItemId) return 0
+        if (currentCount >= MAX_HOTBAR_STACK_SIZE) return 0
+        val canAdd = (MAX_HOTBAR_STACK_SIZE - currentCount).coerceAtMost(placeCap)
+        if (canAdd <= 0) return 0
+        writeContainerSlot(session, containerId, slot, currentId, currentCount + canAdd)
+        session.cursorItemCount -= canAdd
+        if (session.cursorItemCount <= 0) {
+            session.cursorItemId = -1
+            session.cursorItemCount = 0
+        }
+        onContainerSlotMutated(session, containerId, slot)
+        return canAdd
+    }
+
+    private fun onContainerSlotMutated(session: PlayerSession, containerId: Int, slot: Int) {
+        if (containerId == PLAYER_INVENTORY_CONTAINER_ID && slot in 36..44) {
+            val hotbar = slot - 36
+            if (hotbar == session.selectedHotbarSlot) {
+                session.selectedBlockStateId = if (session.hotbarItemCounts[hotbar] > 0) session.hotbarBlockStateIds[hotbar] else 0
+                broadcastHeldItemEquipment(session)
+            }
+            return
+        }
+        if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && containerId == session.openContainerId && slot in TABLE_PLAYER_HOTBAR_SLOT_RANGE) {
+            val hotbar = slot - TABLE_PLAYER_HOTBAR_SLOT_RANGE.first
+            if (hotbar == session.selectedHotbarSlot) {
+                session.selectedBlockStateId = if (session.hotbarItemCounts[hotbar] > 0) session.hotbarBlockStateIds[hotbar] else 0
+                broadcastHeldItemEquipment(session)
+            }
+            return
+        }
+        if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId && slot in FURNACE_PLAYER_HOTBAR_SLOT_RANGE) {
+            val hotbar = slot - FURNACE_PLAYER_HOTBAR_SLOT_RANGE.first
+            if (hotbar == session.selectedHotbarSlot) {
+                session.selectedBlockStateId = if (session.hotbarItemCounts[hotbar] > 0) session.hotbarBlockStateIds[hotbar] else 0
+                broadcastHeldItemEquipment(session)
+            }
+        }
+    }
+
+    private fun readContainerSlot(session: PlayerSession, containerId: Int, slot: Int): Pair<Int, Int>? {
+        if (containerId == PLAYER_INVENTORY_CONTAINER_ID) {
+            if (slot in PLAYER_CRAFT_INPUT_SLOT_RANGE) {
+                val idx = slot - PLAYER_CRAFT_INPUT_SLOT_RANGE.first
+                return session.playerCraftItemIds[idx] to session.playerCraftItemCounts[idx]
+            }
+            val accessor = inventorySlotAccessor(session, slot, includeOffhand = true) ?: return null
+            return accessor.first.invoke()
+        }
+        if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && containerId == session.openContainerId) {
+            if (slot in TABLE_CRAFT_INPUT_SLOT_RANGE) {
+                val idx = slot - TABLE_CRAFT_INPUT_SLOT_RANGE.first
+                return session.tableCraftItemIds[idx] to session.tableCraftItemCounts[idx]
+            }
+            val accessor = inventorySlotAccessorForTable(session, slot) ?: return null
+            return accessor.first.invoke()
+        }
+        if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId) {
+            val furnace = openFurnaceState(session) ?: return null
+            return when (slot) {
+                FURNACE_INPUT_SLOT -> run { furnace.inputItemId to furnace.inputCount }
+                FURNACE_FUEL_SLOT -> run { furnace.fuelItemId to furnace.fuelCount }
+                FURNACE_RESULT_SLOT -> run { furnace.resultItemId to furnace.resultCount }
+                else -> {
+                    val accessor = inventorySlotAccessorForFurnace(session, slot) ?: return null
+                    accessor.first.invoke()
+                }
+            }
+        }
+        return null
+    }
+
+    private fun writeContainerSlot(session: PlayerSession, containerId: Int, slot: Int, itemId: Int, count: Int) {
+        if (containerId == PLAYER_INVENTORY_CONTAINER_ID) {
+            if (slot in PLAYER_CRAFT_INPUT_SLOT_RANGE) {
+                val idx = slot - PLAYER_CRAFT_INPUT_SLOT_RANGE.first
+                writeCraftSlot(session.playerCraftItemIds, session.playerCraftItemCounts, idx, itemId, count)
+                return
+            }
+            val accessor = inventorySlotAccessor(session, slot, includeOffhand = true) ?: return
+            accessor.second.invoke(itemId, count)
+            return
+        }
+        if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && containerId == session.openContainerId) {
+            if (slot in TABLE_CRAFT_INPUT_SLOT_RANGE) {
+                val idx = slot - TABLE_CRAFT_INPUT_SLOT_RANGE.first
+                writeCraftSlot(session.tableCraftItemIds, session.tableCraftItemCounts, idx, itemId, count)
+                return
+            }
+            val accessor = inventorySlotAccessorForTable(session, slot) ?: return
+            accessor.second.invoke(itemId, count)
+            return
+        }
+        if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId) {
+            val furnace = openFurnaceState(session) ?: return
+            when (slot) {
+                FURNACE_INPUT_SLOT -> writeFurnaceSlot(
+                    furnace,
+                    slot = FURNACE_INPUT_SLOT,
+                    itemId = itemId,
+                    count = count
+                )
+                FURNACE_FUEL_SLOT -> writeFurnaceSlot(
+                    furnace,
+                    slot = FURNACE_FUEL_SLOT,
+                    itemId = itemId,
+                    count = count
+                )
+                FURNACE_RESULT_SLOT -> writeFurnaceSlot(
+                    furnace,
+                    slot = FURNACE_RESULT_SLOT,
+                    itemId = itemId,
+                    count = count
+                )
+                else -> {
+                    val accessor = inventorySlotAccessorForFurnace(session, slot) ?: return
+                    accessor.second.invoke(itemId, count)
+                }
+            }
+            if (slot == FURNACE_INPUT_SLOT || slot == FURNACE_FUEL_SLOT || slot == FURNACE_RESULT_SLOT) {
+                refreshFurnaceActivity(
+                    key = FurnaceKey(session.worldKey, session.openFurnaceX, session.openFurnaceY, session.openFurnaceZ),
+                    furnace = furnace
+                )
+            }
+            return
+        }
+    }
+
+    private fun inventorySlotAccessorForTable(
+        session: PlayerSession,
+        slot: Int
+    ): Pair<() -> Pair<Int, Int>, (Int, Int) -> Unit>? {
+        val mapped = when (slot) {
+            in TABLE_PLAYER_MAIN_SLOT_RANGE -> slot - TABLE_PLAYER_MAIN_SLOT_RANGE.first
+            in TABLE_PLAYER_HOTBAR_SLOT_RANGE -> 27 + (slot - TABLE_PLAYER_HOTBAR_SLOT_RANGE.first)
+            else -> -1
+        }
+        if (mapped !in 0..35) return null
+        val inventorySlot = if (mapped < 27) inventorySlotForMainInventoryIndex(mapped) else 36 + (mapped - 27)
+        return inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
+    }
+
+    private fun inventorySlotAccessorForFurnace(
+        session: PlayerSession,
+        slot: Int
+    ): Pair<() -> Pair<Int, Int>, (Int, Int) -> Unit>? {
+        val mapped = when (slot) {
+            in FURNACE_PLAYER_MAIN_SLOT_RANGE -> slot - FURNACE_PLAYER_MAIN_SLOT_RANGE.first
+            in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> 27 + (slot - FURNACE_PLAYER_HOTBAR_SLOT_RANGE.first)
+            else -> -1
+        }
+        if (mapped !in 0..35) return null
+        val inventorySlot = if (mapped < 27) inventorySlotForMainInventoryIndex(mapped) else 36 + (mapped - 27)
+        return inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
+    }
+
+    private fun isQuickCraftContainerValid(session: PlayerSession, containerId: Int): Boolean {
+        if (containerId == PLAYER_INVENTORY_CONTAINER_ID) return true
+        return when (session.openContainerType) {
+            CONTAINER_TYPE_CRAFTING_TABLE, CONTAINER_TYPE_FURNACE -> containerId == session.openContainerId
+            else -> false
+        }
+    }
+
+    private fun isQuickCraftTargetSlot(session: PlayerSession, containerId: Int, slot: Int): Boolean {
+        if (containerId == PLAYER_INVENTORY_CONTAINER_ID) {
+            if (slot in PLAYER_CRAFT_INPUT_SLOT_RANGE) return true
+            return inventorySlotAccessor(session, slot, includeOffhand = true) != null
+        }
+        if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && containerId == session.openContainerId) {
+            if (slot in TABLE_CRAFT_INPUT_SLOT_RANGE) return true
+            return inventorySlotAccessorForTable(session, slot) != null
+        }
+        if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId) {
+            return when (slot) {
+                FURNACE_INPUT_SLOT, FURNACE_FUEL_SLOT -> true
+                FURNACE_RESULT_SLOT -> false
+                else -> inventorySlotAccessorForFurnace(session, slot) != null
+            }
+        }
+        return false
+    }
+
+    private fun resetQuickCraftDrag(session: PlayerSession) {
+        session.quickCraftActive = false
+        session.quickCraftContainerId = -1
+        session.quickCraftMouseButton = 0
+        session.quickCraftSlots.clear()
+    }
+
+    private fun handlePickupAllDoubleClick(
+        session: PlayerSession,
+        containerId: Int,
+        slot: Int,
+        button: Int
+    ) {
+        if (!isQuickCraftContainerValid(session, containerId)) return
+        if (button != 0) return
+
+        val cursorItemId = session.cursorItemId
+        val cursorCount = session.cursorItemCount
+        if (cursorItemId < 0 || cursorCount <= 0) {
+            val clickedItemId = readContainerSlot(session, containerId, slot)?.first ?: -1
+            if (clickedItemId < 0) return
+            quickMoveAllMatchingFromSlot(session, containerId, slot, clickedItemId)
+            return
+        }
+        val targetItemId = when {
+            cursorItemId >= 0 && cursorCount > 0 -> cursorItemId
+            else -> readContainerSlot(session, containerId, slot)?.first ?: -1
+        }
+        if (targetItemId < 0) return
+        if (cursorItemId >= 0 && cursorCount > 0 && cursorItemId != targetItemId) return
+
+        var nextCursorCount = if (cursorItemId >= 0 && cursorCount > 0) cursorCount else 0
+        if (nextCursorCount >= MAX_HOTBAR_STACK_SIZE) return
+
+        val candidateSlots = pickupAllCandidateSlots(session, containerId)
+        for (candidateSlot in candidateSlots) {
+            if (nextCursorCount >= MAX_HOTBAR_STACK_SIZE) break
+            val (slotItemId, slotItemCount) = readContainerSlot(session, containerId, candidateSlot) ?: continue
+            if (slotItemId != targetItemId || slotItemCount <= 0) continue
+            val remaining = MAX_HOTBAR_STACK_SIZE - nextCursorCount
+            if (remaining <= 0) break
+            val take = slotItemCount.coerceAtMost(remaining)
+            if (take <= 0) continue
+            val nextSlotCount = slotItemCount - take
+            if (nextSlotCount <= 0) {
+                writeContainerSlot(session, containerId, candidateSlot, -1, 0)
+            } else {
+                writeContainerSlot(session, containerId, candidateSlot, slotItemId, nextSlotCount)
+            }
+            onContainerSlotMutated(session, containerId, candidateSlot)
+            nextCursorCount += take
+        }
+
+        if (nextCursorCount <= 0) return
+        session.cursorItemId = targetItemId
+        session.cursorItemCount = nextCursorCount
+    }
+
+    private fun pickupAllCandidateSlots(session: PlayerSession, containerId: Int): List<Int> {
+        return if (containerId == PLAYER_INVENTORY_CONTAINER_ID) {
+            buildList(40) {
+                addAll(PLAYER_CRAFT_INPUT_SLOT_RANGE)
+                addAll(9..35)
+                addAll(36..44)
+                add(45)
+            }
+        } else if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId) {
+            buildList(38) {
+                add(FURNACE_INPUT_SLOT)
+                add(FURNACE_FUEL_SLOT)
+                addAll(FURNACE_PLAYER_MAIN_SLOT_RANGE)
+                addAll(FURNACE_PLAYER_HOTBAR_SLOT_RANGE)
+            }
+        } else if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && containerId == session.openContainerId) {
+            buildList(45) {
+                addAll(TABLE_CRAFT_INPUT_SLOT_RANGE)
+                addAll(TABLE_PLAYER_MAIN_SLOT_RANGE)
+                addAll(TABLE_PLAYER_HOTBAR_SLOT_RANGE)
+            }
+        } else {
+            emptyList()
+        }
+    }
+
+    private fun handleQuickMoveClick(session: PlayerSession, containerId: Int, slot: Int) {
+        when {
+            containerId == PLAYER_INVENTORY_CONTAINER_ID && slot == PLAYER_CRAFT_RESULT_SLOT -> {
+                craftAllFromPlayerResultToInventory(session)
+            }
+            session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE &&
+                containerId == session.openContainerId &&
+                slot == TABLE_CRAFT_RESULT_SLOT -> {
+                craftAllFromTableResultToInventory(session)
+            }
+            session.openContainerType == CONTAINER_TYPE_FURNACE &&
+                containerId == session.openContainerId &&
+                slot == FURNACE_RESULT_SLOT -> {
+                quickMoveFromFurnaceResult(session, containerId)
+            }
+            else -> {
+                if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId) {
+                    quickMoveWithinFurnace(session, containerId, slot)
+                } else if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && containerId == session.openContainerId) {
+                    quickMoveWithinCraftingTable(session, containerId, slot)
+                } else {
+                    quickMoveSingleStack(session, containerId, slot)
+                }
+            }
+        }
+    }
+
+    private fun craftAllFromPlayerResultToInventory(session: PlayerSession) {
+        val containerId = PLAYER_INVENTORY_CONTAINER_ID
+        val targetSlots = PLAYER_CRAFT_RESULT_QUICK_MOVE_TARGET_SLOTS
+        repeat(MAX_SHIFT_CRAFT_ITERATIONS) {
+            val match = currentPlayerCraftMatch(session) ?: return
+            val resultItemId = itemIdByKey[match.recipe.result.itemKey] ?: return
+            val resultCount = match.recipe.result.count
+            if (!canInsertIntoContainerSlots(session, containerId, resultItemId, resultCount, targetSlots)) return
+            consumeMatchedIngredients(session.playerCraftItemIds, session.playerCraftItemCounts, match.inputSlotsToConsume)
+            if (!tryInsertIntoContainerSlots(session, containerId, resultItemId, resultCount, targetSlots)) return
+        }
+    }
+
+    private fun craftAllFromTableResultToInventory(session: PlayerSession) {
+        val containerId = session.openContainerId
+        val targetSlots = TABLE_CRAFT_RESULT_QUICK_MOVE_TARGET_SLOTS
+        repeat(MAX_SHIFT_CRAFT_ITERATIONS) {
+            val match = currentTableCraftMatch(session) ?: return
+            val resultItemId = itemIdByKey[match.recipe.result.itemKey] ?: return
+            val resultCount = match.recipe.result.count
+            if (!canInsertIntoContainerSlots(session, containerId, resultItemId, resultCount, targetSlots)) return
+            consumeMatchedIngredients(session.tableCraftItemIds, session.tableCraftItemCounts, match.inputSlotsToConsume)
+            if (!tryInsertIntoContainerSlots(session, containerId, resultItemId, resultCount, targetSlots)) return
+        }
+    }
+
+    private fun canInsertIntoContainerSlots(
+        session: PlayerSession,
+        containerId: Int,
+        itemId: Int,
+        itemCount: Int,
+        targetSlots: IntArray
+    ): Boolean {
+        if (itemId < 0 || itemCount <= 0 || targetSlots.isEmpty()) return false
+        var remaining = itemCount
+
+        for (slot in targetSlots) {
+            val (slotItemId, slotCount) = readContainerSlot(session, containerId, slot) ?: continue
+            if (slotItemId != itemId || slotCount <= 0 || slotCount >= MAX_HOTBAR_STACK_SIZE) continue
+            remaining -= (MAX_HOTBAR_STACK_SIZE - slotCount)
+            if (remaining <= 0) return true
+        }
+        for (slot in targetSlots) {
+            val (slotItemId, slotCount) = readContainerSlot(session, containerId, slot) ?: continue
+            if (slotItemId >= 0 && slotCount > 0) continue
+            remaining -= MAX_HOTBAR_STACK_SIZE
+            if (remaining <= 0) return true
+        }
+        return false
+    }
+
+    private fun tryInsertIntoContainerSlots(
+        session: PlayerSession,
+        containerId: Int,
+        itemId: Int,
+        itemCount: Int,
+        targetSlots: IntArray
+    ): Boolean {
+        if (itemId < 0 || itemCount <= 0 || targetSlots.isEmpty()) return false
+        var remaining = itemCount
+
+        for (slot in targetSlots) {
+            if (remaining <= 0) break
+            val (slotItemId, slotCount) = readContainerSlot(session, containerId, slot) ?: continue
+            if (slotItemId != itemId || slotCount <= 0 || slotCount >= MAX_HOTBAR_STACK_SIZE) continue
+            val added = minOf(MAX_HOTBAR_STACK_SIZE - slotCount, remaining)
+            if (added <= 0) continue
+            writeContainerSlot(session, containerId, slot, slotItemId, slotCount + added)
+            onContainerSlotMutated(session, containerId, slot)
+            remaining -= added
+        }
+        for (slot in targetSlots) {
+            if (remaining <= 0) break
+            val (slotItemId, slotCount) = readContainerSlot(session, containerId, slot) ?: continue
+            if (slotItemId >= 0 && slotCount > 0) continue
+            val added = minOf(MAX_HOTBAR_STACK_SIZE, remaining)
+            if (added <= 0) continue
+            writeContainerSlot(session, containerId, slot, itemId, added)
+            onContainerSlotMutated(session, containerId, slot)
+            remaining -= added
+        }
+        return remaining <= 0
+    }
+
+    private fun quickMoveFromFurnaceResult(session: PlayerSession, containerId: Int) {
+        val furnace = openFurnaceState(session) ?: return
+        val resultItemId: Int
+        val resultCount: Int
+        run {
+            resultItemId = furnace.resultItemId
+            resultCount = furnace.resultCount
+        }
+        if (resultItemId < 0 || resultCount <= 0) return
+        if (!tryInsertIntoContainerSlots(session, containerId, resultItemId, resultCount, FURNACE_RESULT_QUICK_MOVE_TARGET_SLOTS)) return
+        run {
+            furnace.resultItemId = -1
+            furnace.resultCount = 0
+        }
+    }
+
+    private fun quickMoveWithinCraftingTable(session: PlayerSession, containerId: Int, slot: Int) {
+        if (slot in TABLE_CRAFT_INPUT_SLOT_RANGE) {
+            quickMoveSingleStack(session, containerId, slot)
+            return
+        }
+        if (slot !in TABLE_PLAYER_MAIN_SLOT_RANGE && slot !in TABLE_PLAYER_HOTBAR_SLOT_RANGE) {
+            quickMoveSingleStack(session, containerId, slot)
+            return
+        }
+        val from = readContainerSlot(session, containerId, slot) ?: return
+        val itemId = from.first
+        val count = from.second
+        if (itemId < 0 || count <= 0) return
+        val remainingToGrid = moveItemIntoContainerSlots(
+            session = session,
+            containerId = containerId,
+            itemId = itemId,
+            remaining = count,
+            targets = TABLE_CRAFT_INPUT_SLOT_RANGE.toList()
+        )
+        if (remainingToGrid != count) {
+            if (remainingToGrid <= 0) writeContainerSlot(session, containerId, slot, -1, 0)
+            else writeContainerSlot(session, containerId, slot, itemId, remainingToGrid)
+            onContainerSlotMutated(session, containerId, slot)
+            return
+        }
+        quickMoveSingleStack(session, containerId, slot)
+    }
+
+    private fun quickMoveWithinFurnace(session: PlayerSession, containerId: Int, slot: Int) {
+        val stack = readContainerSlot(session, containerId, slot) ?: return
+        val itemId = stack.first
+        val count = stack.second
+        if (itemId < 0 || count <= 0) return
+
+        val moved = when {
+            slot == FURNACE_INPUT_SLOT || slot == FURNACE_FUEL_SLOT -> {
+                quickMoveSingleStack(session, containerId, slot)
+            }
+            slot in FURNACE_PLAYER_MAIN_SLOT_RANGE || slot in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> {
+                if (isFuelItemId(itemId)) {
+                    val fuelRemaining = moveItemIntoContainerSlots(
+                        session = session,
+                        containerId = containerId,
+                        itemId = itemId,
+                        remaining = count,
+                        targets = listOf(FURNACE_FUEL_SLOT)
+                    )
+                    if (fuelRemaining < count) {
+                        if (fuelRemaining <= 0) {
+                            writeContainerSlot(session, containerId, slot, -1, 0)
+                            onContainerSlotMutated(session, containerId, slot)
+                            true
+                        } else if (isSmeltableItemId(itemId)) {
+                            val smeltRemaining = moveItemIntoContainerSlots(
+                                session = session,
+                                containerId = containerId,
+                                itemId = itemId,
+                                remaining = fuelRemaining,
+                                targets = listOf(FURNACE_INPUT_SLOT)
+                            )
+                            if (smeltRemaining <= 0) writeContainerSlot(session, containerId, slot, -1, 0)
+                            else writeContainerSlot(session, containerId, slot, itemId, smeltRemaining)
+                            onContainerSlotMutated(session, containerId, slot)
+                            true
+                        } else {
+                            writeContainerSlot(session, containerId, slot, itemId, fuelRemaining)
+                            onContainerSlotMutated(session, containerId, slot)
+                            true
+                        }
+                    } else if (isSmeltableItemId(itemId)) {
+                        moveItemIntoContainerSlots(
+                            session = session,
+                            containerId = containerId,
+                            itemId = itemId,
+                            remaining = count,
+                            targets = listOf(FURNACE_INPUT_SLOT)
+                        ).let { remaining ->
+                            if (remaining != count) {
+                                if (remaining <= 0) writeContainerSlot(session, containerId, slot, -1, 0)
+                                else writeContainerSlot(session, containerId, slot, itemId, remaining)
+                                onContainerSlotMutated(session, containerId, slot)
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                } else if (isSmeltableItemId(itemId)) {
+                    moveItemIntoContainerSlots(
+                        session = session,
+                        containerId = containerId,
+                        itemId = itemId,
+                        remaining = count,
+                        targets = listOf(FURNACE_INPUT_SLOT)
+                    ).let { remaining ->
+                        if (remaining != count) {
+                            if (remaining <= 0) writeContainerSlot(session, containerId, slot, -1, 0)
+                            else writeContainerSlot(session, containerId, slot, itemId, remaining)
+                            onContainerSlotMutated(session, containerId, slot)
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                } else {
+                    quickMoveSingleStack(session, containerId, slot)
+                }
+            }
+            else -> false
+        }
+        if (!moved) return
+    }
+
+    private fun quickMoveAllMatchingFromSlot(
+        session: PlayerSession,
+        containerId: Int,
+        slot: Int,
+        itemId: Int
+    ) {
+        if (itemId < 0) return
+        quickMoveSingleStack(session, containerId, slot)
+        val candidates = quickMoveSourceSlots(session, containerId, slot).filter { it != slot }
+        for (candidate in candidates) {
+            val stack = readContainerSlot(session, containerId, candidate) ?: continue
+            if (stack.first != itemId || stack.second <= 0) continue
+            quickMoveSingleStack(session, containerId, candidate)
+        }
+    }
+
+    private fun quickMoveSingleStack(session: PlayerSession, containerId: Int, fromSlot: Int): Boolean {
+        val from = readContainerSlot(session, containerId, fromSlot) ?: return false
+        val itemId = from.first
+        var remaining = from.second
+        if (itemId < 0 || remaining <= 0) return false
+
+        val targets = quickMoveTargetSlots(session, containerId, fromSlot)
+        if (targets.isEmpty()) return false
+        remaining = moveItemIntoContainerSlots(
+            session = session,
+            containerId = containerId,
+            itemId = itemId,
+            remaining = remaining,
+            targets = targets
+        )
+        if (remaining == from.second) return false
+        if (remaining <= 0) {
+            writeContainerSlot(session, containerId, fromSlot, -1, 0)
+        } else {
+            writeContainerSlot(session, containerId, fromSlot, itemId, remaining)
+        }
+        onContainerSlotMutated(session, containerId, fromSlot)
+        return true
+    }
+
+    private fun moveItemIntoContainerSlots(
+        session: PlayerSession,
+        containerId: Int,
+        itemId: Int,
+        remaining: Int,
+        targets: List<Int>
+    ): Int {
+        var outRemaining = remaining
+        if (itemId < 0 || outRemaining <= 0) return outRemaining
+
+        for (target in targets) {
+            if (outRemaining <= 0) break
+            val current = readContainerSlot(session, containerId, target) ?: continue
+            val currentId = current.first
+            val currentCount = current.second
+            if (currentId != itemId || currentCount <= 0 || currentCount >= MAX_HOTBAR_STACK_SIZE) continue
+            val add = minOf(MAX_HOTBAR_STACK_SIZE - currentCount, outRemaining)
+            if (add <= 0) continue
+            writeContainerSlot(session, containerId, target, currentId, currentCount + add)
+            onContainerSlotMutated(session, containerId, target)
+            outRemaining -= add
+        }
+
+        for (target in targets) {
+            if (outRemaining <= 0) break
+            val current = readContainerSlot(session, containerId, target) ?: continue
+            val currentId = current.first
+            val currentCount = current.second
+            if (currentId >= 0 && currentCount > 0) continue
+            val add = minOf(MAX_HOTBAR_STACK_SIZE, outRemaining)
+            if (add <= 0) continue
+            writeContainerSlot(session, containerId, target, itemId, add)
+            onContainerSlotMutated(session, containerId, target)
+            outRemaining -= add
+        }
+
+        return outRemaining
+    }
+
+    private fun quickMoveSourceSlots(session: PlayerSession, containerId: Int, slot: Int): List<Int> {
+        if (containerId == PLAYER_INVENTORY_CONTAINER_ID) {
+            return when (slot) {
+                in 9..35 -> (9..35).toList()
+                in 36..44 -> (36..44).toList()
+                in PLAYER_CRAFT_INPUT_SLOT_RANGE -> PLAYER_CRAFT_INPUT_SLOT_RANGE.toList()
+                in 5..8 -> (5..8).toList()
+                45 -> listOf(45)
+                else -> emptyList()
+            }
+        }
+        if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId) {
+            return when (slot) {
+                in FURNACE_PLAYER_MAIN_SLOT_RANGE -> FURNACE_PLAYER_MAIN_SLOT_RANGE.toList()
+                in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> FURNACE_PLAYER_HOTBAR_SLOT_RANGE.toList()
+                FURNACE_INPUT_SLOT, FURNACE_FUEL_SLOT, FURNACE_RESULT_SLOT -> listOf(slot)
+                else -> emptyList()
+            }
+        }
+        return when (slot) {
+            in TABLE_PLAYER_MAIN_SLOT_RANGE -> TABLE_PLAYER_MAIN_SLOT_RANGE.toList()
+            in TABLE_PLAYER_HOTBAR_SLOT_RANGE -> TABLE_PLAYER_HOTBAR_SLOT_RANGE.toList()
+            in TABLE_CRAFT_INPUT_SLOT_RANGE -> TABLE_CRAFT_INPUT_SLOT_RANGE.toList()
+            else -> emptyList()
+        }
+    }
+
+    private fun quickMoveTargetSlots(session: PlayerSession, containerId: Int, slot: Int): List<Int> {
+        if (containerId == PLAYER_INVENTORY_CONTAINER_ID) {
+            return when (slot) {
+                in PLAYER_CRAFT_INPUT_SLOT_RANGE -> (9..35).toList() + (36..44).toList()
+                in 5..8 -> (9..35).toList() + (36..44).toList()
+                45 -> (9..35).toList() + (36..44).toList()
+                in 9..35 -> (36..44).toList()
+                in 36..44 -> (9..35).toList()
+                else -> emptyList()
+            }
+        }
+        if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId) {
+            return when (slot) {
+                FURNACE_INPUT_SLOT, FURNACE_FUEL_SLOT, FURNACE_RESULT_SLOT ->
+                    FURNACE_PLAYER_MAIN_SLOT_RANGE.toList() + FURNACE_PLAYER_HOTBAR_SLOT_RANGE.toList()
+                in FURNACE_PLAYER_MAIN_SLOT_RANGE -> FURNACE_PLAYER_HOTBAR_SLOT_RANGE.toList()
+                in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> FURNACE_PLAYER_MAIN_SLOT_RANGE.toList()
+                else -> emptyList()
+            }
+        }
+        return when (slot) {
+            in TABLE_CRAFT_INPUT_SLOT_RANGE -> TABLE_PLAYER_MAIN_SLOT_RANGE.toList() + TABLE_PLAYER_HOTBAR_SLOT_RANGE.toList()
+            in TABLE_PLAYER_MAIN_SLOT_RANGE -> TABLE_PLAYER_HOTBAR_SLOT_RANGE.toList()
+            in TABLE_PLAYER_HOTBAR_SLOT_RANGE -> TABLE_PLAYER_MAIN_SLOT_RANGE.toList()
+            else -> emptyList()
+        }
+    }
+
+    private fun handleHotbarSwapClick(session: PlayerSession, containerId: Int, slot: Int, hotbarButton: Int) {
+        if (!isQuickCraftContainerValid(session, containerId)) return
+        if (tryCraftResultToHotbarBySwap(session, containerId, slot, hotbarButton)) return
+
+        if (hotbarButton == OFFHAND_SWAP_BUTTON) {
+            handleOffhandSwapClick(session, containerId, slot)
+            return
+        }
+        if (hotbarButton !in 0..8) return
+
+        val clicked = readContainerSlot(session, containerId, slot) ?: return
+        val clickedItemId = clicked.first
+        val clickedCount = clicked.second
+        val clickedHotbarIndex = hotbarIndexForContainerSlot(session, containerId, slot)
+        if (clickedHotbarIndex == hotbarButton) return
+
+        val targetItemId = session.hotbarItemIds[hotbarButton]
+        val targetCount = session.hotbarItemCounts[hotbarButton]
+        val targetMeta = captureHotbarMeta(session, hotbarButton)
+        val clickedMeta = if (clickedHotbarIndex != null) captureHotbarMeta(session, clickedHotbarIndex) else null
+
+        writeContainerSlot(session, containerId, slot, targetItemId, targetCount)
+        setHotbarSlotWithMeta(session, hotbarButton, clickedItemId, clickedCount, clickedMeta)
+        if (clickedHotbarIndex != null) {
+            setHotbarSlotWithMeta(session, clickedHotbarIndex, targetItemId, targetCount, targetMeta)
+        }
+
+        updateSelectedBlockStateAndEquipmentAfterHotbarMutation(
+            session = session,
+            changedHotbarA = hotbarButton,
+            changedHotbarB = clickedHotbarIndex
+        )
+    }
+
+    private fun tryCraftResultToHotbarBySwap(
+        session: PlayerSession,
+        containerId: Int,
+        slot: Int,
+        hotbarButton: Int
+    ): Boolean {
+        if (hotbarButton !in 0..8) return false
+        val isPlayerCraftResult = containerId == PLAYER_INVENTORY_CONTAINER_ID && slot == PLAYER_CRAFT_RESULT_SLOT
+        val isTableCraftResult =
+            session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE &&
+                containerId == session.openContainerId &&
+                slot == TABLE_CRAFT_RESULT_SLOT
+        if (!isPlayerCraftResult && !isTableCraftResult) return false
+
+        val match = if (isPlayerCraftResult) currentPlayerCraftMatch(session) else currentTableCraftMatch(session)
+        if (match == null) return true
+        val resultItemId = itemIdByKey[match.recipe.result.itemKey] ?: return true
+        val resultCount = match.recipe.result.count.coerceAtLeast(1)
+
+        val targetItemId = session.hotbarItemIds[hotbarButton]
+        val targetCount = session.hotbarItemCounts[hotbarButton]
+        val canPlace = when {
+            targetItemId < 0 || targetCount <= 0 -> true
+            targetItemId == resultItemId && targetCount + resultCount <= MAX_HOTBAR_STACK_SIZE -> true
+            else -> false
+        }
+        if (!canPlace) return true
+
+        if (isPlayerCraftResult) {
+            consumeMatchedIngredients(session.playerCraftItemIds, session.playerCraftItemCounts, match.inputSlotsToConsume)
+        } else {
+            consumeMatchedIngredients(session.tableCraftItemIds, session.tableCraftItemCounts, match.inputSlotsToConsume)
+        }
+
+        val nextCount = if (targetItemId < 0 || targetCount <= 0) resultCount else (targetCount + resultCount)
+        setHotbarSlotWithMeta(session, hotbarButton, resultItemId, nextCount, null)
+        updateSelectedBlockStateAndEquipmentAfterHotbarMutation(
+            session = session,
+            changedHotbarA = hotbarButton,
+            changedHotbarB = null
+        )
+        return true
+    }
+
+    private fun handleOffhandSwapClick(session: PlayerSession, containerId: Int, slot: Int) {
+        val clicked = readContainerSlot(session, containerId, slot) ?: return
+        val clickedItemId = clicked.first
+        val clickedCount = clicked.second
+        val clickedHotbarIndex = hotbarIndexForContainerSlot(session, containerId, slot)
+
+        val offhandItemId = session.offhandItemId
+        val offhandCount = session.offhandItemCount
+
+        writeContainerSlot(session, containerId, slot, offhandItemId, offhandCount)
+        session.offhandItemId = if (clickedItemId >= 0 && clickedCount > 0) clickedItemId else -1
+        session.offhandItemCount = if (clickedItemId >= 0 && clickedCount > 0) clickedCount.coerceAtMost(MAX_HOTBAR_STACK_SIZE) else 0
+
+        if (clickedHotbarIndex != null) {
+            setHotbarSlotWithMeta(session, clickedHotbarIndex, offhandItemId, offhandCount, null)
+        }
+        broadcastHeldItemEquipment(session)
+    }
+
+    private fun isResultSlot(containerId: Int, session: PlayerSession, slot: Int): Boolean {
+        return when {
+            containerId == PLAYER_INVENTORY_CONTAINER_ID -> slot == PLAYER_CRAFT_RESULT_SLOT
+            session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && containerId == session.openContainerId ->
+                slot == TABLE_CRAFT_RESULT_SLOT
+            session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId ->
+                slot == FURNACE_RESULT_SLOT
+            else -> false
+        }
+    }
+
+    private fun hotbarIndexForContainerSlot(session: PlayerSession, containerId: Int, slot: Int): Int? {
+        return when {
+            containerId == PLAYER_INVENTORY_CONTAINER_ID && slot in 36..44 -> slot - 36
+            session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE &&
+                containerId == session.openContainerId &&
+                slot in TABLE_PLAYER_HOTBAR_SLOT_RANGE -> slot - TABLE_PLAYER_HOTBAR_SLOT_RANGE.first
+            session.openContainerType == CONTAINER_TYPE_FURNACE &&
+                containerId == session.openContainerId &&
+                slot in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> slot - FURNACE_PLAYER_HOTBAR_SLOT_RANGE.first
+            else -> null
+        }
+    }
+
+    private data class HotbarMeta(
+        val blockStateId: Int,
+        val blockEntityTypeId: Int,
+        val blockEntityNbtPayload: ByteArray?
+    )
+
+    private fun captureHotbarMeta(session: PlayerSession, hotbar: Int): HotbarMeta {
+        return HotbarMeta(
+            blockStateId = session.hotbarBlockStateIds[hotbar],
+            blockEntityTypeId = session.hotbarBlockEntityTypeIds[hotbar],
+            blockEntityNbtPayload = session.hotbarBlockEntityNbtPayloads[hotbar]
+        )
+    }
+
+    private fun setHotbarSlotWithMeta(
+        session: PlayerSession,
+        hotbar: Int,
+        itemId: Int,
+        count: Int,
+        inheritedMeta: HotbarMeta?
+    ) {
+        if (itemId >= 0 && count > 0) {
+            session.hotbarItemIds[hotbar] = itemId
+            session.hotbarItemCounts[hotbar] = count.coerceAtMost(MAX_HOTBAR_STACK_SIZE)
+            if (inheritedMeta != null) {
+                session.hotbarBlockStateIds[hotbar] = inheritedMeta.blockStateId
+                session.hotbarBlockEntityTypeIds[hotbar] = inheritedMeta.blockEntityTypeId
+                session.hotbarBlockEntityNbtPayloads[hotbar] = inheritedMeta.blockEntityNbtPayload
+            } else {
+                session.hotbarBlockStateIds[hotbar] = itemBlockStateId(itemId)
+                session.hotbarBlockEntityTypeIds[hotbar] = -1
+                session.hotbarBlockEntityNbtPayloads[hotbar] = null
+            }
+            return
+        }
+        session.hotbarItemIds[hotbar] = -1
+        session.hotbarItemCounts[hotbar] = 0
+        session.hotbarBlockStateIds[hotbar] = 0
+        session.hotbarBlockEntityTypeIds[hotbar] = -1
+        session.hotbarBlockEntityNbtPayloads[hotbar] = null
+    }
+
+    private fun updateSelectedBlockStateAndEquipmentAfterHotbarMutation(
+        session: PlayerSession,
+        changedHotbarA: Int,
+        changedHotbarB: Int?
+    ) {
+        val selected = session.selectedHotbarSlot.coerceIn(0, 8)
+        if (selected == changedHotbarA || selected == changedHotbarB) {
+            session.selectedBlockStateId = if (session.hotbarItemCounts[selected] > 0) {
+                session.hotbarBlockStateIds[selected]
+            } else {
+                0
+            }
+            broadcastHeldItemEquipment(session)
+        }
+    }
+
+    fun handleContainerClose(channelId: ChannelId, containerId: Int) {
+        val session = sessions[channelId] ?: return
+        resetQuickCraftDrag(session)
+        if (containerId != session.openContainerId) return
+        when (session.openContainerType) {
+            CONTAINER_TYPE_CRAFTING_TABLE -> closeCraftingTable(session)
+            CONTAINER_TYPE_FURNACE -> closeFurnace(session)
+        }
+    }
+
+    private fun handlePlayerInventoryPickupClick(session: PlayerSession, slot: Int, button: Int) {
+        if (slot == PLAYER_CRAFT_RESULT_SLOT) {
+            craftFromPlayerResult(session)
+            return
+        }
+        if (slot in PLAYER_CRAFT_INPUT_SLOT_RANGE) {
+            val gridIndex = slot - PLAYER_CRAFT_INPUT_SLOT_RANGE.first
+            pickupSwap(
+                readSlot = { readCraftSlot(session.playerCraftItemIds, session.playerCraftItemCounts, gridIndex) },
+                writeSlot = { id, count -> writeCraftSlot(session.playerCraftItemIds, session.playerCraftItemCounts, gridIndex, id, count) },
+                session = session,
+                rightClick = button == 1
+            )
+            return
+        }
+        pickupInventorySlot(session, slot, button == 1, includeOffhand = true)
+    }
+
+    private fun handleCraftingTablePickupClick(session: PlayerSession, slot: Int, button: Int) {
+        if (slot == TABLE_CRAFT_RESULT_SLOT) {
+            craftFromTableResult(session)
+            return
+        }
+        if (slot in TABLE_CRAFT_INPUT_SLOT_RANGE) {
+            val gridIndex = slot - TABLE_CRAFT_INPUT_SLOT_RANGE.first
+            pickupSwap(
+                readSlot = { readCraftSlot(session.tableCraftItemIds, session.tableCraftItemCounts, gridIndex) },
+                writeSlot = { id, count -> writeCraftSlot(session.tableCraftItemIds, session.tableCraftItemCounts, gridIndex, id, count) },
+                session = session,
+                rightClick = button == 1
+            )
+            return
+        }
+        pickupInventorySlot(session, slot, button == 1, includeOffhand = false, tableContainer = true)
+    }
+
+    private fun handleFurnacePickupClick(session: PlayerSession, containerId: Int, slot: Int, button: Int) {
+        if (button !in 0..1) return
+        val rightClick = button == 1
+        val furnace = openFurnaceState(session) ?: return
+        val furnaceKey = FurnaceKey(session.worldKey, session.openFurnaceX, session.openFurnaceY, session.openFurnaceZ)
+        when (slot) {
+            FURNACE_RESULT_SLOT -> {
+                takeFromOutputSlot(
+                    readSlot = { furnace.resultItemId to furnace.resultCount },
+                    writeSlot = { id, count ->
+                        furnace.resultItemId = if (count > 0) id else -1
+                        furnace.resultCount = count.coerceAtLeast(0)
+                        furnace.dirty = true
+                    },
+                    session = session,
+                    rightClick = rightClick
+                )
+                refreshFurnaceActivity(furnaceKey, furnace)
+                return
+            }
+            FURNACE_INPUT_SLOT -> {
+                pickupSwap(
+                    readSlot = { furnace.inputItemId to furnace.inputCount },
+                    writeSlot = { id, count -> writeFurnaceSlot(furnace, FURNACE_INPUT_SLOT, id, count) },
+                    session = session,
+                    rightClick = rightClick
+                )
+                refreshFurnaceActivity(furnaceKey, furnace)
+                return
+            }
+            FURNACE_FUEL_SLOT -> {
+                val cursorItemId = session.cursorItemId
+                val cursorCount = session.cursorItemCount
+                if (cursorItemId >= 0 && cursorCount > 0 && furnace.fuelCount <= 0 && !isFuelItemId(cursorItemId)) {
+                    return
+                }
+                pickupSwap(
+                    readSlot = { furnace.fuelItemId to furnace.fuelCount },
+                    writeSlot = { id, count ->
+                        if (count > 0 && id >= 0 && !isFuelItemId(id)) return@pickupSwap
+                        writeFurnaceSlot(furnace, FURNACE_FUEL_SLOT, id, count)
+                    },
+                    session = session,
+                    rightClick = rightClick
+                )
+                refreshFurnaceActivity(furnaceKey, furnace)
+                return
+            }
+            else -> {
+                pickupInventorySlot(session, slot, rightClick, includeOffhand = false, furnaceContainer = true)
+            }
+        }
+        onContainerSlotMutated(session, containerId, slot)
+    }
+
+    private fun pickupInventorySlot(
+        session: PlayerSession,
+        slot: Int,
+        rightClick: Boolean,
+        includeOffhand: Boolean,
+        tableContainer: Boolean = false,
+        furnaceContainer: Boolean = false
+    ) {
+        val read: (() -> Pair<Int, Int>)?
+        val write: ((Int, Int) -> Unit)?
+        if (tableContainer) {
+            val mapped = when (slot) {
+                in TABLE_PLAYER_MAIN_SLOT_RANGE -> slot - TABLE_PLAYER_MAIN_SLOT_RANGE.first
+                in TABLE_PLAYER_HOTBAR_SLOT_RANGE -> 27 + (slot - TABLE_PLAYER_HOTBAR_SLOT_RANGE.first)
+                else -> -1
+            }
+            if (mapped in 0..35) {
+                val inventorySlot = if (mapped < 27) inventorySlotForMainInventoryIndex(mapped) else 36 + (mapped - 27)
+                val pair = inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
+                read = pair?.first
+                write = pair?.second
+            } else {
+                read = null
+                write = null
+            }
+        } else if (furnaceContainer) {
+            val mapped = when (slot) {
+                in FURNACE_PLAYER_MAIN_SLOT_RANGE -> slot - FURNACE_PLAYER_MAIN_SLOT_RANGE.first
+                in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> 27 + (slot - FURNACE_PLAYER_HOTBAR_SLOT_RANGE.first)
+                else -> -1
+            }
+            if (mapped in 0..35) {
+                val inventorySlot = if (mapped < 27) inventorySlotForMainInventoryIndex(mapped) else 36 + (mapped - 27)
+                val pair = inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
+                read = pair?.first
+                write = pair?.second
+            } else {
+                read = null
+                write = null
+            }
+        } else {
+            val pair = inventorySlotAccessor(session, slot, includeOffhand)
+            read = pair?.first
+            write = pair?.second
+        }
+        if (read == null || write == null) return
+        pickupSwap(read, write, session, rightClick)
+        if (!tableContainer && slot in 36..44) {
+            val hotbar = slot - 36
+            if (session.selectedHotbarSlot == hotbar) {
+                session.selectedBlockStateId = if (session.hotbarItemCounts[hotbar] > 0) session.hotbarBlockStateIds[hotbar] else 0
+                broadcastHeldItemEquipment(session)
+            }
+        }
+    }
+
+    private fun inventorySlotAccessor(
+        session: PlayerSession,
+        slot: Int,
+        includeOffhand: Boolean
+    ): Pair<() -> Pair<Int, Int>, (Int, Int) -> Unit>? {
+        return when {
+            slot in 36..44 -> {
+                val hotbar = slot - 36
+                ({ session.hotbarItemIds[hotbar] to session.hotbarItemCounts[hotbar] }) to { id, count ->
+                    session.hotbarItemIds[hotbar] = id
+                    session.hotbarItemCounts[hotbar] = count
+                    if (count <= 0 || id < 0) {
+                        session.hotbarBlockStateIds[hotbar] = 0
+                        session.hotbarBlockEntityTypeIds[hotbar] = -1
+                        session.hotbarBlockEntityNbtPayloads[hotbar] = null
+                    }
+                }
+            }
+            slot in 9..35 -> {
+                val index = mainInventoryIndexForInventorySlot(slot)
+                ({ session.mainInventoryItemIds[index] to session.mainInventoryItemCounts[index] }) to { id, count ->
+                    session.mainInventoryItemIds[index] = id
+                    session.mainInventoryItemCounts[index] = count
+                }
+            }
+            slot in 5..8 -> {
+                val armorIndex = armorIndexForInventorySlot(slot)
+                ({ session.armorItemIds[armorIndex] to session.armorItemCounts[armorIndex] }) to { id, count ->
+                    session.armorItemIds[armorIndex] = id
+                    session.armorItemCounts[armorIndex] = count
+                }
+            }
+            includeOffhand && slot == 45 -> {
+                ({ session.offhandItemId to session.offhandItemCount }) to { id, count ->
+                    session.offhandItemId = id
+                    session.offhandItemCount = count
+                }
+            }
+            else -> null
+        }
+    }
+
+    private fun pickupSwap(
+        readSlot: () -> Pair<Int, Int>,
+        writeSlot: (Int, Int) -> Unit,
+        session: PlayerSession,
+        rightClick: Boolean
+    ) {
+        var (slotItem, slotCount) = readSlot()
+        var cursorItem = session.cursorItemId
+        var cursorCount = session.cursorItemCount
+
+        if (cursorItem < 0 || cursorCount <= 0) {
+            if (slotItem < 0 || slotCount <= 0) return
+            if (rightClick && slotCount > 1) {
+                val take = slotCount / 2
+                cursorItem = slotItem
+                cursorCount = take
+                slotCount -= take
+                if (slotCount <= 0) {
+                    slotItem = -1
+                    slotCount = 0
+                }
+            } else {
+                cursorItem = slotItem
+                cursorCount = slotCount
+                slotItem = -1
+                slotCount = 0
+            }
+            writeSlot(slotItem, slotCount)
+            session.cursorItemId = cursorItem
+            session.cursorItemCount = cursorCount
+            return
+        }
+
+        if (slotItem < 0 || slotCount <= 0) {
+            if (rightClick) {
+                writeSlot(cursorItem, 1)
+                cursorCount -= 1
+                if (cursorCount <= 0) {
+                    cursorItem = -1
+                    cursorCount = 0
+                }
+            } else {
+                writeSlot(cursorItem, cursorCount)
+                cursorItem = -1
+                cursorCount = 0
+            }
+            session.cursorItemId = cursorItem
+            session.cursorItemCount = cursorCount
+            return
+        }
+
+        if (slotItem == cursorItem && slotCount < MAX_HOTBAR_STACK_SIZE) {
+            if (rightClick) {
+                slotCount += 1
+                cursorCount -= 1
+            } else {
+                val move = (MAX_HOTBAR_STACK_SIZE - slotCount).coerceAtMost(cursorCount)
+                slotCount += move
+                cursorCount -= move
+            }
+            if (cursorCount <= 0) {
+                cursorItem = -1
+                cursorCount = 0
+            }
+            writeSlot(slotItem, slotCount)
+            session.cursorItemId = cursorItem
+            session.cursorItemCount = cursorCount
+            return
+        }
+
+        writeSlot(cursorItem, cursorCount)
+        session.cursorItemId = slotItem
+        session.cursorItemCount = slotCount
+    }
+
+    private fun takeFromOutputSlot(
+        readSlot: () -> Pair<Int, Int>,
+        writeSlot: (Int, Int) -> Unit,
+        session: PlayerSession,
+        rightClick: Boolean
+    ) {
+        val (slotItemId, slotCount) = readSlot()
+        if (slotItemId < 0 || slotCount <= 0) return
+        val take = if (rightClick) 1 else slotCount
+        if (take <= 0) return
+
+        if (session.cursorItemId >= 0 && session.cursorItemCount > 0) {
+            if (session.cursorItemId != slotItemId) return
+            if (session.cursorItemCount + take > MAX_HOTBAR_STACK_SIZE) return
+            session.cursorItemCount += take
+        } else {
+            session.cursorItemId = slotItemId
+            session.cursorItemCount = take
+        }
+
+        val remain = slotCount - take
+        if (remain <= 0) {
+            writeSlot(-1, 0)
+        } else {
+            writeSlot(slotItemId, remain)
+        }
+    }
+
+    private fun craftFromPlayerResult(session: PlayerSession) {
+        val match = currentPlayerCraftMatch(session) ?: return
+        val resultItemId = itemIdByKey[match.recipe.result.itemKey] ?: return
+        if (!canTakeResultIntoCursor(session, resultItemId, match.recipe.result.count)) return
+        consumeMatchedIngredients(session.playerCraftItemIds, session.playerCraftItemCounts, match.inputSlotsToConsume)
+        addResultToCursor(session, resultItemId, match.recipe.result.count)
+    }
+
+    private fun craftFromTableResult(session: PlayerSession) {
+        val match = currentTableCraftMatch(session) ?: return
+        val resultItemId = itemIdByKey[match.recipe.result.itemKey] ?: return
+        if (!canTakeResultIntoCursor(session, resultItemId, match.recipe.result.count)) return
+        consumeMatchedIngredients(session.tableCraftItemIds, session.tableCraftItemCounts, match.inputSlotsToConsume)
+        addResultToCursor(session, resultItemId, match.recipe.result.count)
+    }
+
+    private fun currentPlayerCraftMatch(session: PlayerSession): CraftingRecipeCache.RecipeMatch? {
+        val keys = Array(4) { i -> itemKeyForStack(session.playerCraftItemIds[i], session.playerCraftItemCounts[i]) }
+        return CraftingRecipeCache.findFirstMatch(2, 2, keys)
+    }
+
+    private fun currentTableCraftMatch(session: PlayerSession): CraftingRecipeCache.RecipeMatch? {
+        val keys = Array(9) { i -> itemKeyForStack(session.tableCraftItemIds[i], session.tableCraftItemCounts[i]) }
+        return CraftingRecipeCache.findFirstMatch(3, 3, keys)
+    }
+
+    private fun currentSmeltingRecipe(furnace: FurnaceState): SmeltingRecipeCache.SmeltingRecipe? {
+        if (furnace.inputItemId < 0 || furnace.inputCount <= 0) return null
+        return SmeltingRecipeCache.recipeByInputItemId(furnace.inputItemId, itemKeyById)
+    }
+
+    private fun fuelBurnSeconds(itemId: Int): Double {
+        if (itemId < 0) return 0.0
+        return FurnaceFuelCache.burnSecondsByItemId(itemId)
+    }
+
+    private fun isFuelItemId(itemId: Int): Boolean = fuelBurnSeconds(itemId) > 0.0
+
+    private fun isSmeltableItemId(itemId: Int): Boolean {
+        if (itemId < 0) return false
+        return SmeltingRecipeCache.recipeByInputItemId(itemId, itemKeyById) != null
+    }
+
+    private fun canSmeltNow(
+        furnace: FurnaceState,
+        recipe: SmeltingRecipeCache.SmeltingRecipe?
+    ): Boolean {
+        if (recipe == null) return false
+        if (furnace.inputItemId < 0 || furnace.inputCount <= 0) return false
+        val resultItemId = itemIdByKey[recipe.resultItemKey] ?: return false
+        if (furnace.resultCount <= 0 || furnace.resultItemId < 0) return true
+        if (furnace.resultItemId != resultItemId) return false
+        return furnace.resultCount + recipe.resultCount <= MAX_HOTBAR_STACK_SIZE
+    }
+
+    private fun smeltOneItem(
+        furnace: FurnaceState,
+        recipe: SmeltingRecipeCache.SmeltingRecipe
+    ) {
+        val resultItemId = itemIdByKey[recipe.resultItemKey] ?: return
+        furnace.inputCount -= 1
+        if (furnace.inputCount <= 0) {
+            furnace.inputItemId = -1
+            furnace.inputCount = 0
+        }
+        if (furnace.resultCount <= 0 || furnace.resultItemId < 0) {
+            furnace.resultItemId = resultItemId
+            furnace.resultCount = recipe.resultCount.coerceAtLeast(1)
+        } else if (furnace.resultItemId == resultItemId) {
+            furnace.resultCount = (furnace.resultCount + recipe.resultCount).coerceAtMost(MAX_HOTBAR_STACK_SIZE)
+        }
+        furnace.cookTotalSeconds = recipe.cookSeconds.coerceAtLeast(MIN_FURNACE_COOK_SECONDS)
+    }
+
+    private fun itemKeyForStack(itemId: Int, count: Int): String? {
+        if (itemId < 0 || count <= 0) return null
+        val key = itemKeyById.getOrNull(itemId) ?: return null
+        if (key.isEmpty()) return null
+        return key
+    }
+
+    private fun consumeMatchedIngredients(itemIds: IntArray, itemCounts: IntArray, slots: IntArray) {
+        for (slot in slots) {
+            if (slot !in itemIds.indices) continue
+            val next = itemCounts[slot] - 1
+            if (next <= 0) {
+                itemIds[slot] = -1
+                itemCounts[slot] = 0
+            } else {
+                itemCounts[slot] = next
+            }
+        }
+    }
+
+    private fun canTakeResultIntoCursor(session: PlayerSession, itemId: Int, count: Int): Boolean {
+        if (count <= 0) return false
+        if (session.cursorItemId < 0 || session.cursorItemCount <= 0) return true
+        if (session.cursorItemId != itemId) return false
+        return session.cursorItemCount + count <= MAX_HOTBAR_STACK_SIZE
+    }
+
+    private fun addResultToCursor(session: PlayerSession, itemId: Int, count: Int) {
+        if (session.cursorItemId < 0 || session.cursorItemCount <= 0) {
+            session.cursorItemId = itemId
+            session.cursorItemCount = count
+            return
+        }
+        session.cursorItemCount = (session.cursorItemCount + count).coerceAtMost(MAX_HOTBAR_STACK_SIZE)
+    }
+
+    private fun readCraftSlot(ids: IntArray, counts: IntArray, index: Int): Pair<Int, Int> {
+        if (index !in ids.indices) return -1 to 0
+        return ids[index] to counts[index]
+    }
+
+    private fun writeCraftSlot(ids: IntArray, counts: IntArray, index: Int, itemId: Int, count: Int) {
+        if (index !in ids.indices) return
+        if (itemId < 0 || count <= 0) {
+            ids[index] = -1
+            counts[index] = 0
+        } else {
+            ids[index] = itemId
+            counts[index] = count.coerceAtMost(MAX_HOTBAR_STACK_SIZE)
+        }
+    }
+
+    private fun resyncContainerForSession(session: PlayerSession, containerId: Int) {
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        val stateId = nextInventoryStateId(session)
+        when (containerId) {
+            PLAYER_INVENTORY_CONTAINER_ID -> {
+                ctx.writeAndFlush(
+                    PlayPackets.containerSetContentPacket(
+                        containerId = PLAYER_INVENTORY_CONTAINER_ID,
+                        stateId = stateId,
+                        encodedItems = encodePlayerInventoryContainerItems(session),
+                        encodedCarried = encodeCursorStack(session)
+                    )
+                )
+            }
+            session.openContainerId -> {
+                when (session.openContainerType) {
+                    CONTAINER_TYPE_CRAFTING_TABLE -> {
+                        ctx.writeAndFlush(
+                            PlayPackets.containerSetContentPacket(
+                                containerId = session.openContainerId,
+                                stateId = stateId,
+                                encodedItems = encodeCraftingTableContainerItems(session),
+                                encodedCarried = encodeCursorStack(session)
+                            )
+                        )
+                    }
+                    CONTAINER_TYPE_FURNACE -> {
+                        ctx.write(
+                            PlayPackets.containerSetContentPacket(
+                                containerId = session.openContainerId,
+                                stateId = stateId,
+                                encodedItems = encodeFurnaceContainerItems(session),
+                                encodedCarried = encodeCursorStack(session)
+                            )
+                        )
+                        val furnace = openFurnaceState(session)
+                        if (furnace != null) {
+                            val properties = encodeFurnaceProperties(furnace)
+                            for (propertyIndex in properties.indices) {
+                                ctx.write(
+                                    PlayPackets.containerSetDataPacket(
+                                        containerId = session.openContainerId,
+                                        property = propertyIndex,
+                                        value = properties[propertyIndex]
+                                    )
+                                )
+                            }
+                        }
+                        ctx.flush()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun resyncOpenFurnaceViewers(key: FurnaceKey) {
+        for (session in sessions.values) {
+            if (session.worldKey != key.worldKey) continue
+            if (session.openContainerType != CONTAINER_TYPE_FURNACE) continue
+            if (session.openFurnaceX != key.x || session.openFurnaceY != key.y || session.openFurnaceZ != key.z) continue
+            resyncContainerForSession(session, session.openContainerId)
+        }
+    }
+
+    private fun encodePlayerInventoryContainerItems(session: PlayerSession): List<ByteArray> {
+        val out = ArrayList<ByteArray>(46)
+        val playerMatch = currentPlayerCraftMatch(session)
+        val resultStack = if (playerMatch != null) {
+            val resultItemId = itemIdByKey[playerMatch.recipe.result.itemKey] ?: -1
+            if (resultItemId >= 0) encodedItemStack(resultItemId, playerMatch.recipe.result.count) else emptyItemStack()
+        } else {
+            emptyItemStack()
+        }
+        out.add(resultStack)
+        for (i in 0 until 4) {
+            val id = session.playerCraftItemIds[i]
+            val count = session.playerCraftItemCounts[i]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        for (armorSlot in 0..3) {
+            val id = session.armorItemIds[armorSlot]
+            val count = session.armorItemCounts[armorSlot]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        for (main in 0 until 27) {
+            val id = session.mainInventoryItemIds[main]
+            val count = session.mainInventoryItemCounts[main]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        for (hotbar in 0 until 9) {
+            val id = session.hotbarItemIds[hotbar]
+            val count = session.hotbarItemCounts[hotbar]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        out.add(if (session.offhandItemId >= 0 && session.offhandItemCount > 0) encodedItemStack(session.offhandItemId, session.offhandItemCount) else emptyItemStack())
+        return out
+    }
+
+    private fun encodeCraftingTableContainerItems(session: PlayerSession): List<ByteArray> {
+        val out = ArrayList<ByteArray>(46)
+        val tableMatch = currentTableCraftMatch(session)
+        val resultStack = if (tableMatch != null) {
+            val resultItemId = itemIdByKey[tableMatch.recipe.result.itemKey] ?: -1
+            if (resultItemId >= 0) encodedItemStack(resultItemId, tableMatch.recipe.result.count) else emptyItemStack()
+        } else {
+            emptyItemStack()
+        }
+        out.add(resultStack)
+        for (i in 0 until 9) {
+            val id = session.tableCraftItemIds[i]
+            val count = session.tableCraftItemCounts[i]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        for (main in 0 until 27) {
+            val id = session.mainInventoryItemIds[main]
+            val count = session.mainInventoryItemCounts[main]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        for (hotbar in 0 until 9) {
+            val id = session.hotbarItemIds[hotbar]
+            val count = session.hotbarItemCounts[hotbar]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        return out
+    }
+
+    private fun encodeFurnaceContainerItems(session: PlayerSession): List<ByteArray> {
+        val furnace = openFurnaceState(session) ?: createDetachedFurnaceState()
+        val out = ArrayList<ByteArray>(39)
+        val inputId: Int
+        val inputCount: Int
+        val fuelId: Int
+        val fuelCount: Int
+        val resultId: Int
+        val resultCount: Int
+        run {
+            inputId = furnace.inputItemId
+            inputCount = furnace.inputCount
+            fuelId = furnace.fuelItemId
+            fuelCount = furnace.fuelCount
+            resultId = furnace.resultItemId
+            resultCount = furnace.resultCount
+        }
+        out.add(if (inputId >= 0 && inputCount > 0) encodedItemStack(inputId, inputCount) else emptyItemStack())
+        out.add(if (fuelId >= 0 && fuelCount > 0) encodedItemStack(fuelId, fuelCount) else emptyItemStack())
+        out.add(if (resultId >= 0 && resultCount > 0) encodedItemStack(resultId, resultCount) else emptyItemStack())
+        for (main in 0 until 27) {
+            val id = session.mainInventoryItemIds[main]
+            val count = session.mainInventoryItemCounts[main]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        for (hotbar in 0 until 9) {
+            val id = session.hotbarItemIds[hotbar]
+            val count = session.hotbarItemCounts[hotbar]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        return out
+    }
+
+    private fun encodeCursorStack(session: PlayerSession): ByteArray {
+        return if (session.cursorItemId >= 0 && session.cursorItemCount > 0) {
+            encodedItemStack(session.cursorItemId, session.cursorItemCount)
+        } else {
+            emptyItemStack()
+        }
+    }
+
+    private fun encodeFurnaceProperties(furnace: FurnaceState): IntArray {
+        run {
+            return intArrayOf(
+                secondsToMinecraftTicksInt(furnace.burnRemainingSeconds),
+                secondsToMinecraftTicksInt(furnace.burnTotalSeconds),
+                secondsToMinecraftTicksInt(furnace.cookProgressSeconds),
+                secondsToMinecraftTicksInt(furnace.cookTotalSeconds)
+            )
+        }
+    }
+
+    private fun secondsToMinecraftTicksInt(seconds: Double): Int {
+        if (!seconds.isFinite() || seconds <= 0.0) return 0
+        return (seconds * MINECRAFT_TICKS_PER_SECOND).toInt().coerceAtLeast(0).coerceAtMost(Short.MAX_VALUE.toInt())
+    }
+
+    private fun closeCraftingTable(session: PlayerSession) {
+        resetQuickCraftDrag(session)
+        val closingContainerId = session.openContainerId
+        for (i in session.tableCraftItemIds.indices) {
+            val itemId = session.tableCraftItemIds[i]
+            val count = session.tableCraftItemCounts[i]
+            if (itemId >= 0 && count > 0) {
+                tryInsertItemIntoInventory(session, itemId, count)
+                session.tableCraftItemIds[i] = -1
+                session.tableCraftItemCounts[i] = 0
+            }
+        }
+        val ctx = contexts[session.channelId]
+        session.openContainerType = CONTAINER_TYPE_PLAYER_INVENTORY
+        session.openContainerId = PLAYER_INVENTORY_CONTAINER_ID
+        if (ctx != null && ctx.channel().isActive) {
+            val stateId = nextInventoryStateId(session)
+            ctx.write(PlayPackets.containerClosePacket(closingContainerId))
+            ctx.writeAndFlush(
+                PlayPackets.containerSetContentPacket(
+                    containerId = PLAYER_INVENTORY_CONTAINER_ID,
+                    stateId = stateId,
+                    encodedItems = encodePlayerInventoryContainerItems(session),
+                    encodedCarried = encodeCursorStack(session)
+                )
+            )
+        }
+    }
+
+    private fun closeFurnace(session: PlayerSession) {
+        resetQuickCraftDrag(session)
+        val closingContainerId = session.openContainerId
+        session.openContainerType = CONTAINER_TYPE_PLAYER_INVENTORY
+        session.openContainerId = PLAYER_INVENTORY_CONTAINER_ID
+        session.openFurnaceX = 0
+        session.openFurnaceY = 0
+        session.openFurnaceZ = 0
+        val ctx = contexts[session.channelId]
+        if (ctx != null && ctx.channel().isActive) {
+            val stateId = nextInventoryStateId(session)
+            ctx.write(PlayPackets.containerClosePacket(closingContainerId))
+            ctx.writeAndFlush(
+                PlayPackets.containerSetContentPacket(
+                    containerId = PLAYER_INVENTORY_CONTAINER_ID,
+                    stateId = stateId,
+                    encodedItems = encodePlayerInventoryContainerItems(session),
+                    encodedCarried = encodeCursorStack(session)
+                )
+            )
+        }
+    }
+
+    private fun openCraftingTable(session: PlayerSession) {
+        if (session.openContainerType == CONTAINER_TYPE_FURNACE) {
+            closeFurnace(session)
+        } else if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE) {
+            closeCraftingTable(session)
+        }
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        val containerId = session.nextContainerId
+        session.nextContainerId = (session.nextContainerId + 1).coerceAtMost(Int.MAX_VALUE)
+        session.openContainerId = containerId
+        session.openContainerType = CONTAINER_TYPE_CRAFTING_TABLE
+        val stateId = nextInventoryStateId(session)
+        ctx.write(
+            PlayPackets.openScreenPacket(
+                containerId = containerId,
+                menuTypeId = CRAFTING_TABLE_MENU_TYPE_ID,
+                title = PlayPackets.ChatComponent.Translate("container.crafting")
+            )
+        )
+        ctx.writeAndFlush(
+            PlayPackets.containerSetContentPacket(
+                containerId = containerId,
+                stateId = stateId,
+                encodedItems = encodeCraftingTableContainerItems(session),
+                encodedCarried = encodeCursorStack(session)
+            )
+        )
+    }
+
+    private fun openFurnace(session: PlayerSession, x: Int, y: Int, z: Int) {
+        if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE) {
+            closeCraftingTable(session)
+        } else if (session.openContainerType == CONTAINER_TYPE_FURNACE) {
+            closeFurnace(session)
+        }
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        val containerId = session.nextContainerId
+        session.nextContainerId = (session.nextContainerId + 1).coerceAtMost(Int.MAX_VALUE)
+        session.openContainerId = containerId
+        session.openContainerType = CONTAINER_TYPE_FURNACE
+        session.openFurnaceX = x
+        session.openFurnaceY = y
+        session.openFurnaceZ = z
+        val stateId = nextInventoryStateId(session)
+        ctx.write(
+            PlayPackets.openScreenPacket(
+                containerId = containerId,
+                menuTypeId = furnaceMenuTypeId,
+                title = PlayPackets.ChatComponent.Translate("container.furnace")
+            )
+        )
+        ctx.writeAndFlush(
+            PlayPackets.containerSetContentPacket(
+                containerId = containerId,
+                stateId = stateId,
+                encodedItems = encodeFurnaceContainerItems(session),
+                encodedCarried = encodeCursorStack(session)
+            )
+        )
+        val furnace = openFurnaceState(session) ?: return
+        val properties = encodeFurnaceProperties(furnace)
+        for (propertyIndex in properties.indices) {
+            ctx.write(
+                PlayPackets.containerSetDataPacket(
+                    containerId = containerId,
+                    property = propertyIndex,
+                    value = properties[propertyIndex]
+                )
+            )
+        }
+        ctx.flush()
+    }
+
+    private fun isCraftingTableState(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        return parsed.blockKey == "minecraft:crafting_table"
+    }
+
+    private fun isFurnaceState(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        return parsed.blockKey == "minecraft:furnace"
+    }
+
+    private fun createDetachedFurnaceState(): FurnaceState {
+        return FurnaceState(
+            inputItemId = -1,
+            inputCount = 0,
+            fuelItemId = -1,
+            fuelCount = 0,
+            resultItemId = -1,
+            resultCount = 0,
+            burnRemainingSeconds = 0.0,
+            burnTotalSeconds = 0.0,
+            cookProgressSeconds = 0.0,
+            cookTotalSeconds = DEFAULT_FURNACE_COOK_SECONDS,
+            dirty = false
+        )
+    }
+
+    private fun openFurnaceState(session: PlayerSession): FurnaceState? {
+        if (session.openContainerType != CONTAINER_TYPE_FURNACE) return null
+        val key = FurnaceKey(
+            worldKey = session.worldKey,
+            x = session.openFurnaceX,
+            y = session.openFurnaceY,
+            z = session.openFurnaceZ
+        )
+        return furnaceStates.computeIfAbsent(key) { createDetachedFurnaceState() }
+    }
+
+    private fun furnaceStateAt(worldKey: String, x: Int, y: Int, z: Int): FurnaceState {
+        val key = FurnaceKey(worldKey, x, y, z)
+        return furnaceStates.computeIfAbsent(key) { createDetachedFurnaceState() }
+    }
+
+    private fun writeFurnaceSlot(furnace: FurnaceState, slot: Int, itemId: Int, count: Int) {
+        run {
+            val normalizedId = if (itemId >= 0 && count > 0) itemId else -1
+            val normalizedCount = if (itemId >= 0 && count > 0) count.coerceAtMost(MAX_HOTBAR_STACK_SIZE) else 0
+            when (slot) {
+                FURNACE_INPUT_SLOT -> {
+                    furnace.inputItemId = normalizedId
+                    furnace.inputCount = normalizedCount
+                    if (normalizedCount <= 0) {
+                        furnace.inputItemId = -1
+                        furnace.inputCount = 0
+                    }
+                    furnace.cookProgressSeconds = 0.0
+                }
+                FURNACE_FUEL_SLOT -> {
+                    furnace.fuelItemId = normalizedId
+                    furnace.fuelCount = normalizedCount
+                    if (normalizedCount <= 0) {
+                        furnace.fuelItemId = -1
+                        furnace.fuelCount = 0
+                    }
+                }
+                FURNACE_RESULT_SLOT -> {
+                    furnace.resultItemId = normalizedId
+                    furnace.resultCount = normalizedCount
+                    if (normalizedCount <= 0) {
+                        furnace.resultItemId = -1
+                        furnace.resultCount = 0
+                    }
+                }
+            }
+        }
+    }
+
     fun placeSelectedBlock(
         channelId: ChannelId,
         x: Int,
         y: Int,
         z: Int,
+        clickedX: Int,
+        clickedY: Int,
+        clickedZ: Int,
         hand: Int,
         faceId: Int,
         cursorX: Float,
@@ -2580,6 +7064,83 @@ object PlayerSessionManager {
             return
         }
         val world = WorldManager.world(session.worldKey) ?: return
+        val offhand = hand == 1
+        val slot = session.selectedHotbarSlot.coerceIn(0, 8)
+        val selectedItemId = if (offhand) session.offhandItemId else session.hotbarItemIds[slot]
+        val selectedItemCount = if (offhand) session.offhandItemCount else session.hotbarItemCounts[slot]
+        val clickedStateId = world.blockStateAt(clickedX, clickedY, clickedZ)
+        if (!session.sneaking && isFurnaceState(clickedStateId) && isChunkLoadedForSession(session, clickedX, clickedZ)) {
+            openFurnace(session, clickedX, clickedY, clickedZ)
+            return
+        }
+        if (!session.sneaking && isCraftingTableState(clickedStateId) && isChunkLoadedForSession(session, clickedX, clickedZ)) {
+            openCraftingTable(session)
+            return
+        }
+        if (selectedItemCount <= 0 || selectedItemId < 0) {
+            if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                logger.info(
+                    "Placement drop: player={} reason=empty_hand offhand={} slot={} itemId={} count={}",
+                    session.profile.username, offhand, slot, selectedItemId, selectedItemCount
+                )
+            }
+            return
+        }
+        if (selectedItemId == pigSpawnEggItemId) {
+            if (tryHandlePigSpawnEggUseOn(session, world, hand, clickedX, clickedY, clickedZ, faceId)) {
+                return
+            }
+        }
+
+        // Buckets are not normal block items; handle server-side placement explicitly.
+        if (selectedItemId == emptyBucketItemId) {
+            if (!isChunkLoadedForSession(session, clickedX, clickedZ)) {
+                return
+            }
+            if (!canPickupWaterState(clickedStateId)) {
+                return
+            }
+            setBlockAndBroadcast(
+                session = session,
+                x = clickedX,
+                y = clickedY,
+                z = clickedZ,
+                stateId = 0,
+                logAsFluidSync = true
+            )
+            world.resetFluidTickAccumulator()
+            replaceUsedEmptyBucketWithWaterBucket(session, hand)
+            return
+        }
+        if (selectedItemId == waterBucketItemId) {
+            if (!isChunkLoadedForSession(session, x, z)) {
+                return
+            }
+            val targetState = world.blockStateAt(x, y, z)
+            if (!canPlaceWaterIntoState(targetState)) {
+                if (PLACEMENT_DEBUG_LOG_ENABLED) {
+                    logger.info(
+                        "Placement drop: player={} reason=water_bucket_target_blocked pos=({}, {}, {}) stateId={}",
+                        session.profile.username, x, y, z, targetState
+                    )
+                }
+                return
+            }
+            if (waterSourceStateId <= 0) return
+            setBlockAndBroadcast(
+                session = session,
+                x = x,
+                y = y,
+                z = z,
+                stateId = waterSourceStateId,
+                logAsFluidSync = true
+            )
+            world.resetFluidTickAccumulator()
+            if (session.gameMode != GAME_MODE_CREATIVE) {
+                replaceUsedWaterBucketWithEmptyBucket(session, hand)
+            }
+            return
+        }
         if (!isChunkLoadedForSession(session, x, z)) {
             if (PLACEMENT_DEBUG_LOG_ENABLED) {
                 logger.info(
@@ -2590,13 +7151,13 @@ object PlayerSessionManager {
             resyncBlockToPlayer(session, x, y, z, world.blockStateAt(x, y, z))
             return
         }
-        // Reject placement into occupied space to keep server-authoritative collision rules sane.
-        // (simple rule for now: only place into air)
-        if (world.blockStateAt(x, y, z) != 0) {
+        // Vanilla-like replaceable placement: allow replacing water and other replaceable blocks.
+        val targetStateAtPlacement = world.blockStateAt(x, y, z)
+        if (!canPlaceBlockIntoState(targetStateAtPlacement)) {
             if (PLACEMENT_DEBUG_LOG_ENABLED) {
                 logger.info(
-                    "Placement drop: player={} reason=target_not_air pos=({}, {}, {}) stateId={}",
-                    session.profile.username, x, y, z, world.blockStateAt(x, y, z)
+                    "Placement drop: player={} reason=target_not_replaceable pos=({}, {}, {}) stateId={}",
+                    session.profile.username, x, y, z, targetStateAtPlacement
                 )
             }
             return
@@ -2607,20 +7168,6 @@ object PlayerSessionManager {
                 logger.info(
                     "Placement drop: player={} reason=player_collision pos=({}, {}, {})",
                     session.profile.username, x, y, z
-                )
-            }
-            return
-        }
-
-        val offhand = hand == 1
-        val slot = session.selectedHotbarSlot.coerceIn(0, 8)
-        val selectedItemId = if (offhand) session.offhandItemId else session.hotbarItemIds[slot]
-        val selectedItemCount = if (offhand) session.offhandItemCount else session.hotbarItemCounts[slot]
-        if (selectedItemCount <= 0 || selectedItemId < 0) {
-            if (PLACEMENT_DEBUG_LOG_ENABLED) {
-                logger.info(
-                    "Placement drop: player={} reason=empty_hand offhand={} slot={} itemId={} count={}",
-                    session.profile.username, offhand, slot, selectedItemId, selectedItemCount
                 )
             }
             return
@@ -2666,10 +7213,10 @@ object PlayerSessionManager {
         }
         if (pairedPlacement != null) {
             val pairedCurrentState = world.blockStateAt(pairedPlacement.x, pairedPlacement.y, pairedPlacement.z)
-            if (pairedCurrentState != 0) {
+            if (!canPlaceBlockIntoState(pairedCurrentState)) {
                 if (PLACEMENT_DEBUG_LOG_ENABLED) {
                     logger.info(
-                        "Placement drop: player={} reason=paired_not_air paired=({}, {}, {}) stateId={}",
+                        "Placement drop: player={} reason=paired_not_replaceable paired=({}, {}, {}) stateId={}",
                         session.profile.username,
                         pairedPlacement.x,
                         pairedPlacement.y,
@@ -2714,6 +7261,118 @@ object PlayerSessionManager {
         }
         if (session.gameMode != GAME_MODE_CREATIVE) {
             consumePlacedItem(session, hand)
+        }
+    }
+
+    private fun tryHandlePigSpawnEggUseOn(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        hand: Int,
+        clickedX: Int,
+        clickedY: Int,
+        clickedZ: Int,
+        faceId: Int
+    ): Boolean {
+        val spawnPos = resolveSpawnEggUseOnPosition(
+            world = world,
+            clickedX = clickedX,
+            clickedY = clickedY,
+            clickedZ = clickedZ,
+            faceId = faceId,
+            kind = AnimalKind.PIG
+        ) ?: return false
+        if (!isChunkLoadedForSession(session, floor(spawnPos.first).toInt(), floor(spawnPos.third).toInt())) return false
+        val entityId = allocateEntityId()
+        if (!world.spawnAnimal(
+                entityId = entityId,
+                kind = AnimalKind.PIG,
+                x = spawnPos.first,
+                y = spawnPos.second,
+                z = spawnPos.third,
+                yaw = session.yaw
+            )
+        ) {
+            return false
+        }
+        val snapshot = world.animalSnapshot(entityId) ?: return false
+        for (other in sessions.values) {
+            if (other.worldKey != session.worldKey) continue
+            if (!other.loadedChunks.contains(snapshot.chunkPos)) continue
+            if (!other.visibleAnimalEntityIds.add(snapshot.entityId)) continue
+            val ctx = contexts[other.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+            writeAnimalSpawnPackets(other, ctx, snapshot)
+            ctx.flush()
+        }
+        if (session.gameMode != GAME_MODE_CREATIVE) {
+            consumePlacedItem(session, hand)
+        }
+        return true
+    }
+
+    private fun resolveSpawnEggUseOnPosition(
+        world: org.macaroon3145.world.World,
+        clickedX: Int,
+        clickedY: Int,
+        clickedZ: Int,
+        faceId: Int,
+        kind: AnimalKind
+    ): Triple<Double, Double, Double>? {
+        val dimension = EntityHitboxRegistry.dimension(kind.entityTypeKey) ?: return null
+        val halfWidth = dimension.width * 0.5
+        val height = dimension.height
+        val epsilon = 1.0e-4
+
+        val clickedStateId = world.blockStateAt(clickedX, clickedY, clickedZ)
+        val parsed = if (clickedStateId > 0) BlockStateRegistry.parsedState(clickedStateId) else null
+        val boxes = if (parsed == null || isOpenSpawnSpace(clickedStateId)) {
+            emptyArray()
+        } else {
+            BlockCollisionRegistry.boxesForStateId(clickedStateId, parsed)
+                ?: arrayOf(BlockCollisionRegistry.CollisionBox(0.0, 0.0, 0.0, 1.0, 1.0, 1.0))
+        }
+
+        if (boxes.isEmpty()) {
+            val target = when (faceId) {
+                0 -> BlockPos(clickedX, clickedY - 1, clickedZ)
+                1 -> BlockPos(clickedX, clickedY + 1, clickedZ)
+                2 -> BlockPos(clickedX, clickedY, clickedZ - 1)
+                3 -> BlockPos(clickedX, clickedY, clickedZ + 1)
+                4 -> BlockPos(clickedX - 1, clickedY, clickedZ)
+                5 -> BlockPos(clickedX + 1, clickedY, clickedZ)
+                else -> BlockPos(clickedX, clickedY, clickedZ)
+            }
+            return Triple(target.x + 0.5, target.y.toDouble(), target.z + 0.5)
+        }
+
+        var minX = Double.POSITIVE_INFINITY
+        var minY = Double.POSITIVE_INFINITY
+        var minZ = Double.POSITIVE_INFINITY
+        var maxX = Double.NEGATIVE_INFINITY
+        var maxY = Double.NEGATIVE_INFINITY
+        var maxZ = Double.NEGATIVE_INFINITY
+        for (box in boxes) {
+            minX = min(minX, box.minX)
+            minY = min(minY, box.minY)
+            minZ = min(minZ, box.minZ)
+            maxX = max(maxX, box.maxX)
+            maxY = max(maxY, box.maxY)
+            maxZ = max(maxZ, box.maxZ)
+        }
+
+        val baseX = clickedX.toDouble()
+        val baseY = clickedY.toDouble()
+        val baseZ = clickedZ.toDouble()
+        val centerX = baseX + 0.5
+        val centerZ = baseZ + 0.5
+        return when (faceId) {
+            0 -> Triple(centerX, (baseY + minY) - height - epsilon, centerZ)
+            1 -> Triple(centerX, (baseY + maxY) + epsilon, centerZ)
+            2 -> Triple(centerX, baseY, (baseZ + minZ) - halfWidth - epsilon)
+            3 -> Triple(centerX, baseY, (baseZ + maxZ) + halfWidth + epsilon)
+            4 -> Triple((baseX + minX) - halfWidth - epsilon, baseY, centerZ)
+            5 -> Triple((baseX + maxX) + halfWidth + epsilon, baseY, centerZ)
+            else -> Triple(centerX, baseY, centerZ)
         }
     }
 
@@ -2766,6 +7425,615 @@ object PlayerSessionManager {
         broadcastHeldItemEquipment(session)
     }
 
+    private fun canPlaceWaterIntoState(stateId: Int): Boolean {
+        if (stateId == 0) return true
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        return parsed.blockKey in WATER_BUCKET_REPLACEABLE_BLOCK_KEYS
+    }
+
+    private fun canPlaceBlockIntoState(stateId: Int): Boolean {
+        if (stateId == 0) return true
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        return parsed.blockKey in BLOCK_PLACEMENT_REPLACEABLE_BLOCK_KEYS
+    }
+
+    private fun clickedBlockFromPlacementTarget(x: Int, y: Int, z: Int, faceId: Int): BlockPos {
+        return when (faceId) {
+            0 -> BlockPos(x, y + 1, z)
+            1 -> BlockPos(x, y - 1, z)
+            2 -> BlockPos(x, y, z + 1)
+            3 -> BlockPos(x, y, z - 1)
+            4 -> BlockPos(x + 1, y, z)
+            5 -> BlockPos(x - 1, y, z)
+            else -> BlockPos(x, y, z)
+        }
+    }
+
+    private fun canPickupWaterState(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        if (parsed.blockKey != "minecraft:water") return false
+        val levelRaw = parsed.properties["level"] ?: return stateId == waterSourceStateId
+        val level = levelRaw.toIntOrNull() ?: return false
+        return level == 0
+    }
+
+    private fun replaceUsedWaterBucketWithEmptyBucket(session: PlayerSession, hand: Int) {
+        if (emptyBucketItemId < 0) return
+        val ctx = contexts[session.channelId]
+        if (hand == 1) {
+            if (session.offhandItemId != waterBucketItemId || session.offhandItemCount <= 0) return
+            session.offhandItemId = emptyBucketItemId
+            session.offhandItemCount = 1
+            if (ctx != null && ctx.channel().isActive) {
+                ctx.writeAndFlush(
+                    PlayPackets.containerSetSlotPacket(
+                        containerId = 0,
+                        stateId = nextInventoryStateId(session),
+                        slot = 45,
+                        encodedItemStack = encodedItemStack(emptyBucketItemId, 1)
+                    )
+                )
+            }
+            broadcastHeldItemEquipment(session)
+            return
+        }
+        val slot = session.selectedHotbarSlot.coerceIn(0, 8)
+        if (session.hotbarItemIds[slot] != waterBucketItemId || session.hotbarItemCounts[slot] <= 0) return
+        session.hotbarItemIds[slot] = emptyBucketItemId
+        session.hotbarItemCounts[slot] = 1
+        session.hotbarBlockStateIds[slot] = 0
+        session.hotbarBlockEntityTypeIds[slot] = -1
+        session.hotbarBlockEntityNbtPayloads[slot] = null
+        session.selectedBlockStateId = 0
+        if (ctx != null && ctx.channel().isActive) {
+            ctx.writeAndFlush(
+                PlayPackets.containerSetSlotPacket(
+                    containerId = 0,
+                    stateId = nextInventoryStateId(session),
+                    slot = 36 + slot,
+                    encodedItemStack = encodedItemStack(emptyBucketItemId, 1)
+                )
+            )
+        }
+        broadcastHeldItemEquipment(session)
+    }
+
+    private fun replaceUsedEmptyBucketWithWaterBucket(session: PlayerSession, hand: Int) {
+        if (waterBucketItemId < 0) return
+        if (session.gameMode == GAME_MODE_CREATIVE) {
+            // Vanilla ItemUtils.createFilledResult(..., canUseAsExtraSlot=true):
+            // in creative/infinite mode keep held stack and only add filled bucket if missing.
+            if (!inventoryContainsItem(session, waterBucketItemId)) {
+                tryInsertItemIntoInventory(session, waterBucketItemId, 1)
+            }
+            return
+        }
+
+        val ctx = contexts[session.channelId]
+        if (hand == 1) {
+            if (session.offhandItemId == emptyBucketItemId && session.offhandItemCount == 1) {
+                session.offhandItemId = waterBucketItemId
+                session.offhandItemCount = 1
+                if (ctx != null && ctx.channel().isActive) {
+                    ctx.writeAndFlush(
+                        PlayPackets.containerSetSlotPacket(
+                            containerId = 0,
+                            stateId = nextInventoryStateId(session),
+                            slot = 45,
+                            encodedItemStack = encodedItemStack(waterBucketItemId, 1)
+                        )
+                    )
+                }
+                broadcastHeldItemEquipment(session)
+                return
+            }
+            consumePlacedItem(session, hand)
+            if (!tryInsertItemIntoInventory(session, waterBucketItemId, 1)) {
+                spawnDroppedItemFromPlayer(session, waterBucketItemId, 1, dropStackMotion = false)
+            }
+            return
+        }
+
+        val slot = session.selectedHotbarSlot.coerceIn(0, 8)
+        if (session.hotbarItemIds[slot] == emptyBucketItemId && session.hotbarItemCounts[slot] == 1) {
+            session.hotbarItemIds[slot] = waterBucketItemId
+            session.hotbarItemCounts[slot] = 1
+            session.hotbarBlockStateIds[slot] = 0
+            session.hotbarBlockEntityTypeIds[slot] = -1
+            session.hotbarBlockEntityNbtPayloads[slot] = null
+            session.selectedBlockStateId = 0
+            if (ctx != null && ctx.channel().isActive) {
+                ctx.writeAndFlush(
+                    PlayPackets.containerSetSlotPacket(
+                        containerId = 0,
+                        stateId = nextInventoryStateId(session),
+                        slot = 36 + slot,
+                        encodedItemStack = encodedItemStack(waterBucketItemId, 1)
+                    )
+                )
+            }
+            broadcastHeldItemEquipment(session)
+            return
+        }
+
+        consumePlacedItem(session, hand)
+        if (!tryInsertItemIntoInventory(session, waterBucketItemId, 1)) {
+            spawnDroppedItemFromPlayer(session, waterBucketItemId, 1, dropStackMotion = false)
+        }
+    }
+
+    private fun inventoryContainsItem(session: PlayerSession, itemId: Int): Boolean {
+        if (itemId < 0) return false
+        for (slot in 0..8) {
+            if (session.hotbarItemCounts[slot] > 0 && session.hotbarItemIds[slot] == itemId) return true
+        }
+        for (index in session.mainInventoryItemIds.indices) {
+            if (session.mainInventoryItemCounts[index] > 0 && session.mainInventoryItemIds[index] == itemId) return true
+        }
+        if (session.offhandItemCount > 0 && session.offhandItemId == itemId) return true
+        return false
+    }
+
+    private fun tryInsertItemIntoInventory(session: PlayerSession, itemId: Int, itemCount: Int): Boolean {
+        if (itemId < 0 || itemCount <= 0) return false
+        var remaining = itemCount
+        val changedHotbarSlots = LinkedHashSet<Int>()
+        val changedMainInventorySlots = LinkedHashSet<Int>()
+        val selectedSlot = session.selectedHotbarSlot.coerceIn(0, 8)
+        val selectedBeforeItemId = session.hotbarItemIds[selectedSlot]
+        val selectedBeforeCount = session.hotbarItemCounts[selectedSlot]
+
+        for (slot in 0..8) {
+            if (remaining <= 0) break
+            if (session.hotbarItemCounts[slot] <= 0 || session.hotbarItemIds[slot] != itemId) continue
+            val free = MAX_HOTBAR_STACK_SIZE - session.hotbarItemCounts[slot]
+            if (free <= 0) continue
+            val added = minOf(free, remaining)
+            session.hotbarItemCounts[slot] += added
+            remaining -= added
+            changedHotbarSlots.add(slot)
+        }
+
+        for (index in session.mainInventoryItemIds.indices) {
+            if (remaining <= 0) break
+            if (session.mainInventoryItemCounts[index] <= 0 || session.mainInventoryItemIds[index] != itemId) continue
+            val free = MAX_HOTBAR_STACK_SIZE - session.mainInventoryItemCounts[index]
+            if (free <= 0) continue
+            val added = minOf(free, remaining)
+            session.mainInventoryItemCounts[index] += added
+            remaining -= added
+            changedMainInventorySlots.add(index)
+        }
+
+        for (slot in 0..8) {
+            if (remaining <= 0) break
+            if (session.hotbarItemCounts[slot] > 0 && session.hotbarItemIds[slot] >= 0) continue
+            val added = minOf(MAX_HOTBAR_STACK_SIZE, remaining)
+            session.hotbarItemIds[slot] = itemId
+            session.hotbarItemCounts[slot] = added
+            session.hotbarBlockStateIds[slot] = itemBlockStateId(itemId)
+            session.hotbarBlockEntityTypeIds[slot] = -1
+            session.hotbarBlockEntityNbtPayloads[slot] = null
+            remaining -= added
+            changedHotbarSlots.add(slot)
+        }
+
+        for (index in session.mainInventoryItemIds.indices) {
+            if (remaining <= 0) break
+            if (session.mainInventoryItemCounts[index] > 0 && session.mainInventoryItemIds[index] >= 0) continue
+            val added = minOf(MAX_HOTBAR_STACK_SIZE, remaining)
+            session.mainInventoryItemIds[index] = itemId
+            session.mainInventoryItemCounts[index] = added
+            remaining -= added
+            changedMainInventorySlots.add(index)
+        }
+
+        if (remaining > 0) return false
+
+        session.selectedBlockStateId = if (session.hotbarItemCounts[selectedSlot] > 0) {
+            session.hotbarBlockStateIds[selectedSlot]
+        } else {
+            0
+        }
+
+        val ctx = contexts[session.channelId]
+        if (ctx != null && ctx.channel().isActive) {
+            for (slot in changedHotbarSlots) {
+                val encoded = if (session.hotbarItemIds[slot] >= 0 && session.hotbarItemCounts[slot] > 0) {
+                    encodedItemStack(session.hotbarItemIds[slot], session.hotbarItemCounts[slot])
+                } else {
+                    emptyItemStack()
+                }
+                ctx.write(
+                    PlayPackets.containerSetSlotPacket(
+                        containerId = 0,
+                        stateId = nextInventoryStateId(session),
+                        slot = 36 + slot,
+                        encodedItemStack = encoded
+                    )
+                )
+            }
+            for (index in changedMainInventorySlots) {
+                val encoded = if (session.mainInventoryItemIds[index] >= 0 && session.mainInventoryItemCounts[index] > 0) {
+                    encodedItemStack(session.mainInventoryItemIds[index], session.mainInventoryItemCounts[index])
+                } else {
+                    emptyItemStack()
+                }
+                ctx.write(
+                    PlayPackets.containerSetSlotPacket(
+                        containerId = 0,
+                        stateId = nextInventoryStateId(session),
+                        slot = inventorySlotForMainInventoryIndex(index),
+                        encodedItemStack = encoded
+                    )
+                )
+            }
+            ctx.flush()
+        }
+
+        val selectedAfterItemId = session.hotbarItemIds[selectedSlot]
+        val selectedAfterCount = session.hotbarItemCounts[selectedSlot]
+        if (selectedBeforeItemId != selectedAfterItemId || selectedBeforeCount != selectedAfterCount) {
+            broadcastHeldItemEquipment(session)
+        }
+        return true
+    }
+
+    fun handleUseItem(channelId: ChannelId, hand: Int) {
+        if (hand !in 0..1) return
+        val session = sessions[channelId] ?: return
+        val world = WorldManager.world(session.worldKey) ?: return
+        if (session.gameMode == GAME_MODE_SPECTATOR) return
+
+        val slot = session.selectedHotbarSlot.coerceIn(0, 8)
+        val itemId = if (hand == 1) session.offhandItemId else session.hotbarItemIds[slot]
+        val itemCount = if (hand == 1) session.offhandItemCount else session.hotbarItemCounts[slot]
+        if (itemId < 0 || itemCount <= 0) return
+        if (tryConsumeMountedPigBoost(session, itemId)) return
+        if (tryHandleBucketUseItem(session, world, hand, itemId)) return
+        if (tryConsumeFoodItem(session, hand, itemId)) return
+
+        val kind = when (itemId) {
+            snowballItemId -> ThrownItemKind.SNOWBALL
+            eggItemId -> ThrownItemKind.EGG
+            blueEggItemId -> ThrownItemKind.BLUE_EGG
+            brownEggItemId -> ThrownItemKind.BROWN_EGG
+            else -> return
+        }
+        val spawned = spawnThrownItemFromPlayer(session, world, kind)
+        if (!spawned) return
+        if (session.gameMode != GAME_MODE_CREATIVE) {
+            consumePlacedItem(session, hand)
+        }
+    }
+
+    private fun tryConsumeMountedPigBoost(session: PlayerSession, itemId: Int): Boolean {
+        if (itemId != carrotOnAStickItemId || carrotOnAStickItemId < 0) return false
+        val animalEntityId = session.ridingAnimalEntityId
+        if (animalEntityId < 0) return false
+        if (animalEntityId !in saddledAnimalEntityIds) return true
+        val world = WorldManager.world(session.worldKey) ?: return true
+        val animal = world.animalSnapshot(animalEntityId)
+        if (animal == null || animal.kind != AnimalKind.PIG) {
+            dismountPlayerFromAnimal(session)
+            return true
+        }
+        while (true) {
+            val current = pigBoostStatesByAnimalEntityId[animalEntityId]
+            if (current != null && current.elapsedSeconds < current.durationSeconds) {
+                return true
+            }
+            val next = PigBoostState(
+                elapsedSeconds = 0.0,
+                durationSeconds = randomPigBoostDurationSeconds()
+            )
+            if (current == null) {
+                if (pigBoostStatesByAnimalEntityId.putIfAbsent(animalEntityId, next) == null) {
+                    return true
+                }
+            } else {
+                if (pigBoostStatesByAnimalEntityId.replace(animalEntityId, current, next)) {
+                    return true
+                }
+            }
+        }
+    }
+
+    private fun randomPigBoostDurationSeconds(): Double {
+        val durationTicks = PIG_BOOST_MIN_TICKS + ThreadLocalRandom.current().nextInt(PIG_BOOST_RANDOM_SPREAD_TICKS)
+        return durationTicks / MINECRAFT_TICKS_PER_SECOND
+    }
+
+    private fun tryConsumeFoodItem(session: PlayerSession, hand: Int, itemId: Int): Boolean {
+        val foodData = FoodItemCache.byItemId(itemId) ?: return false
+        if (session.gameMode != GAME_MODE_CREATIVE && session.food >= MAX_PLAYER_FOOD && !foodData.alwaysEdible) return false
+        if (session.usingItemRemainingSeconds > 0.0) {
+            if (session.usingItemHand == hand && session.usingItemId == itemId) return true
+            stopUsingItem(session)
+        }
+        session.usingItemHand = hand
+        session.usingItemId = itemId
+        session.usingItemRemainingSeconds = foodData.consumeSeconds
+        session.usingItemSoundKey = foodData.useSoundKey
+        session.usingItemSoundDelaySeconds = FOOD_USE_SOUND_INITIAL_DELAY_SECONDS
+        return true
+    }
+
+    private fun finishConsumingFoodItem(session: PlayerSession, hand: Int, expectedItemId: Int): Boolean {
+        val slot = session.selectedHotbarSlot.coerceIn(0, 8)
+        val currentItemId = if (hand == 1) session.offhandItemId else session.hotbarItemIds[slot]
+        val currentCount = if (hand == 1) session.offhandItemCount else session.hotbarItemCounts[slot]
+        if (currentItemId != expectedItemId || currentCount <= 0) return false
+        val foodData = FoodItemCache.byItemId(expectedItemId) ?: return false
+        if (session.gameMode != GAME_MODE_CREATIVE && session.food >= MAX_PLAYER_FOOD && !foodData.alwaysEdible) return false
+
+        val previousFood = session.food
+        val previousSaturation = session.saturation
+        val nextFood = (session.food + foodData.nutrition).coerceAtMost(MAX_PLAYER_FOOD)
+        val saturationGain = (foodData.nutrition.toFloat() * foodData.saturationModifier * 2f).coerceAtLeast(0f)
+        val nextSaturation = (session.saturation + saturationGain).coerceAtMost(nextFood.toFloat())
+
+        session.food = nextFood
+        session.saturation = nextSaturation
+        if (session.gameMode != GAME_MODE_CREATIVE) {
+            consumeFoodItemAndHandleRemainder(session, hand, foodData.remainderItemId)
+        }
+        broadcastEntityEventInWorld(session, ENTITY_EVENT_FINISH_USING_ITEM)
+        broadcastFoodFinishSound(session, foodData.finishSoundKey)
+
+        if (session.food != previousFood || session.saturation != previousSaturation) {
+            sendHealthPacket(session)
+        }
+        return true
+    }
+
+    fun handleReleaseUseItem(channelId: ChannelId) {
+        val session = sessions[channelId] ?: return
+        stopUsingItem(session)
+    }
+
+    private fun stopUsingItem(session: PlayerSession) {
+        session.usingItemHand = -1
+        session.usingItemId = -1
+        session.usingItemRemainingSeconds = 0.0
+        session.usingItemSoundKey = null
+        session.usingItemSoundDelaySeconds = 0.0
+    }
+
+    private fun consumeFoodItemAndHandleRemainder(session: PlayerSession, hand: Int, remainderItemId: Int) {
+        if (remainderItemId < 0) {
+            consumePlacedItem(session, hand)
+            return
+        }
+        val ctx = contexts[session.channelId]
+        if (hand == 1) {
+            if (session.offhandItemCount == 1 && session.offhandItemId >= 0) {
+                session.offhandItemId = remainderItemId
+                session.offhandItemCount = 1
+                if (ctx != null && ctx.channel().isActive) {
+                    ctx.writeAndFlush(
+                        PlayPackets.containerSetSlotPacket(
+                            containerId = 0,
+                            stateId = nextInventoryStateId(session),
+                            slot = 45,
+                            encodedItemStack = encodedItemStack(remainderItemId, 1)
+                        )
+                    )
+                }
+                broadcastHeldItemEquipment(session)
+                return
+            }
+            consumePlacedItem(session, hand)
+            if (!tryInsertItemIntoInventory(session, remainderItemId, 1)) {
+                spawnDroppedItemFromPlayer(session, remainderItemId, 1, dropStackMotion = false)
+            }
+            return
+        }
+
+        val slot = session.selectedHotbarSlot.coerceIn(0, 8)
+        if (session.hotbarItemCounts[slot] == 1 && session.hotbarItemIds[slot] >= 0) {
+            session.hotbarItemIds[slot] = remainderItemId
+            session.hotbarItemCounts[slot] = 1
+            session.hotbarBlockStateIds[slot] = 0
+            session.hotbarBlockEntityTypeIds[slot] = -1
+            session.hotbarBlockEntityNbtPayloads[slot] = null
+            session.selectedBlockStateId = 0
+            if (ctx != null && ctx.channel().isActive) {
+                ctx.writeAndFlush(
+                    PlayPackets.containerSetSlotPacket(
+                        containerId = 0,
+                        stateId = nextInventoryStateId(session),
+                        slot = 36 + slot,
+                        encodedItemStack = encodedItemStack(remainderItemId, 1)
+                    )
+                )
+            }
+            broadcastHeldItemEquipment(session)
+            return
+        }
+
+        consumePlacedItem(session, hand)
+        if (!tryInsertItemIntoInventory(session, remainderItemId, 1)) {
+            spawnDroppedItemFromPlayer(session, remainderItemId, 1, dropStackMotion = false)
+        }
+    }
+
+    private fun spawnThrownItemFromPlayer(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        kind: ThrownItemKind
+    ): Boolean {
+        val yawRad = Math.toRadians(session.yaw.toDouble())
+        val pitchRad = Math.toRadians(session.pitch.toDouble())
+        val cosPitch = cos(pitchRad)
+        val dirX = -sin(yawRad) * cosPitch
+        val dirY = -sin(pitchRad)
+        val dirZ = cos(yawRad) * cosPitch
+
+        val spawnX = session.clientEyeX + (dirX * 0.4)
+        val spawnY = session.clientEyeY - 0.1
+        val spawnZ = session.clientEyeZ + (dirZ * 0.4)
+        val launchSpeed = THROWN_ITEM_LAUNCH_SPEED
+        val vx = dirX * launchSpeed
+        val vy = dirY * launchSpeed + THROWN_ITEM_LAUNCH_VERTICAL_BOOST
+        val vz = dirZ * launchSpeed
+        val entityId = allocateEntityId()
+        if (!world.spawnThrownItem(entityId, session.entityId, kind, spawnX, spawnY, spawnZ, vx, vy, vz)) {
+            return false
+        }
+        broadcastThrownItemLaunchSound(session, kind)
+        val snapshot = world.thrownItemSnapshot(entityId) ?: return true
+        val worldSessions = sessions.values.filter { it.worldKey == session.worldKey }
+        for (other in worldSessions) {
+            if (!other.loadedChunks.contains(snapshot.chunkPos)) continue
+            if (!other.visibleThrownItemEntityIds.add(snapshot.entityId)) continue
+            val ctx = contexts[other.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+            writeThrownItemSpawnPackets(other, ctx, snapshot)
+        }
+        return true
+    }
+
+    private fun tryHandleBucketUseItem(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World,
+        hand: Int,
+        itemId: Int
+    ): Boolean {
+        if (itemId != emptyBucketItemId) return false
+        val waterPos = raycastWaterSourceBlock(session, world) ?: return false
+        if (!isChunkLoadedForSession(session, waterPos.x, waterPos.z)) return false
+        val clickedState = world.blockStateAt(waterPos.x, waterPos.y, waterPos.z)
+        if (!canPickupWaterState(clickedState)) return false
+        setBlockAndBroadcast(
+            session = session,
+            x = waterPos.x,
+            y = waterPos.y,
+            z = waterPos.z,
+            stateId = 0,
+            logAsFluidSync = true
+        )
+        world.resetFluidTickAccumulator()
+        replaceUsedEmptyBucketWithWaterBucket(session, hand)
+        return true
+    }
+
+    private fun raycastWaterSourceBlock(
+        session: PlayerSession,
+        world: org.macaroon3145.world.World
+    ): BlockPos? {
+        val yawRad = Math.toRadians(session.yaw.toDouble())
+        val pitchRad = Math.toRadians(session.pitch.toDouble())
+        val cosPitch = cos(pitchRad)
+        val dirX = -sin(yawRad) * cosPitch
+        val dirY = -sin(pitchRad)
+        val dirZ = cos(yawRad) * cosPitch
+        val eyeX = session.clientEyeX
+        val eyeY = session.clientEyeY
+        val eyeZ = session.clientEyeZ
+        val maxDistance = 5.0
+        val step = 0.1
+        var distance = 0.0
+        var lastX = Int.MIN_VALUE
+        var lastY = Int.MIN_VALUE
+        var lastZ = Int.MIN_VALUE
+        while (distance <= maxDistance) {
+            val sampleX = eyeX + dirX * distance
+            val sampleY = eyeY + dirY * distance
+            val sampleZ = eyeZ + dirZ * distance
+            val blockX = kotlin.math.floor(sampleX).toInt()
+            val blockY = kotlin.math.floor(sampleY).toInt()
+            val blockZ = kotlin.math.floor(sampleZ).toInt()
+            if (blockX == lastX && blockY == lastY && blockZ == lastZ) {
+                distance += step
+                continue
+            }
+            lastX = blockX
+            lastY = blockY
+            lastZ = blockZ
+
+            val stateId = world.blockStateAt(blockX, blockY, blockZ)
+            if (stateId == 0) {
+                distance += step
+                continue
+            }
+            return if (canPickupWaterState(stateId)) BlockPos(blockX, blockY, blockZ) else null
+        }
+        return null
+    }
+
+    private fun broadcastThrownItemLaunchSound(session: PlayerSession, kind: ThrownItemKind) {
+        val soundKey = when (kind) {
+            ThrownItemKind.SNOWBALL -> "minecraft:entity.snowball.throw"
+            ThrownItemKind.EGG, ThrownItemKind.BLUE_EGG, ThrownItemKind.BROWN_EGG -> "minecraft:entity.egg.throw"
+        }
+        val packet = PlayPackets.soundPacketByKey(
+            soundKey = soundKey,
+            soundSourceId = NEUTRAL_SOUND_SOURCE_ID,
+            x = session.x,
+            y = session.y,
+            z = session.z,
+            volume = 0.5f,
+            pitch = 0.4f / (ThreadLocalRandom.current().nextFloat() * 0.4f + 0.8f),
+            seed = ThreadLocalRandom.current().nextLong()
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != session.worldKey) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
+    private fun broadcastFoodUseProgressSound(session: PlayerSession, soundKey: String) {
+        broadcastFoodSoundInWorld(
+            session = session,
+            soundKey = soundKey,
+            volume = 1.0f,
+            pitch = 1.0f,
+            includeSelf = false
+        )
+    }
+
+    private fun broadcastFoodFinishSound(session: PlayerSession, soundKey: String) {
+        broadcastFoodSoundInWorld(
+            session = session,
+            soundKey = soundKey,
+            volume = 0.5f,
+            pitch = ThreadLocalRandom.current().nextFloat() * 0.1f + 0.9f,
+            includeSelf = true
+        )
+    }
+
+    private fun broadcastFoodSoundInWorld(
+        session: PlayerSession,
+        soundKey: String,
+        volume: Float,
+        pitch: Float,
+        includeSelf: Boolean
+    ) {
+        val packet = PlayPackets.soundPacketByKey(
+            soundKey = soundKey,
+            soundSourceId = PLAYERS_SOUND_SOURCE_ID,
+            x = session.x,
+            y = session.y,
+            z = session.z,
+            volume = volume,
+            pitch = pitch,
+            seed = ThreadLocalRandom.current().nextLong()
+        )
+        for ((id, other) in sessions) {
+            if (other.worldKey != session.worldKey) continue
+            if (!includeSelf && other.entityId == session.entityId) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
     private fun spawnDroppedItemFromPlayer(
         session: PlayerSession,
         itemId: Int,
@@ -2782,9 +8050,9 @@ object PlayerSessionManager {
         val dirY = -sin(pitchRad)
         val dirZ = cos(yawRad) * cosPitch
 
-        val spawnX = session.x + (dirX * 0.4)
-        val spawnY = session.y + 1.35
-        val spawnZ = session.z + (dirZ * 0.4)
+        val spawnX = session.clientEyeX + (dirX * 0.4)
+        val spawnY = session.clientEyeY - 0.27
+        val spawnZ = session.clientEyeZ + (dirZ * 0.4)
         val launchSpeed = if (dropStackMotion) 0.24 else 0.30
         val vx = dirX * launchSpeed
         val vy = dirY * launchSpeed + 0.16
@@ -2816,6 +8084,7 @@ object PlayerSessionManager {
         if (collectors.isEmpty()) return emptyList()
 
         val candidatesByEntity = HashMap<Int, DroppedItemPickupCandidate>()
+        val chunkItemsCache = HashMap<ChunkPos, List<DroppedItemSnapshot>>()
 
         for ((collectorOrder, collector) in collectors.withIndex()) {
             val playerChunkX = ChunkStreamingService.chunkXFromBlockX(collector.x)
@@ -2823,12 +8092,14 @@ object PlayerSessionManager {
 
             for (chunkX in (playerChunkX - 1)..(playerChunkX + 1)) {
                 for (chunkZ in (playerChunkZ - 1)..(playerChunkZ + 1)) {
-                    val items = world.droppedItemsInChunk(chunkX, chunkZ)
+                    val chunkPos = ChunkPos(chunkX, chunkZ)
+                    val items = chunkItemsCache.getOrPut(chunkPos) {
+                        world.droppedItemsInChunk(chunkX, chunkZ)
+                    }
                     if (items.isEmpty()) continue
                     for (snapshot in items) {
                         if (snapshot.pickupDelaySeconds > DROPPED_ITEM_PICKUP_DELAY_EPSILON) continue
                         if (!canPlayerPickDroppedItem(collector, snapshot)) continue
-                        if (!canAbsorbDroppedItem(collector, snapshot.itemId, snapshot.itemCount)) continue
                         val distanceSq = pickupDistanceSquared(collector, snapshot)
                         val current = candidatesByEntity[snapshot.entityId]
                         val shouldReplace = current == null ||
@@ -3309,6 +8580,15 @@ object PlayerSessionManager {
         ctx: ChannelHandlerContext,
         packet: ByteArray
     ) {
+        val existing = outboundByContext[ctx]
+        if (existing != null) {
+            existing.add(packet)
+            return
+        }
+        if (packet.size <= SMALL_ENTITY_PACKET_IMMEDIATE_BYTES) {
+            enqueueChannelFlushPacket(ctx, packet)
+            return
+        }
         outboundByContext
             .computeIfAbsent(ctx) { ArrayList(4) }
             .add(packet)
@@ -3403,8 +8683,6 @@ object PlayerSessionManager {
             newDroppedItemTrackerState(snapshot, syncVx, syncVy, syncVz)
         }
         state.secondsSinceHardSync = (state.secondsSinceHardSync + deltaSeconds).coerceAtMost(120.0)
-        val playerTimeScale = ServerConfig.playerTimeScale
-
         val encodedX = encodeDroppedItemPosition4096(snapshot.x)
         val encodedY = encodeDroppedItemPosition4096(snapshot.y)
         val encodedZ = encodeDroppedItemPosition4096(snapshot.z)
@@ -3416,10 +8694,6 @@ object PlayerSessionManager {
         val onGroundChanged = state.lastOnGround != snapshot.onGround
 
         val packets = ArrayList<ByteArray>(2)
-        state.relativeMoveAccumulatorSeconds =
-            (state.relativeMoveAccumulatorSeconds + deltaSeconds).coerceAtMost(MAX_DROPPED_ITEM_RELATIVE_MOVE_ACCUMULATOR_SECONDS)
-        val relativeMoveIntervalSeconds = effectiveDroppedItemRelativeMoveIntervalSeconds(playerTimeScale)
-        val relativeMoveDue = state.relativeMoveAccumulatorSeconds >= relativeMoveIntervalSeconds
         val shouldEmitMovement = hasPositionDelta || onGroundChanged
         var movementPacketSent = false
         var packetVxForMovement = syncVx
@@ -3433,45 +8707,38 @@ object PlayerSessionManager {
                     dz < Short.MIN_VALUE.toLong() || dz > Short.MAX_VALUE.toLong() ||
                     state.secondsSinceHardSync >= MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC
 
-            if (requiresHardSync || relativeMoveDue || onGroundChanged) {
-                if (requiresHardSync) {
-                    packets.add(
-                        PlayPackets.entityPositionSyncPacket(
-                            entityId = snapshot.entityId,
-                            x = snapshot.x,
-                            y = snapshot.y,
-                            z = snapshot.z,
-                            vx = packetVxForMovement,
-                            vy = packetVyForMovement,
-                            vz = packetVzForMovement,
-                            yaw = 0f,
-                            pitch = 0f,
-                            onGround = snapshot.onGround
-                        )
+            if (requiresHardSync) {
+                packets.add(
+                    PlayPackets.entityPositionSyncPacket(
+                        entityId = snapshot.entityId,
+                        x = snapshot.x,
+                        y = snapshot.y,
+                        z = snapshot.z,
+                        vx = packetVxForMovement,
+                        vy = packetVyForMovement,
+                        vz = packetVzForMovement,
+                        yaw = 0f,
+                        pitch = 0f,
+                        onGround = snapshot.onGround
                     )
-                    state.secondsSinceHardSync = 0.0
-                } else {
-                    packets.add(
-                        PlayPackets.entityRelativeMovePacket(
-                            entityId = snapshot.entityId,
-                            deltaX = dx.toInt(),
-                            deltaY = dy.toInt(),
-                            deltaZ = dz.toInt(),
-                            onGround = snapshot.onGround
-                        )
+                )
+                state.secondsSinceHardSync = 0.0
+            } else {
+                packets.add(
+                    PlayPackets.entityRelativeMovePacket(
+                        entityId = snapshot.entityId,
+                        deltaX = dx.toInt(),
+                        deltaY = dy.toInt(),
+                        deltaZ = dz.toInt(),
+                        onGround = snapshot.onGround
                     )
-                }
-                state.encodedX4096 = encodedX
-                state.encodedY4096 = encodedY
-                state.encodedZ4096 = encodedZ
-                state.lastOnGround = snapshot.onGround
-                state.relativeMoveAccumulatorSeconds = if (relativeMoveDue) {
-                    (state.relativeMoveAccumulatorSeconds - relativeMoveIntervalSeconds).coerceAtLeast(0.0)
-                } else {
-                    state.relativeMoveAccumulatorSeconds
-                }
-                movementPacketSent = true
+                )
             }
+            state.encodedX4096 = encodedX
+            state.encodedY4096 = encodedY
+            state.encodedZ4096 = encodedZ
+            state.lastOnGround = snapshot.onGround
+            movementPacketSent = true
         }
 
         val hadVelocity =
@@ -3520,8 +8787,7 @@ object PlayerSessionManager {
             lastVy = syncVy,
             lastVz = syncVz,
             lastOnGround = snapshot.onGround,
-            secondsSinceHardSync = 0.0,
-            relativeMoveAccumulatorSeconds = 0.0
+            secondsSinceHardSync = 0.0
         )
     }
 
@@ -3540,11 +8806,6 @@ object PlayerSessionManager {
     private fun droppedItemNetworkVelocityTimeScale(timeScale: Double): Double {
         if (timeScale <= 0.0 || timeScale.isNaN() || timeScale.isInfinite()) return 0.0
         return timeScale
-    }
-
-    private fun effectiveDroppedItemRelativeMoveIntervalSeconds(playerTimeScale: Double): Double {
-        if (playerTimeScale <= 0.0) return DROPPED_ITEM_RELATIVE_MOVE_INTERVAL_SECONDS
-        return DROPPED_ITEM_RELATIVE_MOVE_INTERVAL_SECONDS / playerTimeScale
     }
 
     private fun sanitizeDroppedItemNetworkVelocity(value: Double): Double {
@@ -3733,7 +8994,6 @@ object PlayerSessionManager {
             )
         }
         state.secondsSinceHardSync = (state.secondsSinceHardSync + deltaSeconds).coerceAtMost(120.0)
-        val playerTimeScale = ServerConfig.playerTimeScale
         val encodedX = encodeDroppedItemPosition4096(snapshot.x)
         val encodedY = encodeDroppedItemPosition4096(snapshot.y)
         val encodedZ = encodeDroppedItemPosition4096(snapshot.z)
@@ -3744,10 +9004,6 @@ object PlayerSessionManager {
         val onGroundChanged = state.lastOnGround != snapshot.onGround
 
         val packets = ArrayList<ByteArray>(2)
-        state.relativeMoveAccumulatorSeconds =
-            (state.relativeMoveAccumulatorSeconds + deltaSeconds).coerceAtMost(MAX_DROPPED_ITEM_RELATIVE_MOVE_ACCUMULATOR_SECONDS)
-        val relativeMoveIntervalSeconds = effectiveDroppedItemRelativeMoveIntervalSeconds(playerTimeScale)
-        val relativeMoveDue = state.relativeMoveAccumulatorSeconds >= relativeMoveIntervalSeconds
         val shouldEmitMovement = hasPositionDelta || onGroundChanged
         var movementPacketSent = false
 
@@ -3757,45 +9013,38 @@ object PlayerSessionManager {
                     dy < Short.MIN_VALUE.toLong() || dy > Short.MAX_VALUE.toLong() ||
                     dz < Short.MIN_VALUE.toLong() || dz > Short.MAX_VALUE.toLong() ||
                     state.secondsSinceHardSync >= MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC
-            if (requiresHardSync || relativeMoveDue || onGroundChanged) {
-                if (requiresHardSync) {
-                    packets.add(
-                        PlayPackets.entityPositionSyncPacket(
-                            entityId = snapshot.entityId,
-                            x = snapshot.x,
-                            y = snapshot.y,
-                            z = snapshot.z,
-                            vx = syncVx,
-                            vy = syncVy,
-                            vz = syncVz,
-                            yaw = 0f,
-                            pitch = 0f,
-                            onGround = snapshot.onGround
-                        )
+            if (requiresHardSync) {
+                packets.add(
+                    PlayPackets.entityPositionSyncPacket(
+                        entityId = snapshot.entityId,
+                        x = snapshot.x,
+                        y = snapshot.y,
+                        z = snapshot.z,
+                        vx = syncVx,
+                        vy = syncVy,
+                        vz = syncVz,
+                        yaw = 0f,
+                        pitch = 0f,
+                        onGround = snapshot.onGround
                     )
-                    state.secondsSinceHardSync = 0.0
-                } else {
-                    packets.add(
-                        PlayPackets.entityRelativeMovePacket(
-                            entityId = snapshot.entityId,
-                            deltaX = dx.toInt(),
-                            deltaY = dy.toInt(),
-                            deltaZ = dz.toInt(),
-                            onGround = snapshot.onGround
-                        )
+                )
+                state.secondsSinceHardSync = 0.0
+            } else {
+                packets.add(
+                    PlayPackets.entityRelativeMovePacket(
+                        entityId = snapshot.entityId,
+                        deltaX = dx.toInt(),
+                        deltaY = dy.toInt(),
+                        deltaZ = dz.toInt(),
+                        onGround = snapshot.onGround
                     )
-                }
-                state.encodedX4096 = encodedX
-                state.encodedY4096 = encodedY
-                state.encodedZ4096 = encodedZ
-                state.lastOnGround = snapshot.onGround
-                state.relativeMoveAccumulatorSeconds = if (relativeMoveDue) {
-                    (state.relativeMoveAccumulatorSeconds - relativeMoveIntervalSeconds).coerceAtLeast(0.0)
-                } else {
-                    state.relativeMoveAccumulatorSeconds
-                }
-                movementPacketSent = true
+                )
             }
+            state.encodedX4096 = encodedX
+            state.encodedY4096 = encodedY
+            state.encodedZ4096 = encodedZ
+            state.lastOnGround = snapshot.onGround
+            movementPacketSent = true
         }
 
         val hadVelocity =
@@ -3899,6 +9148,716 @@ object PlayerSessionManager {
         }
     }
 
+    private fun syncThrownItemSnapshot(
+        snapshot: ThrownItemSnapshot,
+        worldSessions: List<PlayerSession>,
+        outboundByContext: MutableMap<ChannelHandlerContext, MutableList<ByteArray>>,
+        sendPositionUpdate: Boolean,
+        deltaSeconds: Double
+    ) {
+        val chunkPos = snapshot.chunkPos
+        var removePacket: ByteArray? = null
+        val (syncVx, syncVy, syncVz) = thrownItemNetworkVelocity(snapshot)
+        for (session in worldSessions) {
+            val shouldBeVisible = session.loadedChunks.contains(chunkPos)
+            val ctx = contexts[session.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+
+            if (shouldBeVisible) {
+                if (session.visibleThrownItemEntityIds.add(snapshot.entityId)) {
+                    queueThrownItemSpawnPackets(
+                        outboundByContext = outboundByContext,
+                        ctx = ctx,
+                        session = session,
+                        snapshot = snapshot,
+                        syncVx = syncVx,
+                        syncVy = syncVy,
+                        syncVz = syncVz
+                    )
+                    continue
+                }
+                if (sendPositionUpdate) {
+                    val movementPackets = thrownItemMovementPackets(
+                        session = session,
+                        snapshot = snapshot,
+                        syncVx = syncVx,
+                        syncVy = syncVy,
+                        syncVz = syncVz,
+                        deltaSeconds = deltaSeconds
+                    )
+                    for (packet in movementPackets) {
+                        enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+                    }
+                }
+                continue
+            }
+
+            if (session.visibleThrownItemEntityIds.remove(snapshot.entityId)) {
+                session.thrownItemTrackerStates.remove(snapshot.entityId)
+                val packet = removePacket ?: PlayPackets.removeEntitiesPacket(intArrayOf(snapshot.entityId)).also {
+                    removePacket = it
+                }
+                enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+            }
+        }
+    }
+
+    private fun queueThrownItemSpawnPackets(
+        outboundByContext: MutableMap<ChannelHandlerContext, MutableList<ByteArray>>,
+        ctx: ChannelHandlerContext,
+        session: PlayerSession,
+        snapshot: ThrownItemSnapshot,
+        syncVx: Double,
+        syncVy: Double,
+        syncVz: Double
+    ) {
+        val entityTypeId = when (snapshot.kind) {
+            ThrownItemKind.SNOWBALL -> PlayPackets.snowballEntityTypeId()
+            ThrownItemKind.EGG, ThrownItemKind.BLUE_EGG, ThrownItemKind.BROWN_EGG -> PlayPackets.eggEntityTypeId()
+        }
+        enqueueDroppedItemPacket(
+            outboundByContext,
+            ctx,
+            PlayPackets.addEntityPacket(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                entityTypeId = entityTypeId,
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                yaw = 0f,
+                pitch = 0f,
+                objectData = 0
+            )
+        )
+        val particleItemId = thrownParticleItemId(snapshot.kind)
+        if (particleItemId >= 0) {
+            enqueueDroppedItemPacket(
+                outboundByContext,
+                ctx,
+                PlayPackets.throwableItemMetadataPacket(
+                    entityId = snapshot.entityId,
+                    encodedItemStack = PlayPackets.encodeItemStack(particleItemId, 1)
+                )
+            )
+        }
+        enqueueDroppedItemPacket(
+            outboundByContext,
+            ctx,
+            PlayPackets.entityVelocityPacket(
+                entityId = snapshot.entityId,
+                vx = syncVx,
+                vy = syncVy,
+                vz = syncVz
+            )
+        )
+        session.thrownItemTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(
+            snapshot = DroppedItemSnapshot(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                itemId = 0,
+                itemCount = 1,
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                vx = syncVx,
+                vy = syncVy,
+                vz = syncVz,
+                pickupDelaySeconds = 0.0,
+                onGround = false,
+                chunkPos = snapshot.chunkPos
+            ),
+            syncVx = syncVx,
+            syncVy = syncVy,
+            syncVz = syncVz
+        )
+    }
+
+    private fun thrownItemMovementPackets(
+        session: PlayerSession,
+        snapshot: ThrownItemSnapshot,
+        syncVx: Double,
+        syncVy: Double,
+        syncVz: Double,
+        deltaSeconds: Double
+    ): List<ByteArray> {
+        val state = session.thrownItemTrackerStates.computeIfAbsent(snapshot.entityId) {
+            newDroppedItemTrackerState(
+                snapshot = DroppedItemSnapshot(
+                    entityId = snapshot.entityId,
+                    uuid = snapshot.uuid,
+                    itemId = 0,
+                    itemCount = 1,
+                    x = snapshot.x,
+                    y = snapshot.y,
+                    z = snapshot.z,
+                    vx = syncVx,
+                    vy = syncVy,
+                    vz = syncVz,
+                    pickupDelaySeconds = 0.0,
+                    onGround = false,
+                    chunkPos = snapshot.chunkPos
+                ),
+                syncVx = syncVx,
+                syncVy = syncVy,
+                syncVz = syncVz
+            )
+        }
+        state.secondsSinceHardSync = (state.secondsSinceHardSync + deltaSeconds).coerceAtMost(120.0)
+        val encodedX = encodeDroppedItemPosition4096(snapshot.x)
+        val encodedY = encodeDroppedItemPosition4096(snapshot.y)
+        val encodedZ = encodeDroppedItemPosition4096(snapshot.z)
+        val dx = encodedX - state.encodedX4096
+        val dy = encodedY - state.encodedY4096
+        val dz = encodedZ - state.encodedZ4096
+        val hasPositionDelta = dx != 0L || dy != 0L || dz != 0L
+
+        val packets = ArrayList<ByteArray>(2)
+        val shouldEmitMovement = hasPositionDelta
+        var movementPacketSent = false
+
+        if (shouldEmitMovement) {
+            val requiresHardSync =
+                dx < Short.MIN_VALUE.toLong() || dx > Short.MAX_VALUE.toLong() ||
+                    dy < Short.MIN_VALUE.toLong() || dy > Short.MAX_VALUE.toLong() ||
+                    dz < Short.MIN_VALUE.toLong() || dz > Short.MAX_VALUE.toLong() ||
+                    state.secondsSinceHardSync >= MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC
+            if (requiresHardSync) {
+                packets.add(
+                    PlayPackets.entityPositionSyncPacket(
+                        entityId = snapshot.entityId,
+                        x = snapshot.x,
+                        y = snapshot.y,
+                        z = snapshot.z,
+                        vx = syncVx,
+                        vy = syncVy,
+                        vz = syncVz,
+                        yaw = 0f,
+                        pitch = 0f,
+                        onGround = false
+                    )
+                )
+                state.secondsSinceHardSync = 0.0
+            } else {
+                packets.add(
+                    PlayPackets.entityRelativeMovePacket(
+                        entityId = snapshot.entityId,
+                        deltaX = dx.toInt(),
+                        deltaY = dy.toInt(),
+                        deltaZ = dz.toInt(),
+                        onGround = false
+                    )
+                )
+            }
+            state.encodedX4096 = encodedX
+            state.encodedY4096 = encodedY
+            state.encodedZ4096 = encodedZ
+            movementPacketSent = true
+        }
+
+        val hadVelocity =
+            abs(state.lastVx) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                abs(state.lastVy) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                abs(state.lastVz) > DROPPED_ITEM_VELOCITY_EPSILON
+        if (movementPacketSent) {
+            val hasVelocity =
+                abs(syncVx) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                    abs(syncVy) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                    abs(syncVz) > DROPPED_ITEM_VELOCITY_EPSILON
+            if (hasVelocity) {
+                packets.add(PlayPackets.entityVelocityPacket(snapshot.entityId, syncVx, syncVy, syncVz))
+                state.lastVx = syncVx
+                state.lastVy = syncVy
+                state.lastVz = syncVz
+            } else if (hadVelocity) {
+                packets.add(PlayPackets.entityVelocityPacket(snapshot.entityId, 0.0, 0.0, 0.0))
+                state.lastVx = 0.0
+                state.lastVy = 0.0
+                state.lastVz = 0.0
+            }
+        }
+        return packets
+    }
+
+    private fun thrownItemNetworkVelocity(snapshot: ThrownItemSnapshot): Triple<Double, Double, Double> {
+        val effectiveTickScale = droppedItemNetworkVelocityTimeScale(ServerConfig.timeScale)
+        val vx = sanitizeDroppedItemNetworkVelocity(snapshot.vx * effectiveTickScale)
+        val vy = sanitizeDroppedItemNetworkVelocity(snapshot.vy * effectiveTickScale)
+        val vz = sanitizeDroppedItemNetworkVelocity(snapshot.vz * effectiveTickScale)
+        return Triple(vx, vy, vz)
+    }
+
+    private fun writeThrownItemSpawnPackets(session: PlayerSession, ctx: ChannelHandlerContext, snapshot: ThrownItemSnapshot) {
+        val (syncVx, syncVy, syncVz) = thrownItemNetworkVelocity(snapshot)
+        val entityTypeId = when (snapshot.kind) {
+            ThrownItemKind.SNOWBALL -> PlayPackets.snowballEntityTypeId()
+            ThrownItemKind.EGG, ThrownItemKind.BLUE_EGG, ThrownItemKind.BROWN_EGG -> PlayPackets.eggEntityTypeId()
+        }
+        ctx.write(
+            PlayPackets.addEntityPacket(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                entityTypeId = entityTypeId,
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                yaw = 0f,
+                pitch = 0f,
+                objectData = 0
+            )
+        )
+        val particleItemId = thrownParticleItemId(snapshot.kind)
+        if (particleItemId >= 0) {
+            ctx.write(
+                PlayPackets.throwableItemMetadataPacket(
+                    entityId = snapshot.entityId,
+                    encodedItemStack = PlayPackets.encodeItemStack(particleItemId, 1)
+                )
+            )
+        }
+        ctx.write(PlayPackets.entityVelocityPacket(snapshot.entityId, syncVx, syncVy, syncVz))
+        session.thrownItemTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(
+            snapshot = DroppedItemSnapshot(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                itemId = 0,
+                itemCount = 1,
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                vx = syncVx,
+                vy = syncVy,
+                vz = syncVz,
+                pickupDelaySeconds = 0.0,
+                onGround = false,
+                chunkPos = snapshot.chunkPos
+            ),
+            syncVx = syncVx,
+            syncVy = syncVy,
+            syncVz = syncVz
+        )
+    }
+
+    private fun thrownParticleItemId(kind: ThrownItemKind): Int {
+        return when (kind) {
+            ThrownItemKind.SNOWBALL -> snowballItemId
+            ThrownItemKind.EGG -> eggItemId
+            ThrownItemKind.BLUE_EGG -> blueEggItemId
+            ThrownItemKind.BROWN_EGG -> brownEggItemId
+        }
+    }
+
+    private fun sendThrownItemsForChunk(
+        session: PlayerSession,
+        ctx: ChannelHandlerContext,
+        snapshots: List<ThrownItemSnapshot>
+    ) {
+        if (snapshots.isEmpty()) return
+        for (snapshot in snapshots) {
+            if (!session.visibleThrownItemEntityIds.add(snapshot.entityId)) continue
+            writeThrownItemSpawnPackets(session, ctx, snapshot)
+        }
+    }
+
+    private fun hideThrownItemsForChunk(
+        session: PlayerSession,
+        ctx: ChannelHandlerContext,
+        chunkPos: ChunkPos,
+        entityIds: IntArray
+    ) {
+        if (entityIds.isEmpty()) return
+        val toRemove = ArrayList<Int>(entityIds.size)
+        for (id in entityIds) {
+            if (session.visibleThrownItemEntityIds.remove(id)) {
+                session.thrownItemTrackerStates.remove(id)
+                toRemove.add(id)
+            }
+        }
+        if (toRemove.isNotEmpty()) {
+            ctx.write(PlayPackets.removeEntitiesPacket(toRemove.toIntArray()))
+        }
+    }
+
+    private fun syncAnimalSnapshot(
+        snapshot: AnimalSnapshot,
+        worldSessions: List<PlayerSession>,
+        outboundByContext: MutableMap<ChannelHandlerContext, MutableList<ByteArray>>,
+        sendPositionUpdate: Boolean,
+        deltaSeconds: Double
+    ) {
+        syncMountedRiderPositionFromAnimalSnapshot(snapshot)
+        val chunkPos = snapshot.chunkPos
+        val riderEntityId = animalRiderEntityIdByAnimalEntityId[snapshot.entityId]
+        var removePacket: ByteArray? = null
+        val (syncVx, syncVy, syncVz) = animalNetworkVelocity(snapshot)
+        for (session in worldSessions) {
+            val isRider = riderEntityId != null && session.entityId == riderEntityId
+            val shouldBeVisible = isRider || session.loadedChunks.contains(chunkPos)
+            val ctx = contexts[session.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+
+            if (shouldBeVisible) {
+                if (session.visibleAnimalEntityIds.add(snapshot.entityId)) {
+                    queueAnimalSpawnPackets(
+                        outboundByContext = outboundByContext,
+                        ctx = ctx,
+                        session = session,
+                        snapshot = snapshot,
+                        syncVx = syncVx,
+                        syncVy = syncVy,
+                        syncVz = syncVz
+                    )
+                    continue
+                }
+                if (sendPositionUpdate) {
+                    val movementPackets = animalMovementPackets(
+                        session = session,
+                        snapshot = snapshot,
+                        syncVx = syncVx,
+                        syncVy = syncVy,
+                        syncVz = syncVz,
+                        deltaSeconds = deltaSeconds
+                    )
+                    for (packet in movementPackets) {
+                        enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+                    }
+                    enqueueDroppedItemPacket(
+                        outboundByContext,
+                        ctx,
+                        PlayPackets.entityHeadLookPacket(snapshot.entityId, snapshot.headYaw)
+                    )
+                }
+                continue
+            }
+
+            if (session.visibleAnimalEntityIds.remove(snapshot.entityId)) {
+                session.animalTrackerStates.remove(snapshot.entityId)
+                val packet = removePacket ?: PlayPackets.removeEntitiesPacket(intArrayOf(snapshot.entityId)).also {
+                    removePacket = it
+                }
+                enqueueDroppedItemPacket(outboundByContext, ctx, packet)
+            }
+        }
+    }
+
+    private fun syncMountedRiderPositionFromAnimalSnapshot(snapshot: AnimalSnapshot) {
+        val riderEntityId = animalRiderEntityIdByAnimalEntityId[snapshot.entityId] ?: return
+        val rider = sessions.values.firstOrNull { it.entityId == riderEntityId } ?: return
+        val newX = snapshot.x
+        val newY = snapshot.y + (snapshot.hitboxHeight * PIG_RIDER_OFFSET_Y_FACTOR)
+        val newZ = snapshot.z
+        rider.x = newX
+        rider.y = newY
+        rider.z = newZ
+        rider.onGround = snapshot.onGround
+        rider.clientEyeX = newX
+        rider.clientEyeY = newY + playerEyeOffset(rider)
+        rider.clientEyeZ = newZ
+        rider.encodedX4096 = encodeRelativePosition4096(newX)
+        rider.encodedY4096 = encodeRelativePosition4096(newY)
+        rider.encodedZ4096 = encodeRelativePosition4096(newZ)
+        val currentChunkX = ChunkStreamingService.chunkXFromBlockX(newX)
+        val currentChunkZ = ChunkStreamingService.chunkZFromBlockZ(newZ)
+        if (currentChunkX != rider.centerChunkX || currentChunkZ != rider.centerChunkZ) {
+            rider.centerChunkX = currentChunkX
+            rider.centerChunkZ = currentChunkZ
+            val ctx = contexts[rider.channelId]
+            val world = WorldManager.world(rider.worldKey)
+            if (ctx != null && world != null) {
+                requestChunkStream(rider, ctx, world, currentChunkX, currentChunkZ, rider.chunkRadius)
+            }
+        }
+    }
+
+    private fun queueAnimalSpawnPackets(
+        outboundByContext: MutableMap<ChannelHandlerContext, MutableList<ByteArray>>,
+        ctx: ChannelHandlerContext,
+        session: PlayerSession,
+        snapshot: AnimalSnapshot,
+        syncVx: Double,
+        syncVy: Double,
+        syncVz: Double
+    ) {
+        enqueueDroppedItemPacket(
+            outboundByContext,
+            ctx,
+            PlayPackets.addEntityPacket(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                entityTypeId = animalEntityTypeId(snapshot.kind),
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                yaw = snapshot.yaw,
+                pitch = snapshot.pitch,
+                objectData = 0
+            )
+        )
+        enqueueDroppedItemPacket(outboundByContext, ctx, PlayPackets.entityVelocityPacket(snapshot.entityId, syncVx, syncVy, syncVz))
+        if (snapshot.entityId in saddledAnimalEntityIds && saddleItemId >= 0) {
+            enqueueDroppedItemPacket(
+                outboundByContext,
+                ctx,
+                PlayPackets.entityEquipmentPacket(
+                    snapshot.entityId,
+                    listOf(PlayPackets.EquipmentEntry(slot = 7, encodedItemStack = PlayPackets.encodeItemStack(saddleItemId, 1)))
+                )
+            )
+        }
+        val riderEntityId = animalRiderEntityIdByAnimalEntityId[snapshot.entityId]
+        if (riderEntityId != null) {
+            enqueueDroppedItemPacket(
+                outboundByContext,
+                ctx,
+                PlayPackets.setPassengersPacket(snapshot.entityId, intArrayOf(riderEntityId))
+            )
+        }
+        session.animalTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(
+            snapshot = DroppedItemSnapshot(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                itemId = 0,
+                itemCount = 1,
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                vx = syncVx,
+                vy = syncVy,
+                vz = syncVz,
+                pickupDelaySeconds = 0.0,
+                onGround = snapshot.onGround,
+                chunkPos = snapshot.chunkPos
+            ),
+            syncVx = syncVx,
+            syncVy = syncVy,
+            syncVz = syncVz
+        ).also { state ->
+            state.lastYaw = snapshot.yaw
+            state.lastPitch = snapshot.pitch
+            state.lastHeadYaw = snapshot.headYaw
+        }
+    }
+
+    private fun animalMovementPackets(
+        session: PlayerSession,
+        snapshot: AnimalSnapshot,
+        syncVx: Double,
+        syncVy: Double,
+        syncVz: Double,
+        deltaSeconds: Double
+    ): List<ByteArray> {
+        val state = session.animalTrackerStates.computeIfAbsent(snapshot.entityId) {
+            newDroppedItemTrackerState(
+                snapshot = DroppedItemSnapshot(
+                    entityId = snapshot.entityId,
+                    uuid = snapshot.uuid,
+                    itemId = 0,
+                    itemCount = 1,
+                    x = snapshot.x,
+                    y = snapshot.y,
+                    z = snapshot.z,
+                    vx = syncVx,
+                    vy = syncVy,
+                    vz = syncVz,
+                    pickupDelaySeconds = 0.0,
+                    onGround = snapshot.onGround,
+                    chunkPos = snapshot.chunkPos
+                ),
+                syncVx = syncVx,
+                syncVy = syncVy,
+                syncVz = syncVz
+            )
+        }
+        val rotationChanged =
+            abs(wrapDegrees(snapshot.yaw - state.lastYaw)) > ANIMAL_ROTATION_EPSILON_DEGREES ||
+                abs(wrapDegrees(snapshot.pitch - state.lastPitch)) > ANIMAL_ROTATION_EPSILON_DEGREES
+        state.secondsSinceHardSync = (state.secondsSinceHardSync + deltaSeconds).coerceAtMost(120.0)
+        val encodedX = encodeDroppedItemPosition4096(snapshot.x)
+        val encodedY = encodeDroppedItemPosition4096(snapshot.y)
+        val encodedZ = encodeDroppedItemPosition4096(snapshot.z)
+        val dx = encodedX - state.encodedX4096
+        val dy = encodedY - state.encodedY4096
+        val dz = encodedZ - state.encodedZ4096
+        val hasPositionDelta = dx != 0L || dy != 0L || dz != 0L
+        val onGroundChanged = state.lastOnGround != snapshot.onGround
+
+        val packets = ArrayList<ByteArray>(2)
+        var movementPacketSent = false
+        if (hasPositionDelta || onGroundChanged || rotationChanged) {
+            val requiresHardSync =
+                dx < Short.MIN_VALUE.toLong() || dx > Short.MAX_VALUE.toLong() ||
+                    dy < Short.MIN_VALUE.toLong() || dy > Short.MAX_VALUE.toLong() ||
+                    dz < Short.MIN_VALUE.toLong() || dz > Short.MAX_VALUE.toLong() ||
+                    state.secondsSinceHardSync >= MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC
+            if (requiresHardSync) {
+                packets.add(
+                    PlayPackets.entityPositionSyncPacket(
+                        entityId = snapshot.entityId,
+                        x = snapshot.x,
+                        y = snapshot.y,
+                        z = snapshot.z,
+                        vx = syncVx,
+                        vy = syncVy,
+                        vz = syncVz,
+                        yaw = snapshot.yaw,
+                        pitch = snapshot.pitch,
+                        onGround = snapshot.onGround
+                    )
+                )
+                state.secondsSinceHardSync = 0.0
+            } else {
+                packets.add(
+                    PlayPackets.entityRelativeMoveLookPacket(
+                        entityId = snapshot.entityId,
+                        deltaX = dx.toInt(),
+                        deltaY = dy.toInt(),
+                        deltaZ = dz.toInt(),
+                        yaw = snapshot.yaw,
+                        pitch = snapshot.pitch,
+                        onGround = snapshot.onGround
+                    )
+                )
+            }
+            state.encodedX4096 = encodedX
+            state.encodedY4096 = encodedY
+            state.encodedZ4096 = encodedZ
+            state.lastOnGround = snapshot.onGround
+            state.lastYaw = snapshot.yaw
+            state.lastPitch = snapshot.pitch
+            movementPacketSent = true
+        }
+        state.lastHeadYaw = snapshot.headYaw
+
+        val hadVelocity =
+            abs(state.lastVx) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                abs(state.lastVy) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                abs(state.lastVz) > DROPPED_ITEM_VELOCITY_EPSILON
+        if (movementPacketSent || onGroundChanged) {
+            val hasVelocity =
+                abs(syncVx) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                    abs(syncVy) > DROPPED_ITEM_VELOCITY_EPSILON ||
+                    abs(syncVz) > DROPPED_ITEM_VELOCITY_EPSILON
+            if (hasVelocity) {
+                packets.add(PlayPackets.entityVelocityPacket(snapshot.entityId, syncVx, syncVy, syncVz))
+                state.lastVx = syncVx
+                state.lastVy = syncVy
+                state.lastVz = syncVz
+            } else if (hadVelocity) {
+                packets.add(PlayPackets.entityVelocityPacket(snapshot.entityId, 0.0, 0.0, 0.0))
+                state.lastVx = 0.0
+                state.lastVy = 0.0
+                state.lastVz = 0.0
+            }
+        }
+        return packets
+    }
+
+    private fun animalNetworkVelocity(snapshot: AnimalSnapshot): Triple<Double, Double, Double> {
+        val effectiveTickScale = droppedItemNetworkVelocityTimeScale(ServerConfig.timeScale)
+        val vx = sanitizeDroppedItemNetworkVelocity(snapshot.vx * effectiveTickScale)
+        val vy = if (snapshot.onGround) 0.0 else sanitizeDroppedItemNetworkVelocity(snapshot.vy * effectiveTickScale)
+        val vz = sanitizeDroppedItemNetworkVelocity(snapshot.vz * effectiveTickScale)
+        return Triple(vx, vy, vz)
+    }
+
+    private fun wrapDegrees(value: Float): Float {
+        var out = value % 360f
+        if (out >= 180f) out -= 360f
+        if (out < -180f) out += 360f
+        return out
+    }
+
+    private fun writeAnimalSpawnPackets(session: PlayerSession, ctx: ChannelHandlerContext, snapshot: AnimalSnapshot) {
+        val (syncVx, syncVy, syncVz) = animalNetworkVelocity(snapshot)
+        ctx.write(
+            PlayPackets.addEntityPacket(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                entityTypeId = animalEntityTypeId(snapshot.kind),
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                yaw = snapshot.yaw,
+                pitch = snapshot.pitch,
+                objectData = 0
+            )
+        )
+        ctx.write(PlayPackets.entityVelocityPacket(snapshot.entityId, syncVx, syncVy, syncVz))
+        if (snapshot.entityId in saddledAnimalEntityIds && saddleItemId >= 0) {
+            ctx.write(
+                PlayPackets.entityEquipmentPacket(
+                    snapshot.entityId,
+                    listOf(PlayPackets.EquipmentEntry(slot = 7, encodedItemStack = PlayPackets.encodeItemStack(saddleItemId, 1)))
+                )
+            )
+        }
+        val riderEntityId = animalRiderEntityIdByAnimalEntityId[snapshot.entityId]
+        if (riderEntityId != null) {
+            ctx.write(PlayPackets.setPassengersPacket(snapshot.entityId, intArrayOf(riderEntityId)))
+        }
+        session.animalTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(
+            snapshot = DroppedItemSnapshot(
+                entityId = snapshot.entityId,
+                uuid = snapshot.uuid,
+                itemId = 0,
+                itemCount = 1,
+                x = snapshot.x,
+                y = snapshot.y,
+                z = snapshot.z,
+                vx = syncVx,
+                vy = syncVy,
+                vz = syncVz,
+                pickupDelaySeconds = 0.0,
+                onGround = snapshot.onGround,
+                chunkPos = snapshot.chunkPos
+            ),
+            syncVx = syncVx,
+            syncVy = syncVy,
+            syncVz = syncVz
+        ).also { state ->
+            state.lastYaw = snapshot.yaw
+            state.lastPitch = snapshot.pitch
+            state.lastHeadYaw = snapshot.headYaw
+        }
+    }
+
+    private fun sendAnimalsForChunk(
+        session: PlayerSession,
+        ctx: ChannelHandlerContext,
+        snapshots: List<AnimalSnapshot>
+    ) {
+        if (snapshots.isEmpty()) return
+        for (snapshot in snapshots) {
+            if (!session.visibleAnimalEntityIds.add(snapshot.entityId)) continue
+            writeAnimalSpawnPackets(session, ctx, snapshot)
+        }
+    }
+
+    private fun hideAnimalsForChunk(
+        session: PlayerSession,
+        ctx: ChannelHandlerContext,
+        chunkPos: ChunkPos,
+        entityIds: IntArray
+    ) {
+        if (entityIds.isEmpty()) return
+        val toRemove = ArrayList<Int>(entityIds.size)
+        for (id in entityIds) {
+            if (session.visibleAnimalEntityIds.remove(id)) {
+                session.animalTrackerStates.remove(id)
+                toRemove.add(id)
+            }
+        }
+        if (toRemove.isNotEmpty()) {
+            ctx.write(PlayPackets.removeEntitiesPacket(toRemove.toIntArray()))
+        }
+    }
+
+    private fun animalEntityTypeId(kind: AnimalKind): Int {
+        return when (kind) {
+            AnimalKind.PIG -> PlayPackets.pigEntityTypeId()
+        }
+    }
+
     private fun resolvePlacementState(
         baseStateId: Int,
         faceId: Int,
@@ -3922,8 +9881,9 @@ object PlayerSessionManager {
             }
         }
 
+        val horizontalPlacement = oppositeHorizontalFacing(yawToHorizontalFacing(playerYaw))
         if (props.containsKey("horizontal_facing")) {
-            props["horizontal_facing"] = yawToHorizontalFacing(playerYaw)
+            props["horizontal_facing"] = horizontalPlacement
         }
 
         if (props.containsKey("facing")) {
@@ -3937,7 +9897,7 @@ object PlayerSessionManager {
                 5 -> "east"
                 else -> null
             }
-            val horizontal = yawToHorizontalFacing(playerYaw)
+            val horizontal = horizontalPlacement
             props["facing"] = when {
                 face != null && values.contains(face) -> face
                 values.contains(horizontal) -> horizontal
@@ -3988,6 +9948,16 @@ object PlayerSessionManager {
             1 -> "west"
             2 -> "north"
             else -> "east"
+        }
+    }
+
+    private fun oppositeHorizontalFacing(facing: String): String {
+        return when (facing) {
+            "north" -> "south"
+            "south" -> "north"
+            "west" -> "east"
+            "east" -> "west"
+            else -> facing
         }
     }
 
@@ -4157,11 +10127,13 @@ object PlayerSessionManager {
         z: Int,
         stateId: Int,
         blockEntityTypeId: Int = -1,
-        blockEntityNbtPayload: ByteArray? = null
+        blockEntityNbtPayload: ByteArray? = null,
+        logAsFluidSync: Boolean = false
     ) {
         if (y !in -64..319) return
         val world = WorldManager.world(session.worldKey) ?: return
         val oldStateId = world.blockStateAt(x, y, z)
+        maybeDropAndClearFurnaceInventory(world, x, y, z, oldStateId, stateId)
         world.setBlockState(x, y, z, stateId)
         if (stateId != 0 && stateId != oldStateId) {
             world.requestDroppedItemUnstuckAtBlock(x, y, z)
@@ -4196,27 +10168,102 @@ object PlayerSessionManager {
             } else {
                 null
             }
+        var recipients = 0
         for ((id, other) in sessions) {
             if (other.worldKey != session.worldKey) continue
             if (!other.loadedChunks.contains(chunk)) continue
             val ctx = contexts[id] ?: continue
             if (!ctx.channel().isActive) continue
-            ctx.write(packet)
-            if (breakEffectPacket != null && id != session.channelId) {
-                ctx.write(breakEffectPacket)
+            recipients++
+            ctx.executor().execute {
+                if (!ctx.channel().isActive) return@execute
+                ctx.write(packet)
+                if (breakEffectPacket != null && id != session.channelId) {
+                    ctx.write(breakEffectPacket)
+                }
+                if (blockEntityPacket != null) {
+                    ctx.write(blockEntityPacket)
+                }
+                ctx.flush()
             }
-            if (blockEntityPacket != null) {
-                ctx.write(blockEntityPacket)
-            }
-            ctx.flush()
         }
         triggerFallingBlocksNear(session, world, x, y, z)
+    }
+
+    private fun maybeDropAndClearFurnaceInventory(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        oldStateId: Int,
+        newStateId: Int
+    ) {
+        if (oldStateId == newStateId) return
+        if (!isFurnaceState(oldStateId)) return
+        if (isFurnaceState(newStateId)) return
+
+        val key = FurnaceKey(world.key, x, y, z)
+        val removed = furnaceStates.remove(key) ?: return
+        activeFurnaceKeys.remove(key)
+        activeFurnaceKeysByWorld[key.worldKey]?.let { set ->
+            set.remove(key)
+            if (set.isEmpty()) {
+                activeFurnaceKeysByWorld.remove(key.worldKey, set)
+            }
+        }
+        val drops = run {
+            ArrayList<org.macaroon3145.world.VanillaDrop>(3).apply {
+                if (removed.inputItemId >= 0 && removed.inputCount > 0) {
+                    add(org.macaroon3145.world.VanillaDrop(removed.inputItemId, removed.inputCount))
+                }
+                if (removed.fuelItemId >= 0 && removed.fuelCount > 0) {
+                    add(org.macaroon3145.world.VanillaDrop(removed.fuelItemId, removed.fuelCount))
+                }
+                if (removed.resultItemId >= 0 && removed.resultCount > 0) {
+                    add(org.macaroon3145.world.VanillaDrop(removed.resultItemId, removed.resultCount))
+                }
+            }
+        }
+        if (drops.isNotEmpty()) {
+            spawnBrokenBlockDropsInWorld(world, x, y, z, drops)
+        }
+
+        for (viewer in sessions.values) {
+            if (viewer.worldKey != world.key) continue
+            if (viewer.openContainerType != CONTAINER_TYPE_FURNACE) continue
+            if (viewer.openFurnaceX != x || viewer.openFurnaceY != y || viewer.openFurnaceZ != z) continue
+            closeFurnace(viewer)
+        }
     }
 
     private fun triggerFallingBlocksNear(session: PlayerSession, world: org.macaroon3145.world.World, x: Int, y: Int, z: Int) {
         triggerFallingBlockColumnFrom(session, world, x, y, z)
         if (y + 1 <= 319) {
             triggerFallingBlockColumnFrom(session, world, x, y + 1, z)
+        }
+    }
+
+    private fun broadcastBlockChangeToLoadedPlayers(
+        worldKey: String,
+        chunkPos: ChunkPos,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ) {
+        val packet = PlayPackets.blockChangePacket(x, y, z, stateId)
+        var recipients = 0
+        for ((id, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            if (!other.loadedChunks.contains(chunkPos)) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            recipients++
+            ctx.executor().execute {
+                if (!ctx.channel().isActive) return@execute
+                ctx.write(packet)
+                ctx.flush()
+            }
         }
     }
 
@@ -4306,6 +10353,10 @@ object PlayerSessionManager {
         val clamped = gameMode.coerceIn(0, 3)
         if (session.gameMode == clamped) return
         session.gameMode = clamped
+        if (clamped != GAME_MODE_CREATIVE) {
+            session.flying = false
+            session.fallDistance = 0.0
+        }
 
         val ownPacket = PlayPackets.gameStateGameModePacket(clamped)
         val tabPacket = PlayPackets.playerInfoGameModeUpdatePacket(session.profile.uuid, clamped)
@@ -4325,6 +10376,10 @@ object PlayerSessionManager {
         val ownPacket = PlayPackets.gameStateGameModePacket(clamped)
         for ((id, session) in sessions) {
             session.gameMode = clamped
+            if (clamped != GAME_MODE_CREATIVE) {
+                session.flying = false
+                session.fallDistance = 0.0
+            }
             val ctx = contexts[id] ?: continue
             if (!ctx.channel().isActive) continue
             ctx.executor().execute {
@@ -4517,6 +10572,16 @@ object PlayerSessionManager {
 
     private fun spawnBrokenBlockDrops(session: PlayerSession, x: Int, y: Int, z: Int, drops: List<org.macaroon3145.world.VanillaDrop>) {
         val world = WorldManager.world(session.worldKey) ?: return
+        spawnBrokenBlockDropsInWorld(world, x, y, z, drops)
+    }
+
+    private fun spawnBrokenBlockDropsInWorld(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        drops: List<org.macaroon3145.world.VanillaDrop>
+    ) {
         for (drop in drops) {
             if (drop.itemId < 0 || drop.count <= 0) continue
             val random = ThreadLocalRandom.current()
@@ -4533,6 +10598,312 @@ object PlayerSessionManager {
                 pickupDelaySeconds = BLOCK_DROP_PICKUP_DELAY_SECONDS
             )
         }
+    }
+
+    private fun maybeSpawnFluidBrokenBlockDrops(world: org.macaroon3145.world.World, changed: org.macaroon3145.world.FluidBlockChange) {
+        val previousStateId = changed.previousStateId
+        if (previousStateId <= 0) return
+        val previousState = BlockStateRegistry.parsedState(previousStateId) ?: return
+        if (previousState.blockKey == "minecraft:water") return
+        val nextState = BlockStateRegistry.parsedState(changed.stateId) ?: return
+        if (nextState.blockKey != "minecraft:water") return
+
+        val drops = runCatching {
+            VanillaMiningRules.resolveDrops(world, previousStateId, -1, changed.x, changed.y, changed.z)
+        }.onFailure { throwable ->
+            logger.error(
+                "Failed to resolve fluid-broken block drops for block at {} {} {} in {} (stateId={})",
+                changed.x,
+                changed.y,
+                changed.z,
+                world.key,
+                previousStateId,
+                throwable
+            )
+        }.getOrDefault(emptyList())
+        if (drops.isEmpty()) return
+        spawnBrokenBlockDropsInWorld(world, changed.x, changed.y, changed.z, drops)
+    }
+
+    private fun resolveFluidDependentDropsCached(
+        world: org.macaroon3145.world.World,
+        stateId: Int,
+        x: Int,
+        y: Int,
+        z: Int
+    ): List<org.macaroon3145.world.VanillaDrop> {
+        fluidDependentDropCache[stateId]?.let { return it }
+        val resolved = runCatching {
+            VanillaMiningRules.resolveDrops(world, stateId, -1, x, y, z)
+        }.onFailure { throwable ->
+            logger.error(
+                "Failed to resolve fluid-dependent block drops for block at {} {} {} in {} (stateId={})",
+                x,
+                y,
+                z,
+                world.key,
+                stateId,
+                throwable
+            )
+        }.getOrDefault(emptyList())
+        fluidDependentDropCache.putIfAbsent(stateId, resolved)
+        return resolved
+    }
+
+    private data class FluidDependentRemoval(
+        val x: Int,
+        val y: Int,
+        val z: Int,
+        val previousStateId: Int,
+        val chunkPos: ChunkPos,
+        val drops: List<org.macaroon3145.world.VanillaDrop>
+    )
+
+    private data class FluidChunkDependentResult(
+        val removals: List<FluidDependentRemoval>,
+        val spillSeeds: List<BlockPos>
+    )
+
+    private fun breakDependentBlocksForFluidByChunk(
+        world: org.macaroon3145.world.World,
+        removedCenters: Collection<BlockPos>
+    ): List<org.macaroon3145.world.FluidBlockChange> {
+        // Kept for compatibility/prewarm paths. Runtime tick path uses scheduleFluidDependentBreakRounds.
+        if (removedCenters.isEmpty()) return emptyList()
+        val changedOut = ArrayList<org.macaroon3145.world.FluidBlockChange>()
+        val seenSeeds = HashSet<Long>(removedCenters.size * 2)
+        val pendingByChunk = LinkedHashMap<ChunkPos, MutableSet<BlockPos>>()
+        for (seed in removedCenters) {
+            if (!seenSeeds.add(packBlockPos(seed.x, seed.y, seed.z))) continue
+            pendingByChunk.computeIfAbsent(seed.chunkPos()) { LinkedHashSet() }.add(seed)
+        }
+
+        var rounds = 0
+        while (pendingByChunk.isNotEmpty() && rounds < 8) {
+            rounds++
+            val currentRound = ArrayList<Map.Entry<ChunkPos, MutableSet<BlockPos>>>(pendingByChunk.entries)
+            pendingByChunk.clear()
+            for ((chunkPos, seeds) in currentRound) {
+                if (seeds.isEmpty()) continue
+                val result = breakDependentBlocksForFluidChunk(
+                    world = world,
+                    ownerChunk = chunkPos,
+                    removedCenters = seeds
+                )
+                for (removal in result.removals) {
+                    world.setBlockStateWithoutFluidUpdates(removal.x, removal.y, removal.z, 0)
+                    world.setBlockEntity(removal.x, removal.y, removal.z, null)
+                    changedOut.add(
+                        org.macaroon3145.world.FluidBlockChange(
+                            x = removal.x,
+                            y = removal.y,
+                            z = removal.z,
+                            previousStateId = removal.previousStateId,
+                            stateId = 0,
+                            chunkPos = removal.chunkPos
+                        )
+                    )
+                    if (removal.drops.isNotEmpty()) {
+                        spawnBrokenBlockDropsInWorld(world, removal.x, removal.y, removal.z, removal.drops)
+                    }
+                }
+                for (spill in result.spillSeeds) {
+                    if (!seenSeeds.add(packBlockPos(spill.x, spill.y, spill.z))) continue
+                    pendingByChunk.computeIfAbsent(spill.chunkPos()) { LinkedHashSet() }.add(spill)
+                }
+            }
+        }
+        return changedOut
+    }
+
+    private fun scheduleFluidDependentBreakRounds(
+        world: org.macaroon3145.world.World,
+        removedCenters: Collection<BlockPos>,
+        onComplete: () -> Unit
+    ) {
+        if (removedCenters.isEmpty()) {
+            onComplete()
+            return
+        }
+        val seenSeeds = ConcurrentHashMap.newKeySet<Long>()
+        val changedOut = ConcurrentLinkedQueue<org.macaroon3145.world.FluidBlockChange>()
+        val initialByChunk = LinkedHashMap<ChunkPos, MutableSet<BlockPos>>()
+        for (seed in removedCenters) {
+            if (!seenSeeds.add(packBlockPos(seed.x, seed.y, seed.z))) continue
+            initialByChunk.computeIfAbsent(seed.chunkPos()) { LinkedHashSet() }.add(seed)
+        }
+
+        fun runRound(round: Int, byChunk: Map<ChunkPos, Set<BlockPos>>) {
+            if (byChunk.isEmpty() || round >= 8) {
+                if (changedOut.isNotEmpty()) {
+                    broadcastFluidChanges(world.key, ArrayList(changedOut))
+                }
+                onComplete()
+                return
+            }
+
+            val nextByChunk = ConcurrentHashMap<ChunkPos, MutableSet<BlockPos>>()
+            val remaining = AtomicInteger(byChunk.size)
+            val completed = AtomicBoolean(false)
+
+            fun completeRoundIfDone() {
+                if (remaining.decrementAndGet() != 0) return
+                if (!completed.compareAndSet(false, true)) return
+                val nextSnapshot = LinkedHashMap<ChunkPos, Set<BlockPos>>(nextByChunk.size)
+                for ((chunkPos, seeds) in nextByChunk) {
+                    if (seeds.isEmpty()) continue
+                    nextSnapshot[chunkPos] = seeds.toSet()
+                }
+                runRound(round + 1, nextSnapshot)
+            }
+
+            for ((chunkPos, seeds) in byChunk) {
+                world.submitOnChunkActor(chunkPos) {
+                    try {
+                        val result = breakDependentBlocksForFluidChunk(
+                            world = world,
+                            ownerChunk = chunkPos,
+                            removedCenters = seeds
+                        )
+                        for (removal in result.removals) {
+                            world.setBlockStateWithoutFluidUpdates(removal.x, removal.y, removal.z, 0)
+                            world.setBlockEntity(removal.x, removal.y, removal.z, null)
+                            changedOut.add(
+                                org.macaroon3145.world.FluidBlockChange(
+                                    x = removal.x,
+                                    y = removal.y,
+                                    z = removal.z,
+                                    previousStateId = removal.previousStateId,
+                                    stateId = 0,
+                                    chunkPos = removal.chunkPos
+                                )
+                            )
+                            if (removal.drops.isNotEmpty()) {
+                                spawnBrokenBlockDropsInWorld(world, removal.x, removal.y, removal.z, removal.drops)
+                            }
+                        }
+                        for (spill in result.spillSeeds) {
+                            if (!seenSeeds.add(packBlockPos(spill.x, spill.y, spill.z))) continue
+                            nextByChunk
+                                .computeIfAbsent(spill.chunkPos()) { ConcurrentHashMap.newKeySet() }
+                                .add(spill)
+                        }
+                    } finally {
+                        completeRoundIfDone()
+                    }
+                }
+            }
+        }
+
+        val firstRound = LinkedHashMap<ChunkPos, Set<BlockPos>>(initialByChunk.size)
+        for ((chunkPos, seeds) in initialByChunk) {
+            if (seeds.isEmpty()) continue
+            firstRound[chunkPos] = seeds.toSet()
+        }
+        runRound(0, firstRound)
+    }
+
+    private fun breakDependentBlocksForFluidChunk(
+        world: org.macaroon3145.world.World,
+        ownerChunk: ChunkPos,
+        removedCenters: Collection<BlockPos>
+    ): FluidChunkDependentResult {
+        val pending = ArrayDeque<BlockPos>()
+        val enqueued = HashSet<Long>()
+        val dependents = ArrayList<BlockPos>(2)
+        val removals = ArrayList<FluidDependentRemoval>()
+        val spillSeedsByKey = LinkedHashMap<Long, BlockPos>()
+
+        for (removedCenter in removedCenters) {
+            enqueueDependentChecksForChunk(removedCenter, ownerChunk, pending, enqueued, spillSeedsByKey)
+        }
+
+        while (pending.isNotEmpty()) {
+            val pos = pending.removeFirst()
+            if (pos.chunkPos() != ownerChunk) {
+                spillSeedsByKey.putIfAbsent(packBlockPos(pos.x, pos.y, pos.z), pos)
+                continue
+            }
+            val stateId = world.blockStateAt(pos.x, pos.y, pos.z)
+            if (stateId == 0) continue
+            dependents.clear()
+            appendDependentBlocksToBreak(world, pos.x, pos.y, pos.z, stateId, dependents)
+            if (dependents.isEmpty()) continue
+
+            for (dependent in dependents) {
+                if (dependent.chunkPos() != ownerChunk) {
+                    spillSeedsByKey.putIfAbsent(packBlockPos(dependent.x, dependent.y, dependent.z), dependent)
+                    continue
+                }
+                val dependentStateId = world.blockStateAt(dependent.x, dependent.y, dependent.z)
+                if (dependentStateId == 0) continue
+                val drops = resolveFluidDependentDropsCached(
+                    world = world,
+                    stateId = dependentStateId,
+                    x = dependent.x,
+                    y = dependent.y,
+                    z = dependent.z
+                )
+                removals.add(
+                    FluidDependentRemoval(
+                        x = dependent.x,
+                        y = dependent.y,
+                        z = dependent.z,
+                        previousStateId = dependentStateId,
+                        chunkPos = dependent.chunkPos(),
+                        drops = drops
+                    )
+                )
+                enqueueDependentChecksForChunk(dependent, ownerChunk, pending, enqueued, spillSeedsByKey)
+            }
+        }
+
+        return FluidChunkDependentResult(
+            removals = removals,
+            spillSeeds = ArrayList(spillSeedsByKey.values)
+        )
+    }
+
+    private fun enqueueDependentChecksForChunk(
+        center: BlockPos,
+        ownerChunk: ChunkPos,
+        pending: ArrayDeque<BlockPos>,
+        enqueued: MutableSet<Long>,
+        spillSeeds: MutableMap<Long, BlockPos>
+    ) {
+        enqueueDependentCheckForChunk(center.x, center.y + 1, center.z, ownerChunk, pending, enqueued, spillSeeds)
+        enqueueDependentCheckForChunk(center.x, center.y - 1, center.z, ownerChunk, pending, enqueued, spillSeeds)
+        enqueueDependentCheckForChunk(center.x + 1, center.y, center.z, ownerChunk, pending, enqueued, spillSeeds)
+        enqueueDependentCheckForChunk(center.x - 1, center.y, center.z, ownerChunk, pending, enqueued, spillSeeds)
+        enqueueDependentCheckForChunk(center.x, center.y, center.z + 1, ownerChunk, pending, enqueued, spillSeeds)
+        enqueueDependentCheckForChunk(center.x, center.y, center.z - 1, ownerChunk, pending, enqueued, spillSeeds)
+    }
+
+    private fun enqueueDependentCheckForChunk(
+        x: Int,
+        y: Int,
+        z: Int,
+        ownerChunk: ChunkPos,
+        pending: ArrayDeque<BlockPos>,
+        enqueued: MutableSet<Long>,
+        spillSeeds: MutableMap<Long, BlockPos>
+    ) {
+        if (y !in -64..319) return
+        val packed = packBlockPos(x, y, z)
+        if (!enqueued.add(packed)) return
+        val candidate = BlockPos(x, y, z)
+        if (candidate.chunkPos() == ownerChunk) {
+            pending.addLast(candidate)
+        } else {
+            spillSeeds.putIfAbsent(packed, candidate)
+        }
+    }
+
+    private fun packBlockPos(x: Int, y: Int, z: Int): Long {
+        val px = x.toLong() and 0x3FFFFFFL
+        val py = (y - (-64)).toLong() and 0x3FFL
+        val pz = z.toLong() and 0x3FFFFFFL
+        return (px shl 38) or (pz shl 12) or py
     }
 
     private fun twoBlockUpperStateId(stateId: Int): Int {
@@ -5320,7 +11691,6 @@ object PlayerSessionManager {
         return requested.coerceAtMost(ServerConfig.maxViewDistanceChunks.coerceAtLeast(2))
     }
 
-    private const val MAX_DROPPED_ITEM_DELTA_SECONDS = 0.25
     private const val MAX_DROPPED_ITEM_CATCH_UP_TICKS = 5
     private const val MAX_DROPPED_ITEM_LAG_TICKS_BEFORE_RESYNC = 10L
     private const val DROPPED_ITEM_COARSE_PARK_THRESHOLD_NANOS = 2_000_000L
@@ -5330,8 +11700,28 @@ object PlayerSessionManager {
     private const val GAME_MODE_CREATIVE = 1
     private const val GAME_MODE_SPECTATOR = 3
     private const val MAX_PLAYER_HEALTH = 20f
+    private const val MAX_PLAYER_FOOD = 20
     private const val DEFAULT_PLAYER_FOOD = 20
     private const val DEFAULT_PLAYER_SATURATION = 5f
+    private const val SATURATED_REGEN_FOOD_THRESHOLD = 20
+    private const val NORMAL_REGEN_FOOD_THRESHOLD = 18
+    private const val SATURATED_REGEN_INTERVAL_SECONDS = 0.5
+    private const val NORMAL_REGEN_INTERVAL_SECONDS = 4.0
+    private const val SATURATED_REGEN_MAX_EXHAUSTION = 6f
+    private const val NORMAL_REGEN_HEAL_AMOUNT = 1f
+    private const val NORMAL_REGEN_EXHAUSTION = 6f
+    private const val FOOD_EXHAUSTION_PER_LEVEL = 4f
+    private const val VANILLA_STAT_CENTIMETER_SCALE = 100.0
+    private const val VANILLA_WATER_EXHAUSTION_PER_CENTIMETER = 0.0001f // 0.01 per block
+    private const val VANILLA_SPRINT_EXHAUSTION_PER_CENTIMETER = 0.001f // 0.1 per block
+    private const val VANILLA_JUMP_EXHAUSTION = 0.05f
+    private const val VANILLA_SPRINT_JUMP_EXHAUSTION = 0.2f
+    private const val VANILLA_JUMP_MIN_ASCENT_METERS = 1.0e-6
+    private const val FOOD_USE_SOUND_INITIAL_DELAY_SECONDS = 0.2
+    private const val FOOD_USE_SOUND_INTERVAL_SECONDS = 0.2
+    private const val MAX_ITEM_USE_SOUND_LOOPS_PER_TICK = 8
+    private const val REGEN_TIME_EPSILON = 1.0e-9
+    private const val MAX_PLAYER_REGEN_LOOPS_PER_TICK = 64
     private const val MINECRAFT_TICKS_PER_SECOND = 20.0
     private const val MINECRAFT_DAY_TICKS = 24_000.0
     private const val INITIAL_WORLD_TIME_TICKS = 0.0
@@ -5344,12 +11734,31 @@ object PlayerSessionManager {
     private const val BLOCK_DROP_HORIZONTAL_SPEED_MIN = -0.1
     private const val BLOCK_DROP_HORIZONTAL_SPEED_MAX = 0.1
     private const val BLOCK_DROP_VERTICAL_SPEED = 0.2
+    private const val THROWN_ITEM_LAUNCH_SPEED = 1.5
+    private const val THROWN_ITEM_LAUNCH_VERTICAL_BOOST = 0.1
+    private const val THROWN_ITEM_HITBOX_RADIUS = 0.125
+    private const val PIG_BOOST_MIN_TICKS = 140
+    private const val PIG_BOOST_RANDOM_SPREAD_TICKS = 841
+    private const val MAX_CLIENT_VEHICLE_POSE_AGE_NANOS = 500_000_000L
+    private const val MAX_CLIENT_VEHICLE_POSE_DELTA_SQ = 64.0
+    // Vanilla TemptGoal target condition range.
+    private const val PIG_TEMPT_RANGE_BLOCKS = 10.0
+    private const val NEUTRAL_SOUND_SOURCE_ID = 6
     private const val PLAYERS_SOUND_SOURCE_ID = 7
     private const val BIG_FALL_SOUND_DAMAGE_THRESHOLD = 5.0f
     private const val FALL_DAMAGE_TYPE_ID_FALLBACK = 17
     private val PLACEMENT_DEBUG_LOG_ENABLED: Boolean =
         System.getProperty("aerogel.debug.placement")?.toBooleanStrictOrNull() ?: false
     private const val PLAYER_HITBOX_HALF_WIDTH = 0.3
+    private const val PIG_RIDER_OFFSET_Y_FACTOR = 0.75
+    private val WATER_BUCKET_REPLACEABLE_BLOCK_KEYS = loadBlockTag("water_breakable")
+    private val BLOCK_PLACEMENT_REPLACEABLE_BLOCK_KEYS = hashSetOf(
+        "minecraft:water",
+        "minecraft:lava",
+        "minecraft:bubble_column"
+    ).apply {
+        addAll(loadBlockTag("replaceable"))
+    }
     private const val DROPPED_ITEM_PICKUP_EXPAND_HORIZONTAL = 1.0
     private const val DROPPED_ITEM_PICKUP_EXPAND_UP = 0.5
     private const val DROPPED_ITEM_PICKUP_EXPAND_DOWN = 0.5
@@ -5360,10 +11769,43 @@ object PlayerSessionManager {
     private const val DROPPED_ITEM_PICKUP_BROADCAST_DISTANCE_SQ = 32.0 * 32.0
     private const val PLAYER_RELATIVE_MOVE_SCALE = 4096.0
     private const val DROPPED_ITEM_RELATIVE_MOVE_SCALE = 4096.0
-    private const val DROPPED_ITEM_RELATIVE_MOVE_INTERVAL_SECONDS = 0.05
-    private const val MAX_DROPPED_ITEM_RELATIVE_MOVE_ACCUMULATOR_SECONDS = 2.0
     private const val MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC = 20.0
     private const val DROPPED_ITEM_VELOCITY_EPSILON = 1.0e-8
+    private const val ANIMAL_ROTATION_EPSILON_DEGREES = 0.5f
+    private const val SMALL_ENTITY_PACKET_IMMEDIATE_BYTES = 96
+    private const val PLAYER_INVENTORY_CONTAINER_ID = 0
+    private const val CONTAINER_TYPE_PLAYER_INVENTORY = 0
+    private const val CONTAINER_TYPE_CRAFTING_TABLE = 1
+    private const val CONTAINER_TYPE_FURNACE = 2
+    private const val CRAFTING_TABLE_MENU_TYPE_ID = 12
+    private val furnaceMenuTypeId: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:menu", "minecraft:furnace") ?: 14
+    }
+    private const val CLICK_TYPE_PICKUP = 0
+    private const val CLICK_TYPE_QUICK_MOVE = 1
+    private const val CLICK_TYPE_SWAP = 2
+    private const val CLICK_TYPE_QUICK_CRAFT = 5
+    private const val CLICK_TYPE_PICKUP_ALL = 6
+    private const val OFFHAND_SWAP_BUTTON = 40
+    private const val MAX_SHIFT_CRAFT_ITERATIONS = 2048
+    private const val PLAYER_CRAFT_RESULT_SLOT = 0
+    private val PLAYER_CRAFT_INPUT_SLOT_RANGE = 1..4
+    private const val TABLE_CRAFT_RESULT_SLOT = 0
+    private val TABLE_CRAFT_INPUT_SLOT_RANGE = 1..9
+    private val TABLE_PLAYER_MAIN_SLOT_RANGE = 10..36
+    private val TABLE_PLAYER_HOTBAR_SLOT_RANGE = 37..45
+    private const val FURNACE_INPUT_SLOT = 0
+    private const val FURNACE_FUEL_SLOT = 1
+    private const val FURNACE_RESULT_SLOT = 2
+    private val FURNACE_PLAYER_MAIN_SLOT_RANGE = 3..29
+    private val FURNACE_PLAYER_HOTBAR_SLOT_RANGE = 30..38
+    private val FURNACE_RESULT_QUICK_MOVE_TARGET_SLOTS: IntArray = (38 downTo 3).toList().toIntArray()
+    private const val DEFAULT_FURNACE_COOK_SECONDS = 10.0
+    private const val MIN_FURNACE_COOK_SECONDS = 0.05
+    private val PLAYER_CRAFT_RESULT_QUICK_MOVE_TARGET_SLOTS: IntArray =
+        (44 downTo 9).toList().toIntArray()
+    private val TABLE_CRAFT_RESULT_QUICK_MOVE_TARGET_SLOTS: IntArray =
+        (45 downTo 10).toList().toIntArray()
     private val json = Json { ignoreUnknownKeys = true }
     private val PICK_ITEM_FALLBACK_BLOCK_BY_BLOCK = hashMapOf(
         "minecraft:tall_grass" to "minecraft:short_grass",
@@ -5501,12 +11943,17 @@ object PlayerSessionManager {
         return resolveBlockTag(tagName, HashSet())
     }
 
+    private fun loadItemTag(tagName: String): Set<String> {
+        return resolveItemTag(tagName, HashSet())
+    }
+
     private fun resolveBlockTag(tagName: String, visited: MutableSet<String>): Set<String> {
         if (!visited.add(tagName)) return emptySet()
         val resourcePath = "/data/minecraft/tags/block/$tagName.json"
         val stream = PlayerSessionManager::class.java.getResourceAsStream(resourcePath) ?: return emptySet()
+        val parser = Json { ignoreUnknownKeys = true }
         val root = stream.bufferedReader().use {
-            json.parseToJsonElement(it.readText()).jsonObject
+            parser.parseToJsonElement(it.readText()).jsonObject
         }
         val out = LinkedHashSet<String>()
         for (value in root["values"]?.jsonArray.orEmpty()) {
@@ -5515,6 +11962,26 @@ object PlayerSessionManager {
                 out.addAll(resolveBlockTag(raw.removePrefix("#minecraft:"), visited))
             } else if (raw.startsWith("minecraft:")) {
                 out.add(raw)
+            }
+        }
+        return out
+    }
+
+    private fun resolveItemTag(tagName: String, visited: MutableSet<String>): Set<String> {
+        if (!visited.add(tagName)) return emptySet()
+        val resourcePath = "/data/minecraft/tags/item/$tagName.json"
+        val stream = PlayerSessionManager::class.java.getResourceAsStream(resourcePath) ?: return emptySet()
+        val parser = Json { ignoreUnknownKeys = true }
+        val root = stream.bufferedReader().use {
+            parser.parseToJsonElement(it.readText()).jsonObject
+        }
+        val out = LinkedHashSet<String>()
+        for (value in root["values"]?.jsonArray.orEmpty()) {
+            val raw = value.jsonPrimitive.content
+            when {
+                raw.startsWith("#minecraft:") -> out.addAll(resolveItemTag(raw.removePrefix("#minecraft:"), visited))
+                raw.startsWith("#") -> out.addAll(resolveItemTag(raw.substring(1).substringAfter("minecraft:"), visited))
+                raw.startsWith("minecraft:") -> out.add(raw)
             }
         }
         return out
@@ -5559,6 +12026,16 @@ object PlayerSessionManager {
             ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.player.attack.weak")
             ?: PLAYER_ATTACK_WEAK_SOUND_ID_FALLBACK
     }
+    private val SNOWBALL_THROW_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.snowball.throw")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.snowball.throw")
+            ?: SNOWBALL_THROW_SOUND_ID_FALLBACK
+    }
+    private val EGG_THROW_SOUND_ID: Int? by lazy {
+        RegistryCodec.entryIndex("minecraft:sound_event", "minecraft:entity.egg.throw")
+            ?: RegistryCodec.entryIndex("sound_event", "minecraft:entity.egg.throw")
+            ?: EGG_THROW_SOUND_ID_FALLBACK
+    }
     private val FALL_DAMAGE_TYPE_ID: Int by lazy {
         RegistryCodec.entryIndex("minecraft:damage_type", "minecraft:fall")
             ?: FALL_DAMAGE_TYPE_ID_FALLBACK
@@ -5568,6 +12045,12 @@ object PlayerSessionManager {
             ?: FALL_DAMAGE_TYPE_ID
     }
     private const val BASE_UNARMED_DAMAGE = 1.0f
+    private const val BASE_UNARMED_ATTACK_SPEED = 4.0f
+    private const val DEFAULT_ATTACK_STRENGTH_DELAY_TICKS = 5.0f
+    private const val INITIAL_ATTACK_STRENGTH_TICKS = 20.0
+    private const val MAX_ATTACK_STRENGTH_TICKER = 200.0
+    private const val HURT_INVULNERABILITY_SECONDS = 0.5
+    private const val DAMAGE_EPSILON = 1.0e-4f
     private const val MAX_PLAYER_MELEE_REACH_SQ = 9.0
     private const val VANILLA_CRITICAL_DAMAGE_MULTIPLIER = 1.5f
     private const val VANILLA_STRONG_ATTACK_THRESHOLD = 0.9f
@@ -5578,6 +12061,11 @@ object PlayerSessionManager {
     private const val VANILLA_SWEEP_KNOCKBACK = 0.4
     private const val VANILLA_SWEEP_MAX_DISTANCE_SQ = 9.0
     private const val PLAYER_SWEEP_SPEED_THRESHOLD = 0.25
+    private const val ANIMAL_BASE_ATTACK_KNOCKBACK = 0.4
+    private const val ANIMAL_SPRINT_ATTACK_KNOCKBACK = 0.5
+    private const val VANILLA_ENTITY_PUSH_STRENGTH_PER_TICK = 0.05000000074505806
+    private const val VANILLA_ENTITY_PUSH_MIN_DISTANCE = 0.009999999776482582
+    private const val ENTITY_PUSH_MAX_PLAYER_VELOCITY = 0.45
     private const val PLAYER_SMALL_FALL_SOUND_ID_FALLBACK = 1257
     private const val PLAYER_BIG_FALL_SOUND_ID_FALLBACK = 1247
     private const val PLAYER_HURT_SOUND_ID_FALLBACK = 1251
@@ -5586,7 +12074,16 @@ object PlayerSessionManager {
     private const val PLAYER_ATTACK_STRONG_SOUND_ID_FALLBACK = 1244
     private const val PLAYER_ATTACK_SWEEP_SOUND_ID_FALLBACK = 1245
     private const val PLAYER_ATTACK_WEAK_SOUND_ID_FALLBACK = 1246
+    private const val SNOWBALL_THROW_SOUND_ID_FALLBACK = 1494
+    private const val EGG_THROW_SOUND_ID_FALLBACK = 639
+    private const val ANIMAL_SMALL_FALL_SOUND_KEY = "minecraft:entity.generic.small_fall"
+    private const val ANIMAL_BIG_FALL_SOUND_KEY = "minecraft:entity.generic.big_fall"
+    private const val ANIMAL_DEATH_REMOVE_DELAY_SECONDS = 1.0
     private const val ENTITY_EVENT_DEATH_ANIMATION = 3
+    private const val ENTITY_EVENT_FINISH_USING_ITEM = 9
+    private const val ENTITY_EVENT_THROWN_ITEM_BREAK_PARTICLES = 3
+    private const val ENTITY_ANIMATION_CRITICAL_HIT = 4
+    private const val KNOCKBACK_Y_PRE_GRAVITY_COMPENSATION = 0.08
 
     private fun chunkStreamBatchWorkers(): Int = ChunkStreamingService.maxWorkerCount().coerceAtLeast(1)
 
@@ -5688,6 +12185,8 @@ object PlayerSessionManager {
                                 val ids = unloadIdsByChunk[pos]?.getNow(IntArray(0)) ?: IntArray(0)
                                 hideDroppedItemsForChunk(session, ctx, pos, ids)
                                 hideFallingBlocksForChunk(session, ctx, pos, world.fallingBlockEntityIdsInChunk(pos.x, pos.z))
+                                hideThrownItemsForChunk(session, ctx, pos, world.thrownItemEntityIdsInChunk(pos.x, pos.z))
+                                hideAnimalsForChunk(session, ctx, pos, world.animalEntityIdsInChunk(pos.x, pos.z))
                                 session.loadedChunks.remove(pos)
                                 ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
                             }
@@ -5701,8 +12200,11 @@ object PlayerSessionManager {
                             return@execute
                         }
 
-                        val futuresArray = unloadIdsByChunk.values.toTypedArray()
-                        CompletableFuture.allOf(*futuresArray).whenComplete { _, _ ->
+                        val remainingUnloadFetches = AtomicInteger(unloadIdsByChunk.size)
+                        val unloadCompletionScheduled = AtomicBoolean(false)
+                        fun completeUnloadFetches() {
+                            if (remainingUnloadFetches.decrementAndGet() != 0) return
+                            if (!unloadCompletionScheduled.compareAndSet(false, true)) return
                             ctx.executor().execute {
                                 if (!ctx.channel().isActive) {
                                     drain()
@@ -5713,6 +12215,11 @@ object PlayerSessionManager {
                                     return@execute
                                 }
                                 finishUnloadAndFlush()
+                            }
+                        }
+                        for (future in unloadIdsByChunk.values) {
+                            future.whenComplete { _, _ ->
+                                completeUnloadFetches()
                             }
                         }
                         return@execute
@@ -5731,6 +12238,8 @@ object PlayerSessionManager {
                 onChunkSent = { chunkPos, droppedItems ->
                     sendDroppedItemsForChunk(session, ctx, droppedItems)
                     sendFallingBlocksForChunk(session, ctx, world.fallingBlocksInChunk(chunkPos.x, chunkPos.z))
+                    sendThrownItemsForChunk(session, ctx, world.thrownItemsInChunk(chunkPos.x, chunkPos.z))
+                    sendAnimalsForChunk(session, ctx, world.animalsInChunk(chunkPos.x, chunkPos.z))
                 },
                 workerLimit = chunkStreamBatchWorkers()
             ).whenComplete { sentCount, error ->

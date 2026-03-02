@@ -3,6 +3,7 @@ package org.macaroon3145.network.handler
 import org.macaroon3145.network.NetworkUtils
 import org.macaroon3145.network.codec.RegistryCodec
 import org.macaroon3145.world.GeneratedChunk
+import org.macaroon3145.world.WorldManager
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import kotlin.math.floor
@@ -60,6 +61,7 @@ object PlayPackets {
     private const val ENTITY_METADATA_PACKET_ID = 0x61
     private const val ENTITY_EQUIPMENT_PACKET_ID = 0x64
     private const val ENTITY_VELOCITY_PACKET_ID = 0x63
+    private const val SET_PASSENGERS_PACKET_ID = 0x69
     private const val POSITION_PACKET_ID = 0x46
     private const val REMOVE_ENTITIES_PACKET_ID = 0x4B
     private const val RESPAWN_PACKET_ID = 0x50
@@ -73,6 +75,10 @@ object PlayPackets {
     private const val SET_HEALTH_PACKET_ID = 0x66
     private const val SET_HELD_SLOT_PACKET_ID = 0x67
     private const val CONTAINER_SET_SLOT_PACKET_ID = 0x14
+    private const val CONTAINER_SET_CONTENT_PACKET_ID = 0x12
+    private const val CONTAINER_SET_DATA_PACKET_ID = 0x13
+    private const val CONTAINER_CLOSE_PACKET_ID = 0x11
+    private const val OPEN_SCREEN_PACKET_ID = 0x39
     private const val COMMAND_SUGGESTIONS_PACKET_ID = 0x0F
     private const val COMMANDS_PACKET_ID = 0x10
     private const val CUSTOM_PAYLOAD_PACKET_ID = 0x18
@@ -82,6 +88,7 @@ object PlayPackets {
     private const val ENTITY_EVENT_PACKET_ID = 0x22
     private const val HURT_ANIMATION_PACKET_ID = 0x29
     private const val SOUND_ENTITY_PACKET_ID = 0x72
+    private const val SOUND_PACKET_ID = 0x73
 
     private const val SPAWN_X = 0
     private const val SPAWN_Y = 65
@@ -90,6 +97,9 @@ object PlayPackets {
     private const val FALLBACK_PLAYER_ENTITY_TYPE_ID_1_21_11 = 155
     private const val FALLBACK_ITEM_ENTITY_TYPE_ID_1_21_11 = 71
     private const val FALLBACK_FALLING_BLOCK_ENTITY_TYPE_ID_1_21_11 = 51
+    private const val FALLBACK_SNOWBALL_ENTITY_TYPE_ID_1_21_11 = 120
+    private const val FALLBACK_EGG_ENTITY_TYPE_ID_1_21_11 = 39
+    private const val FALLBACK_PIG_ENTITY_TYPE_ID_1_21_11 = 100
     private const val COMMAND_ARGUMENT_TYPE_GAME_PROFILE_ID_1_21_11 = 7
     private const val COMMAND_ARGUMENT_TYPE_VEC3_ID_1_21_11 = 10
     private const val COMMAND_ARGUMENT_TYPE_GAMEMODE_ID_1_21_11 = 42
@@ -117,6 +127,26 @@ object PlayPackets {
     private val cachedFallingBlockEntityTypeId: Int by lazy {
         RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:falling_block")
             ?: FALLBACK_FALLING_BLOCK_ENTITY_TYPE_ID_1_21_11
+    }
+    private val cachedSnowballEntityTypeId: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:snowball")
+            ?: FALLBACK_SNOWBALL_ENTITY_TYPE_ID_1_21_11
+    }
+    private val cachedEggEntityTypeId: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:egg")
+            ?: FALLBACK_EGG_ENTITY_TYPE_ID_1_21_11
+    }
+    private val cachedPigEntityTypeId: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:pig")
+            ?: FALLBACK_PIG_ENTITY_TYPE_ID_1_21_11
+    }
+
+    fun prewarm() {
+        cachedItemEntityTypeId
+        cachedFallingBlockEntityTypeId
+        cachedSnowballEntityTypeId
+        cachedEggEntityTypeId
+        cachedPigEntityTypeId
     }
 
     fun loginPacket(entityId: Int, worldKey: String, gameMode: Int): ByteArray {
@@ -283,6 +313,51 @@ object PlayPackets {
         return packet.toByteArray()
     }
 
+    fun containerSetContentPacket(
+        containerId: Int,
+        stateId: Int,
+        encodedItems: List<ByteArray>,
+        encodedCarried: ByteArray
+    ): ByteArray {
+        val packet = ByteArrayOutputStream()
+        NetworkUtils.writeVarInt(packet, CONTAINER_SET_CONTENT_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, containerId)
+        NetworkUtils.writeVarInt(packet, stateId)
+        NetworkUtils.writeVarInt(packet, encodedItems.size.coerceAtLeast(0))
+        for (encoded in encodedItems) {
+            packet.write(encoded)
+        }
+        packet.write(encodedCarried)
+        return packet.toByteArray()
+    }
+
+    fun containerSetDataPacket(containerId: Int, property: Int, value: Int): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, CONTAINER_SET_DATA_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, containerId)
+        out.writeShort(property)
+        out.writeShort(value)
+        return packet.toByteArray()
+    }
+
+    fun containerClosePacket(containerId: Int): ByteArray {
+        val packet = ByteArrayOutputStream()
+        NetworkUtils.writeVarInt(packet, CONTAINER_CLOSE_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, containerId)
+        return packet.toByteArray()
+    }
+
+    fun openScreenPacket(containerId: Int, menuTypeId: Int, title: ChatComponent): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, OPEN_SCREEN_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, containerId)
+        NetworkUtils.writeVarInt(packet, menuTypeId.coerceAtLeast(0))
+        writeComponentNbt(out, title)
+        return packet.toByteArray()
+    }
+
     fun commandsPacket(includeOperatorCommands: Boolean): ByteArray {
         data class CmdNode(
             val flags: Int,
@@ -400,7 +475,8 @@ object PlayPackets {
                     name = "target",
                     parserTypeId = COMMAND_ARGUMENT_TYPE_ENTITY_ID_1_21_11,
                     parserPayload = entityPayload(single = false, playersOnly = false),
-                    executable = true
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
                 )
                 setNode(literalIndex, nodes[literalIndex].copy(children = intArrayOf(modeIndex)))
                 setNode(modeIndex, nodes[modeIndex].copy(children = intArrayOf(targetIndex)))
@@ -449,13 +525,6 @@ object PlayPackets {
                     parserPayload = timePayload(0),
                     executable = true
                 )
-                val setWorldIndex = addArgument(
-                    name = "world",
-                    parserTypeId = COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11,
-                    parserPayload = brigadierStringPayloadSingleWord(),
-                    executable = true,
-                    suggestionType = "minecraft:ask_server"
-                )
 
                 val addValueIndex = addArgument(
                     name = "value",
@@ -463,24 +532,10 @@ object PlayPackets {
                     parserPayload = timePayload(0),
                     executable = true
                 )
-                val addWorldIndex = addArgument(
-                    name = "world",
-                    parserTypeId = COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11,
-                    parserPayload = brigadierStringPayloadSingleWord(),
-                    executable = true,
-                    suggestionType = "minecraft:ask_server"
-                )
 
                 val queryDaytimeLiteralIndex = addLiteral("daytime", executable = true)
                 val queryGametimeLiteralIndex = addLiteral("gametime", executable = true)
                 val queryDayLiteralIndex = addLiteral("day", executable = true)
-                val queryWorldIndex = addArgument(
-                    name = "world",
-                    parserTypeId = COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11,
-                    parserPayload = brigadierStringPayloadSingleWord(),
-                    executable = true,
-                    suggestionType = "minecraft:ask_server"
-                )
 
                 setNode(literalIndex, nodes[literalIndex].copy(children = intArrayOf(setLiteralIndex, addLiteralIndex, queryLiteralIndex)))
                 setNode(
@@ -506,15 +561,21 @@ object PlayPackets {
                         )
                     )
                 )
-                setNode(setValueIndex, nodes[setValueIndex].copy(children = intArrayOf(setWorldIndex)))
-                setNode(setDayLiteralIndex, nodes[setDayLiteralIndex].copy(children = intArrayOf(setWorldIndex)))
-                setNode(setNoonLiteralIndex, nodes[setNoonLiteralIndex].copy(children = intArrayOf(setWorldIndex)))
-                setNode(setNightLiteralIndex, nodes[setNightLiteralIndex].copy(children = intArrayOf(setWorldIndex)))
-                setNode(setMidnightLiteralIndex, nodes[setMidnightLiteralIndex].copy(children = intArrayOf(setWorldIndex)))
-                setNode(addValueIndex, nodes[addValueIndex].copy(children = intArrayOf(addWorldIndex)))
-                setNode(queryDaytimeLiteralIndex, nodes[queryDaytimeLiteralIndex].copy(children = intArrayOf(queryWorldIndex)))
-                setNode(queryGametimeLiteralIndex, nodes[queryGametimeLiteralIndex].copy(children = intArrayOf(queryWorldIndex)))
-                setNode(queryDayLiteralIndex, nodes[queryDayLiteralIndex].copy(children = intArrayOf(queryWorldIndex)))
+                rootChildren += literalIndex
+            }
+
+            fun addPerfSubtree() {
+                val literalIndex = addLiteral("perf", executable = true)
+                val worldLiteralIndices = WorldManager.allWorlds()
+                    .asSequence()
+                    .map { it.key.substringAfter(':', it.key) }
+                    .distinct()
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .map { addLiteral(it, executable = true) }
+                    .toList()
+                if (worldLiteralIndices.isNotEmpty()) {
+                    setNode(literalIndex, nodes[literalIndex].copy(children = worldLiteralIndices.toIntArray()))
+                }
                 rootChildren += literalIndex
             }
 
@@ -525,6 +586,7 @@ object PlayPackets {
             addDeopSubtree()
             addStopLiteral()
             addTimeSubtree()
+            addPerfSubtree()
         }
         setNode(rootIndex, nodes[rootIndex].copy(children = rootChildren.toIntArray()))
 
@@ -709,9 +771,63 @@ object PlayPackets {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
         NetworkUtils.writeVarInt(packet, SOUND_ENTITY_PACKET_ID)
-        NetworkUtils.writeVarInt(packet, soundEventId)
+        // SoundEvent holder wire format uses registry reference as (id + 1).
+        NetworkUtils.writeVarInt(packet, soundEventId + 1)
         NetworkUtils.writeVarInt(packet, soundSourceId)
         NetworkUtils.writeVarInt(packet, entityId)
+        out.writeFloat(volume)
+        out.writeFloat(pitch)
+        out.writeLong(seed)
+        return packet.toByteArray()
+    }
+
+    fun soundPacket(
+        soundEventId: Int,
+        soundSourceId: Int,
+        x: Double,
+        y: Double,
+        z: Double,
+        volume: Float,
+        pitch: Float,
+        seed: Long
+    ): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, SOUND_PACKET_ID)
+        // Holder<SoundEvent> registry reference is encoded as (id + 1).
+        NetworkUtils.writeVarInt(packet, soundEventId + 1)
+        NetworkUtils.writeVarInt(packet, soundSourceId)
+        out.writeInt((x * 8.0).toInt())
+        out.writeInt((y * 8.0).toInt())
+        out.writeInt((z * 8.0).toInt())
+        out.writeFloat(volume)
+        out.writeFloat(pitch)
+        out.writeLong(seed)
+        return packet.toByteArray()
+    }
+
+    fun soundPacketByKey(
+        soundKey: String,
+        soundSourceId: Int,
+        x: Double,
+        y: Double,
+        z: Double,
+        volume: Float,
+        pitch: Float,
+        seed: Long
+    ): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, SOUND_PACKET_ID)
+        // Holder<SoundEvent> direct encoding:
+        // 0 => inline SoundEvent payload (Identifier + Optional<Float> fixedRange).
+        NetworkUtils.writeVarInt(packet, 0)
+        NetworkUtils.writeString(packet, soundKey)
+        out.writeBoolean(false) // fixedRange absent (variable-range sound)
+        NetworkUtils.writeVarInt(packet, soundSourceId)
+        out.writeInt((x * 8.0).toInt())
+        out.writeInt((y * 8.0).toInt())
+        out.writeInt((z * 8.0).toInt())
         out.writeFloat(volume)
         out.writeFloat(pitch)
         out.writeLong(seed)
@@ -809,6 +925,17 @@ object PlayPackets {
         return packet.toByteArray()
     }
 
+    fun setPassengersPacket(vehicleEntityId: Int, passengerEntityIds: IntArray): ByteArray {
+        val packet = ByteArrayOutputStream()
+        NetworkUtils.writeVarInt(packet, SET_PASSENGERS_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, vehicleEntityId)
+        NetworkUtils.writeVarInt(packet, passengerEntityIds.size.coerceAtLeast(0))
+        for (passengerEntityId in passengerEntityIds) {
+            NetworkUtils.writeVarInt(packet, passengerEntityId)
+        }
+        return packet.toByteArray()
+    }
+
     fun itemEntityMetadataPacket(entityId: Int, encodedItemStack: ByteArray): ByteArray {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
@@ -816,6 +943,21 @@ object PlayPackets {
         NetworkUtils.writeVarInt(packet, entityId)
         // ItemEntity metadata index:
         // MetadataDef.ItemEntity.ITEM => base Entity(0..7) + local(0) = 8
+        out.writeByte(8)
+        // Metadata.TYPE_ITEM_STACK = 7
+        NetworkUtils.writeVarInt(packet, 7)
+        packet.write(encodedItemStack)
+        out.writeByte(0xFF)
+        return packet.toByteArray()
+    }
+
+    fun throwableItemMetadataPacket(entityId: Int, encodedItemStack: ByteArray): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, ENTITY_METADATA_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, entityId)
+        // ThrowableItemProjectile item stack metadata index:
+        // Base Entity metadata occupies 0..7. ThrowableItemProjectile defines local index 0 => global 8.
         out.writeByte(8)
         // Metadata.TYPE_ITEM_STACK = 7
         NetworkUtils.writeVarInt(packet, 7)
@@ -856,6 +998,18 @@ object PlayPackets {
 
     fun fallingBlockEntityTypeId(): Int {
         return cachedFallingBlockEntityTypeId
+    }
+
+    fun snowballEntityTypeId(): Int {
+        return cachedSnowballEntityTypeId
+    }
+
+    fun eggEntityTypeId(): Int {
+        return cachedEggEntityTypeId
+    }
+
+    fun pigEntityTypeId(): Int {
+        return cachedPigEntityTypeId
     }
 
     fun entityPositionSyncPacket(

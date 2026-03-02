@@ -100,4 +100,8 @@ class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChann
         buf.readBytes(bytes)
         return String(bytes, Charsets.UTF_8)
     }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        ctx.close()
+    }
 }

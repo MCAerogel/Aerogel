@@ -12,7 +12,6 @@ object BlockEntityTypeRegistry {
         val resource = BlockEntityTypeRegistry::class.java.classLoader
             .getResourceAsStream("block-entity-type-ids-1.21.11.json")
             ?: error("Missing block-entity-type-ids-1.21.11.json resource")
-
         val root = resource.bufferedReader().use { json.parseToJsonElement(it.readText()) }.jsonObject
         val entries = root["entries"]?.jsonObject ?: return@lazy emptyMap()
         val map = HashMap<String, Int>(entries.size)
@@ -24,5 +23,8 @@ object BlockEntityTypeRegistry {
     }
 
     fun idOf(typeKey: String): Int? = byKey[typeKey]
-}
 
+    fun prewarm() {
+        byKey.size
+    }
+}

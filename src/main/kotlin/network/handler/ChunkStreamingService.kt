@@ -101,9 +101,8 @@ object ChunkStreamingService {
     }
 
     fun prewarmAsync(world: World): CompletableFuture<Void> {
-        return CompletableFuture.runAsync({
-            runCatching { world.prewarmChunkGeneration() }
-        }, workerPool)
+        return world.prewarmChunkGenerationAsync()
+            .handle { _, _ -> null }
     }
 
     fun streamCoords(
@@ -133,7 +132,8 @@ object ChunkStreamingService {
             .coerceAtLeast(1)
             .coerceAtMost(workerCount)
             .coerceAtMost(coords.size)
-        val workers = ArrayList<CompletableFuture<Void>>(parallelism)
+        val dispatcherCount = AtomicInteger(parallelism)
+        val inFlightBuildTasks = AtomicInteger(0)
 
         fun scheduleIntermediateFlush() {
             if (!flushScheduled.compareAndSet(false, true)) return
@@ -152,6 +152,7 @@ object ChunkStreamingService {
 
         fun finishSuccessIfReady() {
             if (!generationWorkersDone.get()) return
+            if (inFlightBuildTasks.get() != 0) return
             if (pendingPacketTasks.get() != 0) return
             if (!completion.complete(sent.get())) return
             ctx.executor().execute {
@@ -161,21 +162,47 @@ object ChunkStreamingService {
             }
         }
 
-        repeat(parallelism) {
-            workers += CompletableFuture.runAsync({
-                while (true) {
-                    if (completion.isDone) break
-                    if (!shouldSend()) break
-                    val index = nextIndex.getAndIncrement()
-                    if (index >= coords.size) break
-                    val coord = coords[index]
-                    if (loadedChunks.contains(coord)) continue
-                    if (!generatingChunks.add(coord)) continue
+        fun finishDispatcher() {
+            if (dispatcherCount.decrementAndGet() == 0) {
+                generationWorkersDone.set(true)
+                finishSuccessIfReady()
+            }
+        }
 
+        fun dispatchNext() {
+            if (completion.isDone || !shouldSend()) {
+                finishDispatcher()
+                return
+            }
+            while (true) {
+                val index = nextIndex.getAndIncrement()
+                if (index >= coords.size) {
+                    finishDispatcher()
+                    return
+                }
+                val coord = coords[index]
+                if (loadedChunks.contains(coord)) continue
+                if (!generatingChunks.add(coord)) continue
+
+                inFlightBuildTasks.incrementAndGet()
+                world.buildChunkAsync(coord, workerPool).whenComplete { generated, error ->
                     try {
-                        val generated = world.buildChunk(coord) {
-                            !completion.isDone && shouldSend()
+                        if (error != null) {
+                            generatingChunks.remove(coord)
+                            if (isChunkRequestCancelled(error) || isChunkBridgeTimeout(error)) {
+                                if (!shouldSend() || completion.isDone) {
+                                    finishDispatcher()
+                                } else {
+                                    dispatchNext()
+                                }
+                                return@whenComplete
+                            }
+                            logger.error("Chunk stream failed for {},{}", coord.x, coord.z, error)
+                            failStream(RuntimeException("Chunk stream failed at ${coord.x},${coord.z}", error))
+                            finishDispatcher()
+                            return@whenComplete
                         }
+
                         pendingPacketTasks.incrementAndGet()
                         packetPool.execute {
                             try {
@@ -209,29 +236,18 @@ object ChunkStreamingService {
                                 }
                             }
                         }
-                    } catch (t: Throwable) {
-                        generatingChunks.remove(coord)
-                        if (isChunkRequestCancelled(t) || isChunkBridgeTimeout(t)) {
-                            if (!shouldSend() || completion.isDone) {
-                                break
-                            }
-                            continue
-                        }
-                        logger.error("Chunk stream failed for {},{}", coord.x, coord.z, t)
-                        failStream(RuntimeException("Chunk stream failed at ${coord.x},${coord.z}", t))
-                        break
+                        dispatchNext()
+                    } finally {
+                        inFlightBuildTasks.decrementAndGet()
+                        finishSuccessIfReady()
                     }
                 }
-            }, workerPool)
+                return
+            }
         }
 
-        CompletableFuture.allOf(*workers.toTypedArray()).whenComplete { _, error ->
-            if (error != null) {
-                failStream(error)
-                return@whenComplete
-            }
-            generationWorkersDone.set(true)
-            finishSuccessIfReady()
+        repeat(parallelism) {
+            dispatchNext()
         }
 
         return completion

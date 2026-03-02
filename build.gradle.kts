@@ -25,6 +25,8 @@ dependencies {
     implementation("com.google.code.gson:gson:2.11.0")
     implementation("org.jline:jline:3.26.3")
     implementation("org.slf4j:slf4j-api:2.0.16")
+    implementation("org.recast4j:recast:1.5.11")
+    implementation("org.recast4j:detour:1.5.11")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.16")
 
     // Mojang-mapped NMS classes via Paper userdev.
@@ -113,8 +115,8 @@ tasks.named("build") {
 val aerogelJarTask = tasks.named<Jar>("aerogelJar")
 val aerogelRunJvmArgs = listOf(
     "--enable-native-access=ALL-UNNAMED",
-    "-Xms8G",
-    "-Xmx8G"
+    "-Xms4G",
+    "-Xmx4G"
 )
 
 tasks.register<Exec>("runAerogelJar") {

@@ -114,6 +114,15 @@ object BlockStateRegistry {
 
     fun parsedState(stateId: Int): ParsedState? = stateIdToParsed[stateId]
 
+    fun allStateIds(): IntArray {
+        val out = IntArray(stateIdToParsed.size)
+        var i = 0
+        for (stateId in stateIdToParsed.keys) {
+            out[i++] = stateId
+        }
+        return out
+    }
+
     fun verticalHalfCounterpartStateId(stateId: Int): Int? = verticalHalfCounterpartByStateId[stateId]
 
     fun propertyValues(blockKey: String, property: String): Set<String> {

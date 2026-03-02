@@ -57,15 +57,20 @@ object TimeCommand : Command {
             return
         }
         val valueToken = rawValue.trim()
-        if (args.size > 3) {
-            sendInvalidArgument(context, sender, args, 3)
+        if (sender != null && args.size > 2) {
+            sendInvalidArgument(context, sender, args, 2)
+            return
+        }
+        if (sender == null && args.size > 3) {
+            sendInvalidArgument(context, null, args, 3)
             return
         }
         if (sender == null && args.getOrNull(2).isNullOrBlank()) {
             sendInvalidArgument(context, null, args, 2)
             return
         }
-        val worldKey = resolveWorldKey(context, sender, args.getOrNull(2))
+        val worldArg = if (sender == null) args.getOrNull(2) else null
+        val worldKey = resolveWorldKey(context, sender, worldArg)
         val parsed = parseTimeValue(valueToken, allowSetAliases = true)
         if (parsed is ParsedTimeValue.InvalidUnit) {
             sendInvalidTimeUnit(context, sender, args, valueIndex)
@@ -105,15 +110,20 @@ object TimeCommand : Command {
             return
         }
         val valueToken = rawValue.trim()
-        if (args.size > 3) {
-            sendInvalidArgument(context, sender, args, 3)
+        if (sender != null && args.size > 2) {
+            sendInvalidArgument(context, sender, args, 2)
+            return
+        }
+        if (sender == null && args.size > 3) {
+            sendInvalidArgument(context, null, args, 3)
             return
         }
         if (sender == null && args.getOrNull(2).isNullOrBlank()) {
             sendInvalidArgument(context, null, args, 2)
             return
         }
-        val worldKey = resolveWorldKey(context, sender, args.getOrNull(2))
+        val worldArg = if (sender == null) args.getOrNull(2) else null
+        val worldKey = resolveWorldKey(context, sender, worldArg)
         val parsed = parseTimeValue(valueToken, allowSetAliases = false)
         if (parsed is ParsedTimeValue.InvalidUnit) {
             sendInvalidTimeUnit(context, sender, args, valueIndex)
@@ -156,15 +166,20 @@ object TimeCommand : Command {
             sendInvalidArgument(context, sender, args, queryIndex)
             return
         }
-        if (args.size > 3) {
-            sendInvalidArgument(context, sender, args, 3)
+        if (sender != null && args.size > 2) {
+            sendInvalidArgument(context, sender, args, 2)
+            return
+        }
+        if (sender == null && args.size > 3) {
+            sendInvalidArgument(context, null, args, 3)
             return
         }
         if (sender == null && args.getOrNull(2).isNullOrBlank()) {
             sendInvalidArgument(context, null, args, 2)
             return
         }
-        val worldKey = resolveWorldKey(context, sender, args.getOrNull(2))
+        val worldArg = if (sender == null) args.getOrNull(2) else null
+        val worldKey = resolveWorldKey(context, sender, worldArg)
         val snapshot = context.worldTimeSnapshot(worldKey)
         if (snapshot == null) {
             sendInvalidWorld(context, sender, args, 2, worldKey)

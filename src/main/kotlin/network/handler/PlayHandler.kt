@@ -7,6 +7,9 @@ import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.NetworkUtils
 import org.macaroon3145.world.BlockPos
 import org.slf4j.LoggerFactory
+import java.io.IOException
+import java.nio.channels.ClosedChannelException
+import java.util.Locale
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
@@ -34,6 +37,8 @@ class PlayHandler(
             0x08 -> handleChatMessage(buf)
             0x0B -> handleClientStatus(buf)
             0x0E -> handleCommandSuggestion(buf)
+            0x11 -> handleContainerClick(buf)
+            0x12 -> handleContainerClose(buf)
             // Vanilla 1.21.11 C2S Play: PlayPackets.INTERACT (PlayerInteractEntityC2SPacket) = 0x19.
             0x19 -> handleUseEntity(buf)
             // Serverbound Client Information (play)
@@ -43,6 +48,10 @@ class PlayHandler(
                     tryHandleMovementByShape(packetId, buf)
                 }
             }
+            // Vanilla 1.21.11 C2S Play: ServerboundMoveVehiclePacket = 0x21.
+            0x21 -> handleMoveVehicle(buf)
+            // Vanilla 1.21.11 C2S Play: UpdatePlayerAbilitiesC2SPacket = 0x27.
+            0x27 -> handleUpdatePlayerAbilities(buf)
             0x23, 0x24 -> handlePickItemFromBlock(buf)
             0x28 -> handlePlayerDigging(buf)
             0x29 -> handleEntityAction(buf)
@@ -52,12 +61,16 @@ class PlayHandler(
             0x37 -> handleSetCreativeModeSlot(buf)
             0x3C -> handleAnimation(buf)
             0x3F -> handlePlayerBlockPlacement(buf)
+            0x40 -> handleUseItem(buf)
             0x00 -> {
                 // teleport confirm
             }
             else -> {
                 // Fallback: protocol IDs can shift across minor versions.
                 // Accept canonical movement payload shapes even if packetId differs.
+                if (tryHandlePlayerInputByShape(packetId, buf)) return
+                if (tryHandleEntityActionByShape(packetId, buf)) return
+                if (packetId == 0x27 && tryHandlePlayerAbilitiesByShape(packetId, buf)) return
                 tryHandleMovementByShape(packetId, buf)
             }
         }
@@ -166,6 +179,22 @@ class PlayHandler(
         }
     }
 
+    private fun tryHandlePlayerAbilitiesByShape(packetId: Int, buf: ByteBuf): Boolean {
+        if (packetId != 0x27) return false
+        if (buf.readableBytes() != 1) return false
+        val flags = buf.readUnsignedByte().toInt()
+        val flying = (flags and 0x02) != 0
+        PlayerSessionManager.updatePlayerFlyingState(session.channelId, flying)
+        return true
+    }
+
+    private fun handleUpdatePlayerAbilities(buf: ByteBuf) {
+        if (buf.readableBytes() < 1) return
+        val flags = buf.readUnsignedByte().toInt()
+        val flying = (flags and 0x02) != 0
+        PlayerSessionManager.updatePlayerFlyingState(session.channelId, flying)
+    }
+
     private fun handleClientInformation(buf: ByteBuf) {
         val locale = readBoundedString(buf, 16) ?: return
         if (buf.readableBytes() < 1) return
@@ -205,30 +234,153 @@ class PlayHandler(
 
     private fun handleEntityAction(buf: ByteBuf) {
         try {
-            NetworkUtils.readVarInt(buf) // entityId (client-side self id)
+            val entityId = NetworkUtils.readVarInt(buf) // client-side self id
             val action = NetworkUtils.readVarInt(buf)
             NetworkUtils.readVarInt(buf) // jump boost
-            when (action) {
-                1 -> PlayerSessionManager.updateAndBroadcastPlayerState(session.channelId, sprinting = true)
-                2 -> PlayerSessionManager.updateAndBroadcastPlayerState(session.channelId, sprinting = false)
-            }
+            if (entityId != session.entityId) return
+            applyEntityAction(action)
         } catch (_: Throwable) {
             return
         }
     }
 
+    private fun applyEntityAction(action: Int) {
+        when (action) {
+            0 -> {
+                PlayerSessionManager.updateAndBroadcastPlayerState(session.channelId, sneaking = true)
+                PlayerSessionManager.handlePlayerDismountRequest(session.channelId)
+            }
+            1 -> PlayerSessionManager.updateAndBroadcastPlayerState(session.channelId, sneaking = false)
+            3 -> PlayerSessionManager.updateAndBroadcastPlayerState(session.channelId, sprinting = true)
+            4 -> PlayerSessionManager.updateAndBroadcastPlayerState(session.channelId, sprinting = false)
+        }
+    }
+
+    private fun tryHandleEntityActionByShape(packetId: Int, buf: ByteBuf): Boolean {
+        if (buf.readableBytes() !in 3..12) return false
+        if (packetId !in 0x26..0x2E) return false
+        buf.markReaderIndex()
+        val entityId = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            buf.resetReaderIndex()
+            return false
+        }
+        val action = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            buf.resetReaderIndex()
+            return false
+        }
+        val jumpBoost = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            buf.resetReaderIndex()
+            return false
+        }
+        if (buf.readableBytes() != 0) {
+            buf.resetReaderIndex()
+            return false
+        }
+        if (entityId != session.entityId) {
+            buf.resetReaderIndex()
+            return false
+        }
+        if (action !in 0..8 || jumpBoost !in 0..255) {
+            buf.resetReaderIndex()
+            return false
+        }
+        applyEntityAction(action)
+        return true
+    }
+
     private fun handlePlayerInput(buf: ByteBuf) {
         if (buf.readableBytes() < 1) return
         val flags = buf.readUnsignedByte().toInt()
+        val forward = (flags and (1 shl 0)) != 0
+        val backward = (flags and (1 shl 1)) != 0
+        val left = (flags and (1 shl 2)) != 0
+        val right = (flags and (1 shl 3)) != 0
+        val jump = (flags and (1 shl 4)) != 0
         val sneaking = (flags and (1 shl 5)) != 0
         val sprinting = (flags and (1 shl 6)) != 0
-        val swimming = sprinting && sneaking && !session.onGround
-        PlayerSessionManager.updateAndBroadcastPlayerState(
-            session.channelId,
+        val swimming = (flags and (1 shl 7)) != 0
+        PlayerSessionManager.updatePlayerInputState(
+            channelId = session.channelId,
+            forward = forward,
+            backward = backward,
+            left = left,
+            right = right,
+            jump = jump,
             sneaking = sneaking,
             sprinting = sprinting,
             swimming = swimming
         )
+    }
+
+    private fun tryHandlePlayerInputByShape(packetId: Int, buf: ByteBuf): Boolean {
+        if (buf.readableBytes() != 1) return false
+        // Avoid stealing known on-ground status packets.
+        if (packetId == 0x1D || packetId == 0x20) return false
+        if (packetId !in 0x24..0x30) return false
+        buf.markReaderIndex()
+        val flags = try {
+            buf.readUnsignedByte().toInt()
+        } catch (_: Throwable) {
+            buf.resetReaderIndex()
+            return false
+        }
+        val forward = (flags and (1 shl 0)) != 0
+        val backward = (flags and (1 shl 1)) != 0
+        val left = (flags and (1 shl 2)) != 0
+        val right = (flags and (1 shl 3)) != 0
+        val jump = (flags and (1 shl 4)) != 0
+        val sneaking = (flags and (1 shl 5)) != 0
+        val sprinting = (flags and (1 shl 6)) != 0
+        val swimming = (flags and (1 shl 7)) != 0
+        PlayerSessionManager.updatePlayerInputState(
+            channelId = session.channelId,
+            forward = forward,
+            backward = backward,
+            left = left,
+            right = right,
+            jump = jump,
+            sneaking = sneaking,
+            sprinting = sprinting,
+            swimming = swimming
+        )
+        return true
+    }
+
+    private fun handleMoveVehicle(buf: ByteBuf) {
+        if (session.ridingAnimalEntityId < 0) return
+        val expectedBytes = (8 * 3) + (4 * 2) + 1 // x,y,z,yaw,pitch,onGround
+        if (buf.readableBytes() != expectedBytes) return
+        buf.markReaderIndex()
+        try {
+            val x = buf.readDouble()
+            val y = buf.readDouble()
+            val z = buf.readDouble()
+            val yaw = buf.readFloat()
+            val pitch = buf.readFloat()
+            val onGround = buf.readBoolean()
+            if (buf.readableBytes() != 0) {
+                buf.resetReaderIndex()
+                return
+            } else {
+                PlayerSessionManager.captureClientVehicleMove(
+                    channelId = session.channelId,
+                    x = x,
+                    y = y,
+                    z = z,
+                    yaw = yaw,
+                    pitch = pitch,
+                    onGround = onGround
+                )
+            }
+        } catch (_: Throwable) {
+            buf.resetReaderIndex()
+        }
     }
 
     private fun handleAnimation(buf: ByteBuf) {
@@ -319,10 +471,11 @@ class PlayHandler(
         } catch (_: Throwable) {
             return
         }
+        var hand = 0
         when (actionType) {
             0 -> { // interact
                 try {
-                    NetworkUtils.readVarInt(buf) // hand
+                    hand = NetworkUtils.readVarInt(buf)
                 } catch (_: Throwable) {
                     return
                 }
@@ -333,7 +486,7 @@ class PlayHandler(
                 buf.readFloat()
                 buf.readFloat()
                 try {
-                    NetworkUtils.readVarInt(buf) // hand
+                    hand = NetworkUtils.readVarInt(buf)
                 } catch (_: Throwable) {
                     return
                 }
@@ -348,6 +501,12 @@ class PlayHandler(
         }
         if (actionType == 1) {
             PlayerSessionManager.handlePlayerAttackEntity(session.channelId, targetEntityId)
+        } else if (actionType == 0) {
+            PlayerSessionManager.handlePlayerInteractEntity(
+                channelId = session.channelId,
+                targetEntityId = targetEntityId,
+                hand = hand
+            )
         }
     }
 
@@ -382,6 +541,12 @@ class PlayHandler(
                 channelId = session.channelId,
                 dropStack = action == 3
             )
+            PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
+            return
+        }
+        // RELEASE_USE_ITEM
+        if (action == 5) {
+            PlayerSessionManager.handleReleaseUseItem(session.channelId)
             PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
             return
         }
@@ -452,6 +617,9 @@ class PlayHandler(
             x = target.x,
             y = target.y,
             z = target.z,
+            clickedX = clicked.x,
+            clickedY = clicked.y,
+            clickedZ = clicked.z,
             hand = hand,
             faceId = faceId,
             cursorX = cursorX,
@@ -459,6 +627,71 @@ class PlayHandler(
             cursorZ = cursorZ
         )
         PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
+    }
+
+    private fun handleUseItem(buf: ByteBuf) {
+        val hand = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            return
+        }
+        if (hand !in 0..1) return
+        // 1.21.11: UseItem carries at least hand + sequence.
+        // Parse sequence strictly so unrelated packets (e.g. container close) cannot be misclassified.
+        val sequence = try {
+            NetworkUtils.readVarInt(buf) // sequence
+        } catch (_: Throwable) {
+            return
+        }
+        // Some revisions include yaw/pitch (float, float). If present, consume exactly 8 bytes.
+        val remaining = buf.readableBytes()
+        if (remaining == 8) {
+            if (buf.readableBytes() < 8) return
+            buf.readFloat()
+            buf.readFloat()
+        } else if (remaining != 0) {
+            return
+        }
+        PlayerSessionManager.handleUseItem(session.channelId, hand)
+        PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
+    }
+
+    private fun handleContainerClick(buf: ByteBuf) {
+        val containerId = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            return
+        }
+        val stateId = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            return
+        }
+        if (buf.readableBytes() < 3) return
+        val slot = buf.readShort().toInt()
+        val button = buf.readByte().toInt()
+        val clickType = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            return
+        }
+        PlayerSessionManager.handleContainerClick(
+            channelId = session.channelId,
+            containerId = containerId,
+            _stateId = stateId,
+            slot = slot,
+            button = button,
+            clickType = clickType
+        )
+    }
+
+    private fun handleContainerClose(buf: ByteBuf) {
+        val containerId = try {
+            NetworkUtils.readVarInt(buf)
+        } catch (_: Throwable) {
+            return
+        }
+        PlayerSessionManager.handleContainerClose(session.channelId, containerId)
     }
 
     private fun handleMovePosition(buf: ByteBuf) {
@@ -553,9 +786,46 @@ class PlayHandler(
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
         keepAliveTask?.cancel(false)
-        logger.error("PlayHandler exception for player={} channel={}", session.profile.username, session.channelId, cause)
+        if (isPeerDisconnect(cause) || !ctx.channel().isActive) {
+            logger.info(
+                "Play connection closed: player={} channel={} reason={}",
+                session.profile.username,
+                session.channelId,
+                disconnectReason(cause)
+            )
+        } else {
+            logger.error("PlayHandler exception for player={} channel={}", session.profile.username, session.channelId, cause)
+        }
         PlayerSessionManager.leave(session.channelId)
         ctx.close()
+    }
+
+    private fun isPeerDisconnect(throwable: Throwable?): Boolean {
+        var current = throwable
+        while (current != null) {
+            if (current is ClosedChannelException) return true
+            if (current is IOException) {
+                val msg = current.message?.lowercase(Locale.ROOT).orEmpty()
+                if (
+                    msg.contains("connection reset") ||
+                    msg.contains("broken pipe") ||
+                    msg.contains("forcibly closed") ||
+                    msg.contains("connection aborted") ||
+                    msg.contains("connection closed")
+                ) {
+                    return true
+                }
+            }
+            if (current.javaClass.name == "io.netty.channel.unix.Errors\$NativeIoException") return true
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun disconnectReason(throwable: Throwable?): String {
+        val type = throwable?.javaClass?.simpleName ?: "unknown"
+        val message = throwable?.message?.takeIf { it.isNotBlank() } ?: "closed"
+        return "$type: $message"
     }
 
     private fun readBoundedString(buf: ByteBuf, maxLength: Int): String? {

@@ -44,6 +44,14 @@ object FoliaSharedMemoryWorldGenerator : WorldGenerator, BlockStateLookupWorldGe
         return client.blockStateAtIfCached(worldKey, x, y, z)
     }
 
+    override fun rawBrightnessAt(worldKey: String, x: Int, y: Int, z: Int): Int {
+        return client.rawBrightnessAt(worldKey, x, y, z)
+    }
+
+    override fun rawBrightnessAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? {
+        return client.rawBrightnessAtIfCached(worldKey, x, y, z)
+    }
+
     fun retainLoadedChunks(worldKey: String, chunks: Set<ChunkPos>) {
         client.retainLoadedChunks(worldKey, chunks)
     }
@@ -121,6 +129,7 @@ private class FoliaSharedMemoryChunkClient {
 
     @Volatile
     private var initialized = false
+    private val mappingInProgress = AtomicBoolean(false)
     private val recoveryInProgress = AtomicBoolean(false)
 
     private data class ChunkCacheKey(
@@ -131,6 +140,7 @@ private class FoliaSharedMemoryChunkClient {
 
     private class ChunkCacheEntry {
         val snapshot = AtomicReference<ChunkStateSnapshot?>()
+        val light = AtomicReference<ChunkLightSnapshot?>()
         val decodeTask = AtomicReference<CompletableFuture<ChunkStateSnapshot>?>()
         val loadTask = AtomicReference<CompletableFuture<ChunkStateSnapshot?>?>()
     }
@@ -145,6 +155,37 @@ private class FoliaSharedMemoryChunkClient {
             val section = sections[sectionIndex]
             val localIndex = ((y and 15) shl 8) or ((z and 15) shl 4) or (x and 15)
             return section.blockStateAt(localIndex)
+        }
+    }
+
+    private data class ChunkLightSnapshot(
+        val minSectionY: Int,
+        val skySectionToArrayIndex: IntArray,
+        val blockSectionToArrayIndex: IntArray,
+        val skyLightArrays: List<ByteArray>,
+        val blockLightArrays: List<ByteArray>
+    ) {
+        fun rawBrightnessAt(x: Int, y: Int, z: Int): Int {
+            val sectionY = y shr 4
+            val lightSection = sectionY - minSectionY + 1
+            if (lightSection !in skySectionToArrayIndex.indices) return 0
+            val localIndex = ((y and 15) shl 8) or ((z and 15) shl 4) or (x and 15)
+            val sky = nibbleAt(skyLightArrays, skySectionToArrayIndex[lightSection], localIndex)
+            val block = nibbleAt(blockLightArrays, blockSectionToArrayIndex[lightSection], localIndex)
+            return if (sky >= block) sky else block
+        }
+
+        private fun nibbleAt(arrays: List<ByteArray>, arrayIndex: Int, blockIndex: Int): Int {
+            if (arrayIndex < 0 || arrayIndex >= arrays.size) return 0
+            val section = arrays[arrayIndex]
+            val byteIndex = blockIndex ushr 1
+            if (byteIndex !in section.indices) return 0
+            val value = section[byteIndex].toInt() and 0xFF
+            return if ((blockIndex and 1) == 0) {
+                value and 0x0F
+            } else {
+                (value ushr 4) and 0x0F
+            }
         }
     }
 
@@ -218,7 +259,11 @@ private class FoliaSharedMemoryChunkClient {
                         FoliaSharedProtocol.RESPONSE_STATE_SUCCESS -> {
                             val decoded = decodeSuccessPayload(slot, context.worldKey)
                             clearRequestResponseState(slot)
-                            cacheDecodedChunk(context, decoded.snapshot)
+                            cacheDecodedChunk(
+                                context = context,
+                                snapshot = decoded.snapshot,
+                                light = decodeChunkLightSnapshot(context.worldKey, decoded.chunk)
+                            )
                             return decoded.chunk
                         }
                         FoliaSharedProtocol.RESPONSE_STATE_ERROR -> {
@@ -267,6 +312,23 @@ private class FoliaSharedMemoryChunkClient {
         val entry = chunkCache[chunkKey] ?: return null
         val snapshot = entry.snapshot.get() ?: return null
         return snapshot.blockStateAt(x, y, z)
+    }
+
+    fun rawBrightnessAt(worldKey: String, x: Int, y: Int, z: Int): Int {
+        val chunkKey = ChunkCacheKey(worldKey, x shr 4, z shr 4)
+        var light = chunkCache[chunkKey]?.light?.get()
+        if (light == null) {
+            requestAndAwaitSnapshot(chunkKey)
+            light = chunkCache[chunkKey]?.light?.get()
+        }
+        return light?.rawBrightnessAt(x, y, z) ?: 0
+    }
+
+    fun rawBrightnessAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? {
+        val chunkKey = ChunkCacheKey(worldKey, x shr 4, z shr 4)
+        val entry = chunkCache[chunkKey] ?: return null
+        val light = entry.light.get() ?: return null
+        return light.rawBrightnessAt(x, y, z)
     }
 
     fun retainLoadedChunks(worldKey: String, chunks: Set<ChunkPos>) {
@@ -382,76 +444,87 @@ private class FoliaSharedMemoryChunkClient {
 
     private fun ensureMapped() {
         if (initialized) return
-        synchronized(this) {
-            if (initialized) return
+        if (mappingInProgress.compareAndSet(false, true)) {
+            try {
+                if (initialized) return
 
-            val requestedSlotCount = configuredSlotCount()
-            val availableSlotIndexes = waitForReadyAndDiscoverSlots(requestedSlotCount)
-            slots.ensureCapacity(availableSlotIndexes.size)
+                val requestedSlotCount = configuredSlotCount()
+                val availableSlotIndexes = waitForReadyAndDiscoverSlots(requestedSlotCount)
+                slots.ensureCapacity(availableSlotIndexes.size)
 
-            for (slotIndex in availableSlotIndexes) {
-                val requestFile = ipcDir.resolve("chunk-request-$slotIndex.mmap")
-                val responseFile = ipcDir.resolve("chunk-response-$slotIndex.mmap")
+                for (slotIndex in availableSlotIndexes) {
+                    val requestFile = ipcDir.resolve("chunk-request-$slotIndex.mmap")
+                    val responseFile = ipcDir.resolve("chunk-response-$slotIndex.mmap")
 
-                val requestChannel = FileChannel.open(
-                    requestFile,
-                    StandardOpenOption.READ,
-                    StandardOpenOption.WRITE
-                )
-                val responseChannel = FileChannel.open(
-                    responseFile,
-                    StandardOpenOption.READ,
-                    StandardOpenOption.WRITE
-                )
+                    val requestChannel = FileChannel.open(
+                        requestFile,
+                        StandardOpenOption.READ,
+                        StandardOpenOption.WRITE
+                    )
+                    val responseChannel = FileChannel.open(
+                        responseFile,
+                        StandardOpenOption.READ,
+                        StandardOpenOption.WRITE
+                    )
 
-                require(requestChannel.size() >= FoliaSharedProtocol.REQUEST_FILE_SIZE.toLong()) {
-                    "Invalid request mmap size for slot=$slotIndex: ${requestChannel.size()}"
+                    require(requestChannel.size() >= FoliaSharedProtocol.REQUEST_FILE_SIZE.toLong()) {
+                        "Invalid request mmap size for slot=$slotIndex: ${requestChannel.size()}"
+                    }
+                    require(responseChannel.size() >= FoliaSharedProtocol.RESPONSE_FILE_SIZE.toLong()) {
+                        "Invalid response mmap size for slot=$slotIndex: ${responseChannel.size()}"
+                    }
+
+                    val requestBuffer = requestChannel.map(
+                        FileChannel.MapMode.READ_WRITE,
+                        0L,
+                        FoliaSharedProtocol.REQUEST_FILE_SIZE.toLong()
+                    ) as MappedByteBuffer
+                    requestBuffer.order(ByteOrder.BIG_ENDIAN)
+
+                    val responseBuffer = responseChannel.map(
+                        FileChannel.MapMode.READ_WRITE,
+                        0L,
+                        FoliaSharedProtocol.RESPONSE_FILE_SIZE.toLong()
+                    ) as MappedByteBuffer
+                    responseBuffer.order(ByteOrder.BIG_ENDIAN)
+
+                    val slot = IpcSlot(
+                        index = slotIndex,
+                        requestChannel = requestChannel,
+                        responseChannel = responseChannel,
+                        requestBuffer = requestBuffer,
+                        responseBuffer = responseBuffer
+                    )
+                    initializeHeadersIfNeeded(slot)
+                    slots.add(slot)
                 }
-                require(responseChannel.size() >= FoliaSharedProtocol.RESPONSE_FILE_SIZE.toLong()) {
-                    "Invalid response mmap size for slot=$slotIndex: ${responseChannel.size()}"
+
+                require(slots.isNotEmpty()) { "Folia bridge exposed no IPC slots in $ipcDir" }
+                if (slots.size != requestedSlotCount) {
+                    logger.warn(
+                        "Folia bridge slot mismatch (requested={}, available={}); using available slot count",
+                        requestedSlotCount,
+                        slots.size
+                    )
                 }
 
-                val requestBuffer = requestChannel.map(
-                    FileChannel.MapMode.READ_WRITE,
-                    0L,
-                    FoliaSharedProtocol.REQUEST_FILE_SIZE.toLong()
-                ) as MappedByteBuffer
-                requestBuffer.order(ByteOrder.BIG_ENDIAN)
-
-                val responseBuffer = responseChannel.map(
-                    FileChannel.MapMode.READ_WRITE,
-                    0L,
-                    FoliaSharedProtocol.RESPONSE_FILE_SIZE.toLong()
-                ) as MappedByteBuffer
-                responseBuffer.order(ByteOrder.BIG_ENDIAN)
-
-                val slot = IpcSlot(
-                    index = slotIndex,
-                    requestChannel = requestChannel,
-                    responseChannel = responseChannel,
-                    requestBuffer = requestBuffer,
-                    responseBuffer = responseBuffer
-                )
-                initializeHeadersIfNeeded(slot)
-                slots.add(slot)
+                slotBusy = AtomicIntegerArray(slots.size)
+                initialized = true
+            } finally {
+                mappingInProgress.set(false)
             }
-
-            require(slots.isNotEmpty()) { "Folia bridge exposed no IPC slots in $ipcDir" }
-            if (slots.size != requestedSlotCount) {
-                logger.warn(
-                    "Folia bridge slot mismatch (requested={}, available={}); using available slot count",
-                    requestedSlotCount,
-                    slots.size
-                )
-            }
-
-            slotBusy = AtomicIntegerArray(slots.size)
-            initialized = true
+            return
+        }
+        while (mappingInProgress.get() && !initialized) {
+            Thread.onSpinWait()
         }
     }
 
     private fun resetMappings() {
-        synchronized(this) {
+        while (!mappingInProgress.compareAndSet(false, true)) {
+            Thread.onSpinWait()
+        }
+        try {
             if (!initialized && slots.isEmpty()) return
             for (slot in slots) {
                 runCatching { slot.requestChannel.close() }
@@ -461,6 +534,8 @@ private class FoliaSharedMemoryChunkClient {
             slotBusy = null
             threadSlot.remove()
             initialized = false
+        } finally {
+            mappingInProgress.set(false)
         }
     }
 
@@ -731,10 +806,17 @@ private class FoliaSharedMemoryChunkClient {
         scheduleSnapshotDecode(context, chunkData)
     }
 
-    private fun cacheDecodedChunk(context: ChunkGenerationContext, snapshot: ChunkStateSnapshot) {
+    private fun cacheDecodedChunk(
+        context: ChunkGenerationContext,
+        snapshot: ChunkStateSnapshot,
+        light: ChunkLightSnapshot? = null
+    ) {
         val key = ChunkCacheKey(context.worldKey, context.chunkPos.x, context.chunkPos.z)
         val entry = chunkCache.computeIfAbsent(key) { ChunkCacheEntry() }
         val previous = entry.snapshot.getAndSet(snapshot)
+        if (light != null) {
+            entry.light.set(light)
+        }
         if (previous == null) {
             decodedChunkOrder.addLast(key)
         }
@@ -756,6 +838,7 @@ private class FoliaSharedMemoryChunkClient {
             attempts = 0
             val entry = chunkCache[oldest] ?: continue
             entry.snapshot.set(null)
+            entry.light.set(null)
             if (entry.decodeTask.get() == null && entry.loadTask.get() == null && !retainedChunkKeys.contains(oldest)) {
                 chunkCache.remove(oldest, entry)
             }
@@ -796,6 +879,61 @@ private class FoliaSharedMemoryChunkClient {
             "minecraft:the_nether", "minecraft:the_end" -> DEFAULT_MIN_Y
             else -> OVERWORLD_MIN_Y
         }
+    }
+
+    private fun decodeChunkLightSnapshot(worldKey: String, generated: GeneratedChunk): ChunkLightSnapshot? {
+        if (generated.skyLightMask.isEmpty() && generated.blockLightMask.isEmpty()) return null
+        val minSectionY = minYForWorld(worldKey) shr 4
+        val sectionCount = maxOf(
+            generated.skyLightMask.size * Long.SIZE_BITS,
+            generated.blockLightMask.size * Long.SIZE_BITS,
+            generated.emptySkyLightMask.size * Long.SIZE_BITS,
+            generated.emptyBlockLightMask.size * Long.SIZE_BITS
+        )
+        if (sectionCount <= 0) return null
+        return ChunkLightSnapshot(
+            minSectionY = minSectionY,
+            skySectionToArrayIndex = decodeLightSectionIndexes(
+                presentMask = generated.skyLightMask,
+                emptyMask = generated.emptySkyLightMask,
+                sectionCount = sectionCount
+            ),
+            blockSectionToArrayIndex = decodeLightSectionIndexes(
+                presentMask = generated.blockLightMask,
+                emptyMask = generated.emptyBlockLightMask,
+                sectionCount = sectionCount
+            ),
+            skyLightArrays = generated.skyLight,
+            blockLightArrays = generated.blockLight
+        )
+    }
+
+    private fun decodeLightSectionIndexes(
+        presentMask: LongArray,
+        emptyMask: LongArray,
+        sectionCount: Int
+    ): IntArray {
+        val out = IntArray(sectionCount) { -1 }
+        var dataArrayIndex = 0
+        for (sectionIndex in 0 until sectionCount) {
+            if (isMaskBitSet(emptyMask, sectionIndex)) {
+                out[sectionIndex] = -1
+                continue
+            }
+            if (!isMaskBitSet(presentMask, sectionIndex)) {
+                continue
+            }
+            out[sectionIndex] = dataArrayIndex
+            dataArrayIndex++
+        }
+        return out
+    }
+
+    private fun isMaskBitSet(mask: LongArray, bitIndex: Int): Boolean {
+        val word = bitIndex ushr 6
+        if (word !in mask.indices) return false
+        val bit = bitIndex and 63
+        return (mask[word] and (1L shl bit)) != 0L
     }
 
     private fun readBlockSection(reader: ByteArrayReader): SectionState {

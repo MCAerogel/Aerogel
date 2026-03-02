@@ -56,7 +56,7 @@ private object FoliaRuntimeBootstrap {
         .build()
 
     private val started = AtomicBoolean(false)
-    private val restartLock = Any()
+    private val restarting = AtomicBoolean(false)
     @Volatile
     private var process: Process? = null
 
@@ -71,9 +71,14 @@ private object FoliaRuntimeBootstrap {
     }
 
     fun restart(configuredChunkWorkerThreads: Int) {
-        synchronized(restartLock) {
+        while (!restarting.compareAndSet(false, true)) {
+            Thread.onSpinWait()
+        }
+        try {
             stop()
             ensureReady(configuredChunkWorkerThreads)
+        } finally {
+            restarting.set(false)
         }
     }
 

@@ -7,7 +7,6 @@ object PerformanceMonitor {
     private const val REPORT_INTERVAL_NANOS = 500_000_000L
     private const val LOG_TO_CONSOLE = false
 
-    private val lock = Any()
     private var windowStartNanos: Long = System.nanoTime()
     private var ticks: Long = 0L
     private var msptSumNanos: Long = 0L
@@ -24,14 +23,12 @@ object PerformanceMonitor {
         private set
 
     fun start() {
-        synchronized(lock) {
-            windowStartNanos = System.nanoTime()
-            ticks = 0L
-            msptSumNanos = 0L
-            rawMspt = 0.0
-            mspt = 0.0
-            tps = 0.0
-        }
+        windowStartNanos = System.nanoTime()
+        ticks = 0L
+        msptSumNanos = 0L
+        rawMspt = 0.0
+        mspt = 0.0
+        tps = 0.0
     }
 
     fun recordTick(tickStartNanos: Long, tickEndNanos: Long) {
@@ -39,25 +36,23 @@ object PerformanceMonitor {
         val tickMs = tickDurationNanos / 1_000_000.0
         rawMspt = tickMs
 
-        synchronized(lock) {
-            mspt = tickMs
-            msptSumNanos += tickDurationNanos
-            ticks += 1
+        mspt = tickMs
+        msptSumNanos += tickDurationNanos
+        ticks += 1
 
-            val windowElapsed = tickEndNanos - windowStartNanos
-            if (windowElapsed >= REPORT_INTERVAL_NANOS) {
-                val seconds = windowElapsed / 1_000_000_000.0
-                tps = if (seconds <= 0.0) 0.0 else ticks / seconds
-                val avgMs = if (ticks == 0L) 0.0 else (msptSumNanos / ticks) / 1_000_000.0
-                mspt = avgMs
-                if (LOG_TO_CONSOLE) {
-                    ServerI18n.log("aerogel.log.perf", format(tps), format(avgMs))
-                }
-
-                windowStartNanos = tickEndNanos
-                ticks = 0L
-                msptSumNanos = 0L
+        val windowElapsed = tickEndNanos - windowStartNanos
+        if (windowElapsed >= REPORT_INTERVAL_NANOS) {
+            val seconds = windowElapsed / 1_000_000_000.0
+            tps = if (seconds <= 0.0) 0.0 else ticks / seconds
+            val avgMs = if (ticks == 0L) 0.0 else (msptSumNanos / ticks) / 1_000_000.0
+            mspt = avgMs
+            if (LOG_TO_CONSOLE) {
+                ServerI18n.log("aerogel.log.perf", format(tps), format(avgMs))
             }
+
+            windowStartNanos = tickEndNanos
+            ticks = 0L
+            msptSumNanos = 0L
         }
     }
 

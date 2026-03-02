@@ -35,7 +35,25 @@ object WorldManager {
             } else {
                 { x, y, z -> lookupGenerator.blockStateAtIfCached(worldKey, x, y, z) }
             }
-            registerWorld(worldKey, seed, generator, baseProvider, cachedProvider)
+            val rawBrightnessProvider: (Int, Int, Int) -> Int = if (lookupGenerator == null) {
+                { _, _, _ -> 0 }
+            } else {
+                { x, y, z -> lookupGenerator.rawBrightnessAt(worldKey, x, y, z) }
+            }
+            val cachedRawBrightnessProvider: (Int, Int, Int) -> Int? = if (lookupGenerator == null) {
+                { _, _, _ -> null }
+            } else {
+                { x, y, z -> lookupGenerator.rawBrightnessAtIfCached(worldKey, x, y, z) }
+            }
+            registerWorld(
+                key = worldKey,
+                seed = seed,
+                generator = generator,
+                baseBlockStateProvider = baseProvider,
+                cachedBlockStateProvider = cachedProvider,
+                rawBrightnessProvider = rawBrightnessProvider,
+                cachedRawBrightnessProvider = cachedRawBrightnessProvider
+            )
         }
         defaultWorldKey = defaultWorld?.takeIf { worlds.containsKey(it) } ?: "minecraft:overworld"
         prewarmWorldsAsync()
@@ -62,9 +80,19 @@ object WorldManager {
         seed: Long,
         generator: WorldGenerator,
         baseBlockStateProvider: (Int, Int, Int) -> Int = { _, _, _ -> AIR_STATE_ID },
-        cachedBlockStateProvider: (Int, Int, Int) -> Int? = { _, _, _ -> null }
+        cachedBlockStateProvider: (Int, Int, Int) -> Int? = { _, _, _ -> null },
+        rawBrightnessProvider: (Int, Int, Int) -> Int = { _, _, _ -> 0 },
+        cachedRawBrightnessProvider: (Int, Int, Int) -> Int? = { _, _, _ -> null }
     ): World {
-        val world = World(key, seed, generator, baseBlockStateProvider, cachedBlockStateProvider)
+        val world = World(
+            key = key,
+            seed = seed,
+            generator = generator,
+            baseBlockStateProvider = baseBlockStateProvider,
+            cachedBlockStateProvider = cachedBlockStateProvider,
+            rawBrightnessProvider = rawBrightnessProvider,
+            cachedRawBrightnessProvider = cachedRawBrightnessProvider
+        )
         worlds[key] = world
         return world
     }

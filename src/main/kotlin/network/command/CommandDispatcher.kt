@@ -33,6 +33,7 @@ class CommandDispatcher(
                     "teleport" to TpCommand,
                     "gamemode" to GamemodeCommand,
                     "time" to TimeCommand,
+                    "perf" to PerfCommand,
                     "stop" to StopCommand
                 )
             )

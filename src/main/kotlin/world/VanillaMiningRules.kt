@@ -38,6 +38,11 @@ object VanillaMiningRules {
         val heldToolKey: String?
     )
 
+    private data class HarvestKey(
+        val blockKey: String,
+        val heldItemId: Int
+    )
+
     private val json = Json { ignoreUnknownKeys = true }
     private val itemKeysById by lazy {
         val resource = VanillaMiningRules::class.java.classLoader
@@ -61,19 +66,24 @@ object VanillaMiningRules {
         }
         out
     }
-    private val vanillaJar by lazy {
+    private val vanillaJarPath by lazy {
         val candidates = listOf(
             Path.of("versions/1.21.11/server-1.21.11.jar"),
             Path.of(".gradle-local/minecraft/1.21.11/server-bundled.jar"),
             Path.of(".gradle-local/minecraft/1.21.11/server-1.21.11-obf.jar")
         )
-        val jarPath = candidates.firstOrNull { Files.isRegularFile(it) }
+        candidates.firstOrNull { Files.isRegularFile(it) }
             ?: error("Missing local vanilla server jar for mining rules")
-        JarFile(jarPath.toFile())
+    }
+    private val vanillaJar by lazy {
+        JarFile(vanillaJarPath.toFile())
     }
     private val blockTagCache = ConcurrentHashMap<String, Set<String>>()
     private val itemTagCache = ConcurrentHashMap<String, Set<String>>()
     private val lootTableCache = ConcurrentHashMap<String, JsonObject?>()
+    private val canHarvestCache = ConcurrentHashMap<HarvestKey, Boolean>()
+    private val toolTypeByItemIdCache = ConcurrentHashMap<Int, ToolType?>()
+    private val incorrectTagByItemIdCache = ConcurrentHashMap<Int, String?>()
 
     private val incorrectToolTags = listOf(
         "incorrect_for_wooden_tool",
@@ -104,6 +114,7 @@ object VanillaMiningRules {
         // Shift first-break lazy costs to startup.
         itemKeysById.size
         itemIdsByKey.size
+        vanillaJar.size()
         val toolTags = listOf("pickaxes", "axes", "shovels", "hoes", "swords")
         for (tag in toolTags) {
             itemTag(tag).size
@@ -122,6 +133,33 @@ object VanillaMiningRules {
         }
         for (blockKey in commonFirstBreakBlockKeys) {
             lootTableForBlock(blockKey)
+        }
+
+        // Eagerly load loot tables for all known block keys to avoid first-hit stalls.
+        val allBlockKeys = LinkedHashSet<String>()
+        for (stateId in BlockStateRegistry.allStateIds()) {
+            val blockKey = BlockStateRegistry.parsedState(stateId)?.blockKey ?: continue
+            allBlockKeys.add(blockKey)
+        }
+        for (blockKey in allBlockKeys) {
+            lootTableForBlock(blockKey)
+            canHarvestCache.putIfAbsent(HarvestKey(blockKey, -1), canHarvestDropsNoCache(blockKey, -1))
+        }
+
+        // Warm common tool classifications/harvest checks once.
+        val toolItemIds = LinkedHashSet<Int>()
+        for (itemKey in itemTag("pickaxes")) itemIdsByKey[itemKey]?.let { toolItemIds.add(it) }
+        for (itemKey in itemTag("axes")) itemIdsByKey[itemKey]?.let { toolItemIds.add(it) }
+        for (itemKey in itemTag("shovels")) itemIdsByKey[itemKey]?.let { toolItemIds.add(it) }
+        for (itemKey in itemTag("hoes")) itemIdsByKey[itemKey]?.let { toolItemIds.add(it) }
+        for (itemKey in itemTag("swords")) itemIdsByKey[itemKey]?.let { toolItemIds.add(it) }
+        itemIdsByKey["minecraft:shears"]?.let { toolItemIds.add(it) }
+        for (toolItemId in toolItemIds) {
+            classifyToolTypeCached(toolItemId)
+            incorrectTagForItemId(toolItemId)
+            for (blockKey in allBlockKeys) {
+                canHarvestCache.putIfAbsent(HarvestKey(blockKey, toolItemId), canHarvestDropsNoCache(blockKey, toolItemId))
+            }
         }
     }
 
@@ -157,16 +195,35 @@ object VanillaMiningRules {
     }
 
     private fun canHarvestDrops(blockKey: String, heldItemId: Int): Boolean {
+        return canHarvestCache.computeIfAbsent(HarvestKey(blockKey, heldItemId)) {
+            canHarvestDropsNoCache(blockKey, heldItemId)
+        }
+    }
+
+    private fun canHarvestDropsNoCache(blockKey: String, heldItemId: Int): Boolean {
         if (!requiresCorrectToolForDrops(blockKey)) return true
-        val toolKey = itemKey(heldItemId) ?: return false
-        val toolType = classifyToolType(toolKey) ?: return false
+        val toolType = classifyToolTypeCached(heldItemId) ?: return false
         if (!toolMatchesMineableTag(blockKey, toolType)) return false
 
-        val incorrectTag = incorrectTagForTool(toolKey)
+        val incorrectTag = incorrectTagForItemId(heldItemId)
         if (incorrectTag != null && blockTag(incorrectTag).contains(blockKey)) {
             return false
         }
         return true
+    }
+
+    private fun classifyToolTypeCached(heldItemId: Int): ToolType? {
+        return toolTypeByItemIdCache.computeIfAbsent(heldItemId) { itemId ->
+            val toolKey = itemKey(itemId) ?: return@computeIfAbsent null
+            classifyToolType(toolKey)
+        }
+    }
+
+    private fun incorrectTagForItemId(heldItemId: Int): String? {
+        return incorrectTagByItemIdCache.computeIfAbsent(heldItemId) { itemId ->
+            val toolKey = itemKey(itemId) ?: return@computeIfAbsent null
+            incorrectTagForTool(toolKey)
+        }
     }
 
     private fun requiresCorrectToolForDrops(blockKey: String): Boolean {

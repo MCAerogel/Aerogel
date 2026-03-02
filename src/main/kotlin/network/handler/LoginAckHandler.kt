@@ -21,4 +21,8 @@ class LoginAckHandler(private val profile: ConnectionProfile) : SimpleChannelInb
         ctx.writeAndFlush(ConfigurationPackets.tagsPacket())
         ctx.writeAndFlush(ConfigurationPackets.finishConfigurationPacket())
     }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        ctx.close()
+    }
 }

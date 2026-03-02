@@ -168,12 +168,12 @@ class FallingBlockSystem(
     fun tick(
         deltaSeconds: Double,
         activeSimulationChunks: Set<ChunkPos>? = null,
+        chunkDeltaSecondsProvider: ((ChunkPos) -> Double)? = null,
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): FallingBlockTickEvents {
         if (deltaSeconds <= 0.0) return FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
         if (entities.isEmpty()) return FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
 
-        val tickScale = deltaSeconds * 20.0
         val spawned = ArrayList<FallingBlockSnapshot>()
         val updated = ArrayList<FallingBlockSnapshot>()
         val removed = ArrayList<FallingBlockRemovedEvent>()
@@ -189,6 +189,9 @@ class FallingBlockSystem(
             val chunkPos = ChunkPos(entity.chunkX, entity.chunkZ)
             val shouldSimulate = activeSimulationChunks == null || activeSimulationChunks.contains(chunkPos)
             if (!shouldSimulate) continue
+            val chunkDeltaSeconds = (chunkDeltaSecondsProvider?.invoke(chunkPos) ?: deltaSeconds)
+            if (chunkDeltaSeconds <= 0.0) continue
+            val tickScale = chunkDeltaSeconds * 20.0
 
             val startedAtNanos = System.nanoTime()
             val oldX = entity.x
