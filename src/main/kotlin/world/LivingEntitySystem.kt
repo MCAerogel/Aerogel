@@ -636,7 +636,7 @@ class AnimalSystem(
             applyBodyAndHeadRotationControl(entity, brain, oldX, oldZ, tickScale)
             updateFallDistance(entity, oldY)
             if (!entity.dead && !oldOnGround && entity.onGround) {
-                val fallDamage = ceil(entity.fallDistance - SAFE_FALL_DISTANCE_BLOCKS).toInt()
+                val fallDamage = floor((entity.fallDistance + FALL_DAMAGE_EPSILON - SAFE_FALL_DISTANCE_BLOCKS) * FALL_DAMAGE_MULTIPLIER).toInt()
                 entity.fallDistance = 0.0
                 if (fallDamage > 0) {
                     val result = applyDamageInternal(entity, fallDamage.toFloat(), AnimalDamageCause.FALL)
@@ -689,9 +689,10 @@ class AnimalSystem(
 
     private fun updateFallDistance(entity: AnimalEntity, oldY: Double) {
         val deltaY = entity.y - oldY
+        val inWater = isWaterAt(entity.x, entity.y, entity.z) || isWaterAt(entity.x, entity.y + entity.hitboxHeight * 0.5, entity.z)
         when {
             entity.onGround -> Unit
-            deltaY < 0.0 -> entity.fallDistance += -deltaY
+            !inWater && deltaY < 0.0 -> entity.fallDistance += -deltaY
             deltaY > 0.0 -> entity.fallDistance = 0.0
         }
     }
@@ -1960,6 +1961,8 @@ class AnimalSystem(
         private val logger = LoggerFactory.getLogger(AnimalSystem::class.java)
         private val json = Json { ignoreUnknownKeys = true }
         private const val SAFE_FALL_DISTANCE_BLOCKS = 3.0
+        private const val FALL_DAMAGE_MULTIPLIER = 1.0
+        private const val FALL_DAMAGE_EPSILON = 1.0e-6
         private const val TICKS_PER_SECOND = 20.0
         private const val GRAVITY_PER_TICK = 0.08
         // Vanilla living-entity horizontal damping:

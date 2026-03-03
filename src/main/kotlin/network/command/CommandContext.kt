@@ -18,6 +18,7 @@ interface CommandContext {
         vararg args: PlayPackets.ChatComponent
     )
     fun sendSourceTranslation(target: PlayerSession?, key: String, vararg args: PlayPackets.ChatComponent)
+    fun sendSourceSuccessTranslation(target: PlayerSession?, key: String, vararg args: PlayPackets.ChatComponent)
     fun sendSourceErrorTranslation(target: PlayerSession?, key: String, vararg args: PlayPackets.ChatComponent)
     fun sendSourceWarnTranslation(target: PlayerSession?, key: String, vararg args: PlayPackets.ChatComponent)
     fun sendTranslationFromTerminal(target: PlayerSession, key: String, vararg args: PlayPackets.ChatComponent)
@@ -41,5 +42,9 @@ interface CommandContext {
     fun worldTimeSnapshot(worldKey: String): Pair<Long, Long>?
     fun setWorldTime(worldKey: String, timeOfDayTicks: Long): Pair<Long, Long>?
     fun addWorldTime(worldKey: String, deltaTicks: Long): Pair<Long, Long>?
+    fun showDashboard(): Boolean
     fun stopServer(): Boolean
+    fun reloadAllPlugins(): Int
+    fun reloadPlugin(pluginId: String): Boolean
+    fun pluginIds(): List<String>
 }

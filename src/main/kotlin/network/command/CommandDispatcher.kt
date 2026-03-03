@@ -1,11 +1,34 @@
 package org.macaroon3145.network.command
 
 import org.macaroon3145.network.handler.PlayerSession
+import java.util.concurrent.ConcurrentHashMap
 
 class CommandDispatcher(
-    private val commands: Map<String, Command>
+    commands: Map<String, Command> = emptyMap()
 ) {
+    private val commands = ConcurrentHashMap<String, Command>()
+
+    init {
+        for ((name, command) in commands) {
+            register(name, command)
+        }
+    }
+
     fun commandNames(): Set<String> = commands.keys
+
+    fun register(name: String, command: Command) {
+        commands[name.lowercase()] = command
+    }
+
+    fun registerAll(vararg names: String, command: Command) {
+        for (name in names) {
+            register(name, command)
+        }
+    }
+
+    fun unregister(name: String) {
+        commands.remove(name.lowercase())
+    }
 
     fun dispatch(context: CommandContext, sender: PlayerSession?, rawCommand: String) {
         val stripped = rawCommand.removePrefix("/").trim()
@@ -25,18 +48,17 @@ class CommandDispatcher(
 
     companion object {
         fun default(): CommandDispatcher {
-            return CommandDispatcher(
-                mapOf(
-                    "op" to OpCommand,
-                    "deop" to DeopCommand,
-                    "tp" to TpCommand,
-                    "teleport" to TpCommand,
-                    "gamemode" to GamemodeCommand,
-                    "time" to TimeCommand,
-                    "perf" to PerfCommand,
-                    "stop" to StopCommand
-                )
-            )
+            val dispatcher = CommandDispatcher()
+            dispatcher.register("op", OpCommand)
+            dispatcher.register("deop", DeopCommand)
+            dispatcher.registerAll("tp", "teleport", command = TpCommand)
+            dispatcher.register("gamemode", GamemodeCommand)
+            dispatcher.register("time", TimeCommand)
+            dispatcher.register("perf", PerfCommand)
+            dispatcher.register("dashboard", DashboardCommand)
+            dispatcher.register("stop", StopCommand)
+            dispatcher.register("reload", ReloadCommand)
+            return dispatcher
         }
     }
 }

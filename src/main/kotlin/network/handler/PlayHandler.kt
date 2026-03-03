@@ -652,7 +652,7 @@ class PlayHandler(
         } else if (remaining != 0) {
             return
         }
-        PlayerSessionManager.handleUseItem(session.channelId, hand)
+        PlayerSessionManager.handleUseItem(session.channelId, hand, sequence)
         PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
     }
 

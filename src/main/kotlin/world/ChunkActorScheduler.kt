@@ -86,6 +86,8 @@ class ChunkActorScheduler {
             return future
         }
 
+        fun workerThread(): Thread? = thread
+
         fun stop() {
             if (!running.compareAndSet(true, false)) return
             val current = thread
@@ -104,6 +106,13 @@ class ChunkActorScheduler {
     }
 
     fun currentChunkPos(): ChunkPos? = CURRENT_CHUNK_POS.get()
+
+    fun actorThread(chunkPos: ChunkPos): Thread? = actors[chunkPos]?.workerThread()
+
+    fun currentChunkVirtualThread(): Thread? {
+        if (CURRENT_CHUNK_POS.get() == null) return null
+        return Thread.currentThread()
+    }
 
     fun stopAll() {
         for ((_, actor) in actors) {

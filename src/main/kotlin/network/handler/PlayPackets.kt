@@ -27,6 +27,7 @@ object PlayPackets {
             val hoverText: String? = null,
             val hoverEntity: HoverEntity? = null,
             val color: String? = null,
+            val bold: Boolean? = null,
             val underlined: Boolean? = null,
             val italic: Boolean? = null
         ) : ChatComponent
@@ -36,6 +37,7 @@ object PlayPackets {
             val args: List<ChatComponent> = emptyList(),
             val extra: List<ChatComponent> = emptyList(),
             val color: String? = null,
+            val bold: Boolean? = null,
             val underlined: Boolean? = null,
             val italic: Boolean? = null
         ) : ChatComponent
@@ -114,10 +116,13 @@ object PlayPackets {
     private const val PLAYER_SKIN_PARTS_METADATA_INDEX = 16
     private const val ENTITY_SHARED_FLAGS_METADATA_INDEX = 0
     private const val ENTITY_POSE_METADATA_INDEX = 6
+    private const val LIVING_ENTITY_FLAGS_METADATA_INDEX = 8
     private const val ENTITY_POSE_METADATA_TYPE_ID = 20 // entity_pose in 1.21.11
     private const val ENTITY_FLAGS_SNEAKING = 0x02
     private const val ENTITY_FLAGS_SPRINTING = 0x08
     private const val ENTITY_FLAGS_SWIMMING = 0x10
+    private const val LIVING_ENTITY_FLAG_IS_USING = 0x01
+    private const val LIVING_ENTITY_FLAG_OFF_HAND = 0x02
     private const val POSE_STANDING = 0
     private const val POSE_SWIMMING = 3
     private const val POSE_CROUCHING = 5
@@ -443,7 +448,8 @@ object PlayPackets {
                     name = "destination",
                     parserTypeId = COMMAND_ARGUMENT_TYPE_ENTITY_ID_1_21_11,
                     parserPayload = entityPayload(single = true, playersOnly = false),
-                    executable = true
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
                 )
                 val locationIndex = addArgument(
                     name = "location",
@@ -454,13 +460,14 @@ object PlayPackets {
                     name = "targets",
                     parserTypeId = COMMAND_ARGUMENT_TYPE_ENTITY_ID_1_21_11,
                     parserPayload = entityPayload(single = false, playersOnly = false),
-                    suggestionType = null
+                    suggestionType = "minecraft:ask_server"
                 )
                 val targetDestinationIndex = addArgument(
                     name = "destination",
                     parserTypeId = COMMAND_ARGUMENT_TYPE_ENTITY_ID_1_21_11,
                     parserPayload = entityPayload(single = true, playersOnly = false),
-                    executable = true
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
                 )
                 val targetLocationIndex = addArgument(
                     name = "location",
@@ -502,7 +509,8 @@ object PlayPackets {
                 val targetIndex = addArgument(
                     name = "targets",
                     parserTypeId = COMMAND_ARGUMENT_TYPE_GAME_PROFILE_ID_1_21_11,
-                    executable = true
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
                 )
                 setNode(literalIndex, nodes[literalIndex].copy(children = intArrayOf(targetIndex)))
                 rootChildren += literalIndex
@@ -513,7 +521,8 @@ object PlayPackets {
                 val targetIndex = addArgument(
                     name = "targets",
                     parserTypeId = COMMAND_ARGUMENT_TYPE_GAME_PROFILE_ID_1_21_11,
-                    executable = true
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
                 )
                 setNode(literalIndex, nodes[literalIndex].copy(children = intArrayOf(targetIndex)))
                 rootChildren += literalIndex
@@ -593,6 +602,22 @@ object PlayPackets {
                 rootChildren += literalIndex
             }
 
+            fun addReloadSubtree() {
+                val literalIndex = addLiteral("reload", executable = true)
+                val targetArgumentIndex = addArgument(
+                    name = "pluginName",
+                    parserTypeId = COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11,
+                    parserPayload = brigadierStringPayloadSingleWord(),
+                    executable = true,
+                    suggestionType = "minecraft:ask_server"
+                )
+                setNode(
+                    literalIndex,
+                    nodes[literalIndex].copy(children = intArrayOf(targetArgumentIndex))
+                )
+                rootChildren += literalIndex
+            }
+
             addTpSubtree("tp")
             addTpSubtree("teleport")
             addGamemodeSubtree()
@@ -601,6 +626,7 @@ object PlayPackets {
             addStopLiteral()
             addTimeSubtree()
             addPerfSubtree()
+            addReloadSubtree()
         }
         setNode(rootIndex, nodes[rootIndex].copy(children = rootChildren.toIntArray()))
 
@@ -657,7 +683,7 @@ object PlayPackets {
         return packet.toByteArray()
     }
 
-    fun playerInfoPacket(profile: ConnectionProfile, gameMode: Int, latencyMs: Int): ByteArray {
+    fun playerInfoPacket(profile: ConnectionProfile, displayName: String, gameMode: Int, latencyMs: Int): ByteArray {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
         val clampedGameMode = gameMode.coerceIn(0, 3)
@@ -668,7 +694,7 @@ object PlayPackets {
         NetworkUtils.writeVarInt(packet, 1)
         NetworkUtils.writeUUID(packet, profile.uuid)
 
-        NetworkUtils.writeString(packet, profile.username)
+        NetworkUtils.writeString(packet, displayName)
         NetworkUtils.writeVarInt(packet, profile.properties.size)
         for (property in profile.properties) {
             NetworkUtils.writeString(packet, property.name)
@@ -1111,7 +1137,8 @@ object PlayPackets {
         entityId: Int,
         sneaking: Boolean,
         sprinting: Boolean,
-        swimming: Boolean
+        swimming: Boolean,
+        usingItemHand: Int = -1
     ): ByteArray {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
@@ -1136,6 +1163,17 @@ object PlayPackets {
             else -> POSE_STANDING
         }
         NetworkUtils.writeVarInt(packet, pose)
+
+        out.writeByte(LIVING_ENTITY_FLAGS_METADATA_INDEX)
+        NetworkUtils.writeVarInt(packet, 0) // metadata type: byte
+        var livingFlags = 0
+        if (usingItemHand in 0..1) {
+            livingFlags = livingFlags or LIVING_ENTITY_FLAG_IS_USING
+            if (usingItemHand == 1) {
+                livingFlags = livingFlags or LIVING_ENTITY_FLAG_OFF_HAND
+            }
+        }
+        out.writeByte(livingFlags)
 
         out.writeByte(0xFF) // metadata terminator
         return packet.toByteArray()
@@ -1311,6 +1349,9 @@ object PlayPackets {
                 if (component.color != null) {
                     writeTagString(out, "color", component.color)
                 }
+                if (component.bold != null) {
+                    writeTagBoolean(out, "bold", component.bold)
+                }
                 if (component.underlined != null) {
                     writeTagBoolean(out, "underlined", component.underlined)
                 }
@@ -1331,6 +1372,9 @@ object PlayPackets {
                 writeTagString(out, "translate", component.key)
                 if (component.color != null) {
                     writeTagString(out, "color", component.color)
+                }
+                if (component.bold != null) {
+                    writeTagBoolean(out, "bold", component.bold)
                 }
                 if (component.underlined != null) {
                     writeTagBoolean(out, "underlined", component.underlined)

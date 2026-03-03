@@ -59,6 +59,42 @@ object DebugConsole {
         }
     }
 
+    inline fun <T> withSpinnerResult(
+        progressMessage: String,
+        crossinline doneMessage: (T) -> String,
+        crossinline doneMark: (T) -> String = { "✓" },
+        action: () -> T
+    ): T {
+        val spinner = newSpinner()
+        val running = AtomicBoolean(true)
+        val spinnerThread = thread(name = "aerogel-console-spinner", isDaemon = true) {
+            while (running.get()) {
+                spinner.tick(
+                    lineBuilder = { frame, elapsedSeconds ->
+                        "$frame $progressMessage (${localizedElapsed(elapsedSeconds)})"
+                    }
+                )
+                Thread.sleep(40)
+            }
+        }
+        return try {
+            val result = action()
+            running.set(false)
+            spinnerThread.join()
+            spinner.finish(doneMark = doneMark(result)) { mark, elapsedSeconds ->
+                "$mark ${doneMessage(result)} (${localizedElapsed(elapsedSeconds)})"
+            }
+            result
+        } catch (error: Throwable) {
+            running.set(false)
+            spinnerThread.join()
+            spinner.finish(doneMark = "✗") { mark, elapsedSeconds ->
+                "$mark $progressMessage (${localizedElapsed(elapsedSeconds)})"
+            }
+            throw error
+        }
+    }
+
     fun err(line: String) {
         rawErr.println(line)
     }

@@ -66,6 +66,8 @@ class World(
     private val changedBlocksByChunk = ConcurrentHashMap<ChunkPos, MutableSet<BlockPos>>()
     private val changedBlockEntities = ConcurrentHashMap<BlockPos, BlockEntityData>()
     private val changedBlockEntitiesByChunk = ConcurrentHashMap<ChunkPos, MutableSet<BlockPos>>()
+    private val dirtyTerrainChunksQueue = ConcurrentLinkedQueue<ChunkPos>()
+    private val dirtyTerrainChunksDedup = ConcurrentHashMap.newKeySet<ChunkPos>()
     private val chunkProcessingProfiler = ChunkProcessingProfiler()
     private val droppedItemSystem = DroppedItemSystem { x, y, z -> blockStateAt(x, y, z) }
     private val thrownItemSystem = ThrownItemSystem { x, y, z -> blockStateAt(x, y, z) }
@@ -296,12 +298,16 @@ class World(
 
     private fun setBlockStateInternal(x: Int, y: Int, z: Int, stateId: Int, enqueueFluidUpdates: Boolean) {
         val pos = BlockPos(x, y, z)
+        val chunkPos = pos.chunkPos()
         val base = baseBlockStateProvider(x, y, z)
+        val previous = changedBlockStates[pos] ?: base
+        if (previous == stateId) return
         if (stateId == base) {
             changedBlockStates.remove(pos)
-            changedBlocksByChunk[pos.chunkPos()]?.remove(pos)
+            changedBlocksByChunk[chunkPos]?.remove(pos)
             changedBlockEntities.remove(pos)
-            changedBlockEntitiesByChunk[pos.chunkPos()]?.remove(pos)
+            changedBlockEntitiesByChunk[chunkPos]?.remove(pos)
+            markTerrainChunkDirty(chunkPos)
             if (enqueueFluidUpdates) {
                 enqueueFluidUpdatesAround(x, y, z)
             }
@@ -309,8 +315,9 @@ class World(
         }
         changedBlockStates[pos] = stateId
         changedBlocksByChunk
-            .computeIfAbsent(pos.chunkPos()) { ConcurrentHashMap.newKeySet() }
+            .computeIfAbsent(chunkPos) { ConcurrentHashMap.newKeySet() }
             .add(pos)
+        markTerrainChunkDirty(chunkPos)
         if (enqueueFluidUpdates) {
             enqueueFluidUpdatesAround(x, y, z)
         }
@@ -360,6 +367,48 @@ class World(
         return changedBlocksByChunk.isNotEmpty() || changedBlockEntitiesByChunk.isNotEmpty()
     }
 
+    fun consumeDirtyTerrainChunks(): Set<ChunkPos> {
+        if (dirtyTerrainChunksQueue.isEmpty()) return emptySet()
+        val out = HashSet<ChunkPos>()
+        while (true) {
+            val chunkPos = dirtyTerrainChunksQueue.poll() ?: break
+            dirtyTerrainChunksDedup.remove(chunkPos)
+            out.add(chunkPos)
+        }
+        return out
+    }
+
+    fun topBlockStateAt(blockX: Int, blockZ: Int): Int {
+        var sawCached = false
+        for (y in WORLD_MAX_Y downTo WORLD_MIN_Y) {
+            val cached = blockStateAtIfCached(blockX, y, blockZ) ?: continue
+            sawCached = true
+            if (cached != AIR_STATE_ID) return cached
+        }
+        if (!sawCached) {
+            for (y in WORLD_MAX_Y downTo WORLD_MIN_Y) {
+                val state = blockStateAt(blockX, y, blockZ)
+                if (state != AIR_STATE_ID) return state
+            }
+        }
+        return AIR_STATE_ID
+    }
+
+    fun topBlockStateAtIfCached(blockX: Int, blockZ: Int): Int? {
+        var sawCached = false
+        for (y in WORLD_MAX_Y downTo WORLD_MIN_Y) {
+            val cached = blockStateAtIfCached(blockX, y, blockZ) ?: continue
+            sawCached = true
+            if (cached != AIR_STATE_ID) return cached
+        }
+        return if (sawCached) AIR_STATE_ID else null
+    }
+
+    private fun markTerrainChunkDirty(chunkPos: ChunkPos) {
+        if (!dirtyTerrainChunksDedup.add(chunkPos)) return
+        dirtyTerrainChunksQueue.add(chunkPos)
+    }
+
     fun spawnDroppedItem(
         entityId: Int,
         itemId: Int,
@@ -370,6 +419,7 @@ class World(
         vx: Double,
         vy: Double,
         vz: Double,
+        uuid: UUID = UUID.randomUUID(),
         pickupDelaySeconds: Double = 2.0
     ): Boolean {
         return droppedItemSystem.spawn(
@@ -382,6 +432,7 @@ class World(
             vx = vx,
             vy = vy,
             vz = vz,
+            uuid = uuid,
             pickupDelaySeconds = pickupDelaySeconds
         )
     }
@@ -404,6 +455,38 @@ class World(
 
     fun droppedItemSnapshot(entityId: Int): DroppedItemSnapshot? {
         return droppedItemSystem.snapshot(entityId)
+    }
+
+    fun droppedItemSnapshots(): List<DroppedItemSnapshot> {
+        return droppedItemSystem.snapshots()
+    }
+
+    fun droppedItemSnapshotByUuid(uuid: UUID): DroppedItemSnapshot? {
+        return droppedItemSystem.snapshotByUuid(uuid)
+    }
+
+    fun setDroppedItemStack(entityId: Int, itemId: Int, itemCount: Int): DroppedItemSnapshot? {
+        return droppedItemSystem.updateItem(entityId, itemId, itemCount)
+    }
+
+    fun setDroppedItemPosition(entityId: Int, x: Double, y: Double, z: Double): DroppedItemSnapshot? {
+        return droppedItemSystem.updatePosition(entityId, x, y, z)
+    }
+
+    fun setDroppedItemVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): DroppedItemSnapshot? {
+        return droppedItemSystem.updateVelocity(entityId, vx, vy, vz)
+    }
+
+    fun setDroppedItemAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): DroppedItemSnapshot? {
+        return droppedItemSystem.updateAcceleration(entityId, ax, ay, az)
+    }
+
+    fun setDroppedItemPickupDelay(entityId: Int, pickupDelaySeconds: Double): DroppedItemSnapshot? {
+        return droppedItemSystem.updatePickupDelay(entityId, pickupDelaySeconds)
+    }
+
+    fun setDroppedItemOnGround(entityId: Int, onGround: Boolean): DroppedItemSnapshot? {
+        return droppedItemSystem.updateOnGround(entityId, onGround)
     }
 
     fun beginChunkProcessingFrame(tickSequence: Long = Long.MIN_VALUE): ChunkProcessingProfiler.Frame {
@@ -461,6 +544,10 @@ class World(
         return chunkProcessingProfiler.topChunksByEwmaMspt(limit, minMspt)
     }
 
+    fun consumeDirtyChunkStats(): Set<ChunkPos> {
+        return chunkProcessingProfiler.consumeDirtyChunks()
+    }
+
     fun requestDroppedItemUnstuckAtBlock(x: Int, y: Int, z: Int) {
         droppedItemSystem.requestUnstuckForBlock(x, y, z)
     }
@@ -478,7 +565,8 @@ class World(
         z: Double,
         vx: Double,
         vy: Double,
-        vz: Double
+        vz: Double,
+        uuid: UUID = UUID.randomUUID()
     ): Boolean {
         return thrownItemSystem.spawn(
             entityId = entityId,
@@ -489,7 +577,8 @@ class World(
             z = z,
             vx = vx,
             vy = vy,
-            vz = vz
+            vz = vz,
+            uuid = uuid
         )
     }
 
@@ -503,6 +592,42 @@ class World(
 
     fun thrownItemSnapshot(entityId: Int): ThrownItemSnapshot? {
         return thrownItemSystem.snapshot(entityId)
+    }
+
+    fun thrownItemSnapshots(): List<ThrownItemSnapshot> {
+        return thrownItemSystem.snapshots()
+    }
+
+    fun thrownItemSnapshotByUuid(uuid: UUID): ThrownItemSnapshot? {
+        return thrownItemSystem.snapshotByUuid(uuid)
+    }
+
+    fun setThrownItemPosition(entityId: Int, x: Double, y: Double, z: Double): ThrownItemSnapshot? {
+        return thrownItemSystem.updatePosition(entityId, x, y, z)
+    }
+
+    fun setThrownItemVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): ThrownItemSnapshot? {
+        return thrownItemSystem.updateVelocity(entityId, vx, vy, vz)
+    }
+
+    fun setThrownItemPreviousPosition(entityId: Int, prevX: Double, prevY: Double, prevZ: Double): ThrownItemSnapshot? {
+        return thrownItemSystem.updatePreviousPosition(entityId, prevX, prevY, prevZ)
+    }
+
+    fun setThrownItemAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): ThrownItemSnapshot? {
+        return thrownItemSystem.updateAcceleration(entityId, ax, ay, az)
+    }
+
+    fun setThrownItemOwnerEntityId(entityId: Int, ownerEntityId: Int): ThrownItemSnapshot? {
+        return thrownItemSystem.updateOwnerEntityId(entityId, ownerEntityId)
+    }
+
+    fun setThrownItemKind(entityId: Int, kind: ThrownItemKind): ThrownItemSnapshot? {
+        return thrownItemSystem.updateKind(entityId, kind)
+    }
+
+    fun setThrownItemOnGround(entityId: Int, onGround: Boolean): ThrownItemSnapshot? {
+        return thrownItemSystem.updateOnGround(entityId, onGround)
     }
 
     fun thrownItemsInChunk(chunkX: Int, chunkZ: Int): List<ThrownItemSnapshot> {
@@ -1023,14 +1148,26 @@ class World(
     ): Double {
         val timeScale = ServerConfig.timeScale
         if (!timeScale.isFinite() || timeScale <= 0.0) return 0.0
+        val scaledFallbackSeconds = if (fallbackSeconds.isFinite() && fallbackSeconds > 0.0) {
+            fallbackSeconds * timeScale
+        } else {
+            0.0
+        }
         val nowNanos = System.nanoTime()
         val previous = lastTickMap.put(chunkPos, nowNanos)
         if (previous == null) {
-            return if (fallbackSeconds.isFinite() && fallbackSeconds > 0.0) fallbackSeconds * timeScale else 0.0
+            return scaledFallbackSeconds
         }
         val elapsedSeconds = ((nowNanos - previous).coerceAtLeast(0L)) / 1_000_000_000.0
         if (!elapsedSeconds.isFinite() || elapsedSeconds <= 0.0) return 0.0
-        return elapsedSeconds * timeScale
+        val scaledElapsedSeconds = elapsedSeconds * timeScale
+        // If a chunk was dormant (e.g., simulation chunk off), avoid a single oversized catch-up tick.
+        if (scaledFallbackSeconds > 0.0 &&
+            scaledElapsedSeconds > scaledFallbackSeconds * MAX_CHUNK_CATCHUP_MULTIPLIER
+        ) {
+            return scaledFallbackSeconds
+        }
+        return scaledElapsedSeconds
     }
 
     private fun tryAcquireChunkTick(
@@ -1105,6 +1242,14 @@ class World(
     }
 
     private fun currentChunkActorThreadChunkPos(): ChunkPos? = chunkActorScheduler.currentChunkPos()
+
+    fun chunkActorVirtualThread(chunkX: Int, chunkZ: Int): Thread? {
+        return chunkActorScheduler.actorThread(ChunkPos(chunkX, chunkZ))
+    }
+
+    fun currentChunkActorVirtualThread(): Thread? {
+        return chunkActorScheduler.currentChunkVirtualThread()
+    }
 
     private fun <T> runOnAnimalChunk(
         chunkPos: ChunkPos,
@@ -1582,6 +1727,7 @@ class World(
         private const val FLUID_REMOVE_LEVEL = -1
         private const val NO_WATER_LEVEL = -1
         private const val SPAWN_SEARCH_CHUNK_RADIUS = 8
+        private const val MAX_CHUNK_CATCHUP_MULTIPLIER = 4.0
         private val HORIZONTAL_DIRS = arrayOf(
             1 to 0,
             -1 to 0,

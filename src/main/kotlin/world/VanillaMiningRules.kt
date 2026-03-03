@@ -9,11 +9,8 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.macaroon3145.network.codec.BlockStateRegistry
-import java.nio.file.Files
-import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
-import java.util.jar.JarFile
 import kotlin.math.roundToInt
 
 data class VanillaDrop(val itemId: Int, val count: Int)
@@ -66,18 +63,7 @@ object VanillaMiningRules {
         }
         out
     }
-    private val vanillaJarPath by lazy {
-        val candidates = listOf(
-            Path.of("versions/1.21.11/server-1.21.11.jar"),
-            Path.of(".gradle-local/minecraft/1.21.11/server-bundled.jar"),
-            Path.of(".gradle-local/minecraft/1.21.11/server-1.21.11-obf.jar")
-        )
-        candidates.firstOrNull { Files.isRegularFile(it) }
-            ?: error("Missing local vanilla server jar for mining rules")
-    }
-    private val vanillaJar by lazy {
-        JarFile(vanillaJarPath.toFile())
-    }
+    private val resourceTextCache = ConcurrentHashMap<String, String?>()
     private val blockTagCache = ConcurrentHashMap<String, Set<String>>()
     private val itemTagCache = ConcurrentHashMap<String, Set<String>>()
     private val lootTableCache = ConcurrentHashMap<String, JsonObject?>()
@@ -114,7 +100,6 @@ object VanillaMiningRules {
         // Shift first-break lazy costs to startup.
         itemKeysById.size
         itemIdsByKey.size
-        vanillaJar.size()
         val toolTags = listOf("pickaxes", "axes", "shovels", "hoes", "swords")
         for (tag in toolTags) {
             itemTag(tag).size
@@ -301,9 +286,14 @@ object VanillaMiningRules {
     }
 
     private fun readJsonObject(path: String): JsonObject? {
-        val entry = vanillaJar.getJarEntry(path) ?: return null
-        vanillaJar.getInputStream(entry).bufferedReader().use { reader ->
-            return json.parseToJsonElement(reader.readText()).jsonObject
+        val text = readResourceText(path) ?: return null
+        return json.parseToJsonElement(text).jsonObject
+    }
+
+    private fun readResourceText(path: String): String? {
+        return resourceTextCache.computeIfAbsent(path) { target ->
+            val stream = VanillaMiningRules::class.java.classLoader.getResourceAsStream(target) ?: return@computeIfAbsent null
+            stream.bufferedReader().use { it.readText() }
         }
     }
 

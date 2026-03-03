@@ -29,6 +29,9 @@ data class DroppedItemSnapshot(
     val vx: Double,
     val vy: Double,
     val vz: Double,
+    val accelerationX: Double = 0.0,
+    val accelerationY: Double = 0.0,
+    val accelerationZ: Double = 0.0,
     val pickupDelaySeconds: Double,
     val onGround: Boolean,
     val chunkPos: ChunkPos
@@ -67,14 +70,17 @@ class DroppedItemSystem(
     private data class MutableDroppedItem(
         val entityId: Int,
         val uuid: UUID,
-        val itemId: Int,
-        val itemCount: Int,
+        var itemId: Int,
+        var itemCount: Int,
         var x: Double,
         var y: Double,
         var z: Double,
         var vx: Double,
         var vy: Double,
         var vz: Double,
+        var accelerationX: Double,
+        var accelerationY: Double,
+        var accelerationZ: Double,
         var pickupDelaySeconds: Double,
         var onGround: Boolean,
         var ageTicks: Double,
@@ -95,6 +101,9 @@ class DroppedItemSystem(
                 vx = vx,
                 vy = vy,
                 vz = vz,
+                accelerationX = accelerationX,
+                accelerationY = accelerationY,
+                accelerationZ = accelerationZ,
                 pickupDelaySeconds = pickupDelaySeconds,
                 onGround = onGround,
                 chunkPos = ChunkPos(chunkX, chunkZ)
@@ -139,6 +148,7 @@ class DroppedItemSystem(
         vx: Double,
         vy: Double,
         vz: Double,
+        uuid: UUID = UUID.randomUUID(),
         pickupDelaySeconds: Double = DEFAULT_PICKUP_DELAY_SECONDS
     ): Boolean {
         if (entityId < 0 || itemId < 0 || itemCount <= 0) return false
@@ -146,7 +156,7 @@ class DroppedItemSystem(
         val chunkZ = chunkZFromBlockZ(z)
         val entity = MutableDroppedItem(
             entityId = entityId,
-            uuid = UUID.randomUUID(),
+            uuid = uuid,
             itemId = itemId,
             itemCount = itemCount,
             x = x,
@@ -155,6 +165,9 @@ class DroppedItemSystem(
             vx = vx,
             vy = vy,
             vz = vz,
+            accelerationX = 0.0,
+            accelerationY = 0.0,
+            accelerationZ = 0.0,
             pickupDelaySeconds = pickupDelaySeconds.coerceAtLeast(0.0),
             onGround = false,
             ageTicks = 0.0,
@@ -185,6 +198,72 @@ class DroppedItemSystem(
 
     fun snapshot(entityId: Int): DroppedItemSnapshot? {
         return snapshots[entityId]
+    }
+
+    fun snapshots(): List<DroppedItemSnapshot> {
+        return snapshots.values.toList()
+    }
+
+    fun snapshotByUuid(uuid: UUID): DroppedItemSnapshot? {
+        return snapshots.values.firstOrNull { it.uuid == uuid }
+    }
+
+    fun updateItem(entityId: Int, itemId: Int, itemCount: Int): DroppedItemSnapshot? {
+        if (itemId < 0 || itemCount <= 0) return null
+        return mutate(entityId) { entity ->
+            entity.itemId = itemId
+            entity.itemCount = itemCount
+        }
+    }
+
+    fun updatePosition(entityId: Int, x: Double, y: Double, z: Double): DroppedItemSnapshot? {
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return null
+        return mutate(entityId) { entity ->
+            entity.x = x
+            entity.y = y
+            entity.z = z
+            entity.sleeping = false
+            entity.restTicks = 0.0
+        }
+    }
+
+    fun updateVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): DroppedItemSnapshot? {
+        if (!vx.isFinite() || !vy.isFinite() || !vz.isFinite()) return null
+        return mutate(entityId) { entity ->
+            entity.vx = vx
+            entity.vy = vy
+            entity.vz = vz
+            entity.sleeping = false
+            entity.restTicks = 0.0
+        }
+    }
+
+    fun updateAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): DroppedItemSnapshot? {
+        if (!ax.isFinite() || !ay.isFinite() || !az.isFinite()) return null
+        return mutate(entityId) { entity ->
+            entity.accelerationX = ax
+            entity.accelerationY = ay
+            entity.accelerationZ = az
+            entity.sleeping = false
+            entity.restTicks = 0.0
+        }
+    }
+
+    fun updatePickupDelay(entityId: Int, pickupDelaySeconds: Double): DroppedItemSnapshot? {
+        if (!pickupDelaySeconds.isFinite()) return null
+        return mutate(entityId) { entity ->
+            entity.pickupDelaySeconds = pickupDelaySeconds.coerceAtLeast(0.0)
+        }
+    }
+
+    fun updateOnGround(entityId: Int, onGround: Boolean): DroppedItemSnapshot? {
+        return mutate(entityId) { entity ->
+            entity.onGround = onGround
+            if (!onGround) {
+                entity.sleeping = false
+                entity.restTicks = 0.0
+            }
+        }
     }
 
     fun remove(entityId: Int): DroppedItemSnapshot? {
@@ -513,6 +592,11 @@ class DroppedItemSystem(
     private fun stepEntity(entity: MutableDroppedItem, deltaSeconds: Double, tickScale: Double) {
         entity.ageTicks += tickScale
         entity.pickupDelaySeconds = (entity.pickupDelaySeconds - deltaSeconds).coerceAtLeast(0.0)
+        if (entity.accelerationX != 0.0 || entity.accelerationY != 0.0 || entity.accelerationZ != 0.0) {
+            entity.vx += (entity.accelerationX * deltaSeconds) / 20.0
+            entity.vy += (entity.accelerationY * deltaSeconds) / 20.0
+            entity.vz += (entity.accelerationZ * deltaSeconds) / 20.0
+        }
         val buoyancyProfile = buoyancyProfile(entity.itemId)
         val buoyantItem = buoyancyProfile.buoyancyPerTick > buoyancyProfile.sinkPerTick
 
@@ -1278,5 +1362,82 @@ class DroppedItemSystem(
             }
             return out
         }
+    }
+
+    private fun mutableFromSnapshot(snapshot: DroppedItemSnapshot): MutableDroppedItem {
+        return MutableDroppedItem(
+            entityId = snapshot.entityId,
+            uuid = snapshot.uuid,
+            itemId = snapshot.itemId,
+            itemCount = snapshot.itemCount,
+            x = snapshot.x,
+            y = snapshot.y,
+            z = snapshot.z,
+            vx = snapshot.vx,
+            vy = snapshot.vy,
+            vz = snapshot.vz,
+            accelerationX = snapshot.accelerationX,
+            accelerationY = snapshot.accelerationY,
+            accelerationZ = snapshot.accelerationZ,
+            pickupDelaySeconds = snapshot.pickupDelaySeconds,
+            onGround = snapshot.onGround,
+            ageTicks = 0.0,
+            restTicks = 0.0,
+            sleeping = false,
+            chunkX = snapshot.chunkPos.x,
+            chunkZ = snapshot.chunkPos.z
+        )
+    }
+
+    private inline fun mutate(entityId: Int, mutator: (MutableDroppedItem) -> Unit): DroppedItemSnapshot? {
+        val currentSnapshot = snapshots[entityId] ?: return null
+        val oldChunk = currentSnapshot.chunkPos
+        val oldLane = laneFor(oldChunk.x, oldChunk.z)
+        val oldLaneMap = laneChunks[oldLane]
+        val oldChunkState = oldLaneMap[oldChunk]
+
+        val entity = oldChunkState?.entities?.get(entityId)
+            ?: run {
+                var foundInbound: MutableDroppedItem? = null
+                if (oldChunkState != null) {
+                    for (candidate in oldChunkState.inbound) {
+                        if (candidate.entityId == entityId) {
+                            foundInbound = candidate
+                            break
+                        }
+                    }
+                }
+                foundInbound
+            }
+            ?: mutableFromSnapshot(currentSnapshot)
+
+        mutator(entity)
+        val newChunkX = chunkXFromBlockX(entity.x)
+        val newChunkZ = chunkZFromBlockZ(entity.z)
+        val newChunk = ChunkPos(newChunkX, newChunkZ)
+        entity.chunkX = newChunkX
+        entity.chunkZ = newChunkZ
+        val newSnapshot = entity.snapshot()
+        snapshots[entityId] = newSnapshot
+
+        if (oldChunk != newChunk) {
+            oldChunkState?.entities?.remove(entityId)
+            moveChunkIndex(entityId, oldChunk, newChunk)
+            val newLane = laneFor(newChunkX, newChunkZ)
+            laneChunks[newLane]
+                .computeIfAbsent(newChunk) { ChunkState() }
+                .inbound
+                .add(entity)
+            dirtyChunksByLane[oldLane].add(oldChunk)
+            dirtyChunksByLane[newLane].add(newChunk)
+        } else {
+            if (oldChunkState != null) {
+                oldChunkState.entities[entityId] = entity
+            } else {
+                oldLaneMap.computeIfAbsent(oldChunk) { ChunkState() }.inbound.add(entity)
+            }
+            dirtyChunksByLane[oldLane].add(oldChunk)
+        }
+        return newSnapshot
     }
 }

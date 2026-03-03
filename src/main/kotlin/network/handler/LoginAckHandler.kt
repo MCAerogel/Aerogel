@@ -3,6 +3,7 @@ package org.macaroon3145.network.handler
 import io.netty.buffer.ByteBuf
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.SimpleChannelInboundHandler
+import org.macaroon3145.api.packet.ProtocolPhase
 import org.macaroon3145.network.NetworkUtils
 
 class LoginAckHandler(private val profile: ConnectionProfile) : SimpleChannelInboundHandler<ByteBuf>() {
@@ -13,6 +14,7 @@ class LoginAckHandler(private val profile: ConnectionProfile) : SimpleChannelInb
             return
         }
 
+        ProtocolPhaseTracker.update(ctx.channel(), ProtocolPhase.CONFIGURATION)
         ctx.pipeline().replace(this, "configurationHandler", ConfigurationHandler(profile))
         for (packet in ConfigurationPackets.registryDataPackets()) {
             ctx.writeAndFlush(packet)

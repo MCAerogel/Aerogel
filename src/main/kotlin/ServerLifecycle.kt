@@ -5,6 +5,7 @@ import io.netty.channel.EventLoopGroup
 import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.handler.PlayerSessionManager
 import org.macaroon3145.perf.GameLoop
+import org.macaroon3145.plugin.PluginSystem
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
@@ -57,6 +58,7 @@ object ServerLifecycle {
         val shutdownBody = {
             GameLoop.stop()
             PlayerSessionManager.shutdown()
+            PluginSystem.shutdown()
             runCatching { serverChannel?.close()?.syncUninterruptibly() }
             val bossShutdown = runCatching {
                 bossGroup?.shutdownGracefully(0L, 1L, TimeUnit.SECONDS)

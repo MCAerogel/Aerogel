@@ -43,8 +43,8 @@ object TpCommand : Command {
         context.sendSourceTranslation(
             sender,
             "commands.teleport.success.entity.single",
-            PlayPackets.ChatComponent.Text(sender.profile.username),
-            PlayPackets.ChatComponent.Text(destination.profile.username)
+            context.playerNameComponent(sender),
+            context.playerNameComponent(destination)
         )
     }
 
@@ -57,8 +57,8 @@ object TpCommand : Command {
                 context.sendTranslation(
                     source,
                     "commands.teleport.success.entity.single",
-                    PlayPackets.ChatComponent.Text(source.profile.username),
-                    PlayPackets.ChatComponent.Text(destination.profile.username)
+                    context.playerNameComponent(source),
+                    context.playerNameComponent(destination)
                 )
             }
         }
@@ -66,15 +66,15 @@ object TpCommand : Command {
             context.sendSourceTranslation(
                 sender,
                 "commands.teleport.success.entity.single",
-                PlayPackets.ChatComponent.Text(sources.first().profile.username),
-                PlayPackets.ChatComponent.Text(destination.profile.username)
+                context.playerNameComponent(sources.first()),
+                context.playerNameComponent(destination)
             )
         } else {
             context.sendSourceTranslation(
                 sender,
                 "commands.teleport.success.entity.multiple",
                 PlayPackets.ChatComponent.Text(sources.size.toString()),
-                PlayPackets.ChatComponent.Text(destination.profile.username)
+                context.playerNameComponent(destination)
             )
         }
     }
@@ -110,7 +110,7 @@ object TpCommand : Command {
             context.sendSourceTranslation(
                 sender,
                 "commands.teleport.success.location.single",
-                PlayPackets.ChatComponent.Text(sources.first().profile.username),
+                context.playerNameComponent(sources.first()),
                 PlayPackets.ChatComponent.Text(formatCoord(x)),
                 PlayPackets.ChatComponent.Text(formatCoord(y)),
                 PlayPackets.ChatComponent.Text(formatCoord(z))
@@ -150,7 +150,7 @@ object TpCommand : Command {
         context.sendSourceTranslation(
             sender,
             "commands.teleport.success.location.single",
-            PlayPackets.ChatComponent.Text(target.profile.username),
+            context.playerNameComponent(target),
             PlayPackets.ChatComponent.Text(formatCoord(x)),
             PlayPackets.ChatComponent.Text(formatCoord(y)),
             PlayPackets.ChatComponent.Text(formatCoord(z))
@@ -159,7 +159,7 @@ object TpCommand : Command {
             context.sendTranslation(
                 target,
                 "commands.teleport.success.location.single",
-                PlayPackets.ChatComponent.Text(target.profile.username),
+                context.playerNameComponent(target),
                 PlayPackets.ChatComponent.Text(formatCoord(x)),
                 PlayPackets.ChatComponent.Text(formatCoord(y)),
                 PlayPackets.ChatComponent.Text(formatCoord(z))

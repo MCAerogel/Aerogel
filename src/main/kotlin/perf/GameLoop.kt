@@ -3,12 +3,9 @@ package org.macaroon3145.perf
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.handler.PlayerSessionManager
 import org.macaroon3145.ui.ServerDashboard
-import java.util.concurrent.locks.LockSupport
 import kotlin.math.roundToLong
 
 object GameLoop {
-    private const val COARSE_PARK_THRESHOLD_NANOS = 2_000_000L
-    private const val COARSE_PARK_GUARD_NANOS = 100_000L
     private const val MAX_LAG_TICKS_BEFORE_RESYNC = 10L
 
     @Volatile
@@ -57,13 +54,6 @@ object GameLoop {
             if (!uncapped) {
                 var now = System.nanoTime()
                 var remaining = nextTickDeadline - now
-
-                if (remaining > COARSE_PARK_THRESHOLD_NANOS) {
-                    val parkNanos = (remaining - COARSE_PARK_GUARD_NANOS).coerceAtLeast(1L)
-                    LockSupport.parkNanos(parkNanos)
-                    now = System.nanoTime()
-                    remaining = nextTickDeadline - now
-                }
 
                 while (remaining > 0L) {
                     Thread.onSpinWait()

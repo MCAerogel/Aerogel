@@ -2,6 +2,7 @@ package org.macaroon3145.world
 
 import org.macaroon3145.config.ServerConfig
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.LongAdder
 
@@ -87,6 +88,8 @@ class ChunkProcessingProfiler {
     )
 
     private val statsByChunk = ConcurrentHashMap<ChunkPos, ChunkStat>()
+    private val dirtyChunksQueue = ConcurrentLinkedQueue<ChunkPos>()
+    private val dirtyChunksDedup = ConcurrentHashMap.newKeySet<ChunkPos>()
 
     fun beginFrame(tickSequence: Long = NO_TICK_SEQUENCE): Frame = Frame(this, tickSequence)
 
@@ -110,6 +113,9 @@ class ChunkProcessingProfiler {
                 tickSequence = frame.tickSequence,
                 breakdownMs = toMsBreakdown(frameBreakdowns[chunkPos].orEmpty())
             )
+            if (totalNanos > 0L) {
+                markChunkDirty(chunkPos)
+            }
         }
 
         if (includeZeroForInactive) {
@@ -201,6 +207,17 @@ class ChunkProcessingProfiler {
                 .thenBy { it.chunkPos.z }
         )
         return if (snapshots.size <= limit) snapshots else snapshots.subList(0, limit)
+    }
+
+    fun consumeDirtyChunks(): Set<ChunkPos> {
+        if (dirtyChunksQueue.isEmpty()) return emptySet()
+        val out = HashSet<ChunkPos>()
+        while (true) {
+            val chunkPos = dirtyChunksQueue.poll() ?: break
+            dirtyChunksDedup.remove(chunkPos)
+            out.add(chunkPos)
+        }
+        return out
     }
 
     private fun updateChunkStat(
@@ -330,6 +347,14 @@ class ChunkProcessingProfiler {
             tickSequence = tickSequence,
             breakdownMs = breakdownMs
         )
+        if (elapsedNanos > 0L) {
+            markChunkDirty(chunkPos)
+        }
+    }
+
+    private fun markChunkDirty(chunkPos: ChunkPos) {
+        if (!dirtyChunksDedup.add(chunkPos)) return
+        dirtyChunksQueue.add(chunkPos)
     }
 
     private fun toMsBreakdown(nanosByCategory: Map<String, Long>): Map<String, Double> {

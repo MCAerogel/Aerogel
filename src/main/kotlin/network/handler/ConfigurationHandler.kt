@@ -3,6 +3,7 @@ package org.macaroon3145.network.handler
 import io.netty.buffer.ByteBuf
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.SimpleChannelInboundHandler
+import org.macaroon3145.api.packet.ProtocolPhase
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.NetworkUtils
 import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
@@ -41,10 +42,11 @@ class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChann
             spawnZ = spawnZ
         )
         val session = join.session
+        ProtocolPhaseTracker.update(ctx.channel(), ProtocolPhase.PLAY)
         ctx.pipeline().replace(this, "playHandler", PlayHandler(profile, session))
         ctx.writeAndFlush(PlayPackets.loginPacket(session.entityId, world.key, session.gameMode))
         ctx.writeAndFlush(PlayPackets.serverBrandPacket("Aerogel"))
-        ctx.writeAndFlush(PlayPackets.playerInfoPacket(profile, session.gameMode, session.pingMs))
+        ctx.writeAndFlush(PlayPackets.playerInfoPacket(profile, PlayerSessionManager.displayNameOrUsername(session), session.gameMode, session.pingMs))
         ctx.writeAndFlush(PlayPackets.commandsPacket(includeOperatorCommands = PlayerSessionManager.isOperatorSession(session)))
         ctx.writeAndFlush(PlayPackets.playerSkinPartsMetadataPacket(entityId = session.entityId, skinPartsMask = skinPartsMask))
         ctx.writeAndFlush(PlayPackets.updateViewDistancePacket(session.chunkRadius))

@@ -19,6 +19,18 @@ object NetworkUtils {
         }
     }
 
+    fun writeVarInt(buf: ByteBuf, value: Int) {
+        var i = value
+        while (true) {
+            if ((i and 0xFFFFFF80.toInt()) == 0) {
+                buf.writeByte(i)
+                return
+            }
+            buf.writeByte(i and 0x7F or 0x80)
+            i = i ushr 7
+        }
+    }
+
     fun readVarInt(buf: ByteBuf): Int {
         var numRead = 0
         var result = 0

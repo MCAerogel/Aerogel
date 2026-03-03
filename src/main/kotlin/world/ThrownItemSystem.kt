@@ -38,6 +38,10 @@ data class ThrownItemSnapshot(
     val vx: Double,
     val vy: Double,
     val vz: Double,
+    val accelerationX: Double,
+    val accelerationY: Double,
+    val accelerationZ: Double,
+    val onGround: Boolean,
     val chunkPos: ChunkPos
 )
 
@@ -91,9 +95,9 @@ class ThrownItemSystem(
 
     private data class MutableThrownItem(
         val entityId: Int,
-        val ownerEntityId: Int,
+        var ownerEntityId: Int,
         val uuid: UUID,
-        val kind: ThrownItemKind,
+        var kind: ThrownItemKind,
         var prevX: Double,
         var prevY: Double,
         var prevZ: Double,
@@ -103,6 +107,10 @@ class ThrownItemSystem(
         var vx: Double,
         var vy: Double,
         var vz: Double,
+        var accelerationX: Double,
+        var accelerationY: Double,
+        var accelerationZ: Double,
+        var onGround: Boolean,
         var ageTicks: Double,
         var chunkX: Int,
         var chunkZ: Int
@@ -122,6 +130,10 @@ class ThrownItemSystem(
                 vx = vx,
                 vy = vy,
                 vz = vz,
+                accelerationX = accelerationX,
+                accelerationY = accelerationY,
+                accelerationZ = accelerationZ,
+                onGround = onGround,
                 chunkPos = ChunkPos(chunkX, chunkZ)
             )
         }
@@ -142,7 +154,8 @@ class ThrownItemSystem(
         z: Double,
         vx: Double,
         vy: Double,
-        vz: Double
+        vz: Double,
+        uuid: UUID = UUID.randomUUID()
     ): Boolean {
         if (entityId < 0) return false
         val chunkX = chunkXFromBlockX(x)
@@ -150,7 +163,7 @@ class ThrownItemSystem(
         val entity = MutableThrownItem(
             entityId = entityId,
             ownerEntityId = ownerEntityId,
-            uuid = UUID.randomUUID(),
+            uuid = uuid,
             kind = kind,
             prevX = x,
             prevY = y,
@@ -161,6 +174,10 @@ class ThrownItemSystem(
             vx = vx,
             vy = vy,
             vz = vz,
+            accelerationX = 0.0,
+            accelerationY = 0.0,
+            accelerationZ = 0.0,
+            onGround = false,
             ageTicks = 0.0,
             chunkX = chunkX,
             chunkZ = chunkZ
@@ -205,6 +222,71 @@ class ThrownItemSystem(
     fun hasEntities(): Boolean = snapshots.isNotEmpty()
 
     fun snapshot(entityId: Int): ThrownItemSnapshot? = snapshots[entityId]
+
+    fun snapshots(): List<ThrownItemSnapshot> {
+        return snapshots.values.toList()
+    }
+
+    fun snapshotByUuid(uuid: UUID): ThrownItemSnapshot? {
+        return snapshots.values.firstOrNull { it.uuid == uuid }
+    }
+
+    fun updatePosition(entityId: Int, x: Double, y: Double, z: Double): ThrownItemSnapshot? {
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return null
+        return mutate(entityId) { entity ->
+            entity.x = x
+            entity.y = y
+            entity.z = z
+            entity.prevX = x
+            entity.prevY = y
+            entity.prevZ = z
+        }
+    }
+
+    fun updateVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): ThrownItemSnapshot? {
+        if (!vx.isFinite() || !vy.isFinite() || !vz.isFinite()) return null
+        return mutate(entityId) { entity ->
+            entity.vx = vx
+            entity.vy = vy
+            entity.vz = vz
+        }
+    }
+
+    fun updatePreviousPosition(entityId: Int, prevX: Double, prevY: Double, prevZ: Double): ThrownItemSnapshot? {
+        if (!prevX.isFinite() || !prevY.isFinite() || !prevZ.isFinite()) return null
+        return mutate(entityId) { entity ->
+            entity.prevX = prevX
+            entity.prevY = prevY
+            entity.prevZ = prevZ
+        }
+    }
+
+    fun updateAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): ThrownItemSnapshot? {
+        if (!ax.isFinite() || !ay.isFinite() || !az.isFinite()) return null
+        return mutate(entityId) { entity ->
+            entity.accelerationX = ax
+            entity.accelerationY = ay
+            entity.accelerationZ = az
+        }
+    }
+
+    fun updateOwnerEntityId(entityId: Int, ownerEntityId: Int): ThrownItemSnapshot? {
+        return mutate(entityId) { entity ->
+            entity.ownerEntityId = ownerEntityId
+        }
+    }
+
+    fun updateKind(entityId: Int, kind: ThrownItemKind): ThrownItemSnapshot? {
+        return mutate(entityId) { entity ->
+            entity.kind = kind
+        }
+    }
+
+    fun updateOnGround(entityId: Int, onGround: Boolean): ThrownItemSnapshot? {
+        return mutate(entityId) { entity ->
+            entity.onGround = onGround
+        }
+    }
 
     fun snapshotsInChunk(chunkX: Int, chunkZ: Int): List<ThrownItemSnapshot> {
         val chunkPos = ChunkPos(chunkX, chunkZ)
@@ -342,6 +424,12 @@ class ThrownItemSystem(
     }
 
     private fun stepEntity(entity: MutableThrownItem, tickScale: Double) {
+        val deltaSeconds = tickScale / 20.0
+        if (entity.accelerationX != 0.0 || entity.accelerationY != 0.0 || entity.accelerationZ != 0.0) {
+            entity.vx += (entity.accelerationX * deltaSeconds) / 20.0
+            entity.vy += (entity.accelerationY * deltaSeconds) / 20.0
+            entity.vz += (entity.accelerationZ * deltaSeconds) / 20.0
+        }
         entity.vy -= GRAVITY_PER_TICK * tickScale
         entity.x += entity.vx * tickScale
         entity.y += entity.vy * tickScale
@@ -354,6 +442,48 @@ class ThrownItemSystem(
         if (abs(entity.vx) < VELOCITY_EPSILON) entity.vx = 0.0
         if (abs(entity.vy) < VELOCITY_EPSILON) entity.vy = 0.0
         if (abs(entity.vz) < VELOCITY_EPSILON) entity.vz = 0.0
+        entity.onGround = collidesAtPoint(entity.x, entity.y - PROJECTILE_COLLISION_RADIUS - 0.01, entity.z)
+    }
+
+    private inline fun mutate(entityId: Int, mutator: (MutableThrownItem) -> Unit): ThrownItemSnapshot? {
+        val entity = entities[entityId] ?: return null
+        val oldChunk = ChunkPos(entity.chunkX, entity.chunkZ)
+        synchronized(entity) {
+            mutator(entity)
+            val newChunkX = chunkXFromBlockX(entity.x)
+            val newChunkZ = chunkZFromBlockZ(entity.z)
+            val newChunk = ChunkPos(newChunkX, newChunkZ)
+            entity.chunkX = newChunkX
+            entity.chunkZ = newChunkZ
+            val snapshot = entity.snapshot()
+            snapshots[entityId] = snapshot
+            if (newChunk != oldChunk) {
+                moveChunkIndex(entityId, oldChunk, newChunk)
+            }
+            return snapshot
+        }
+    }
+
+    private fun collidesAtPoint(x: Double, y: Double, z: Double): Boolean {
+        val blockX = floor(x).toInt()
+        val blockY = floor(y).toInt()
+        val blockZ = floor(z).toInt()
+        val stateId = blockStateAt(blockX, blockY, blockZ)
+        if (stateId <= 0) return false
+        val boxes = collisionBoxesForState(stateId)
+        if (boxes.isEmpty()) return false
+        val localX = x - blockX
+        val localY = y - blockY
+        val localZ = z - blockZ
+        for (box in boxes) {
+            if (localX >= box.minX && localX <= box.maxX &&
+                localY >= box.minY && localY <= box.maxY &&
+                localZ >= box.minZ && localZ <= box.maxZ
+            ) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun firstCollisionHit(

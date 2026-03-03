@@ -27,6 +27,7 @@ import org.macaroon3145.network.handler.HandshakeHandler
 import org.macaroon3145.network.handler.ChunkStreamingService
 import org.macaroon3145.network.handler.PlayPackets
 import org.macaroon3145.network.handler.PlayerSessionManager
+import org.macaroon3145.network.handler.PluginPacketBridgeHandler
 import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.network.codec.BlockEntityTypeRegistry
 import org.macaroon3145.network.codec.ItemBlockStateRegistry
@@ -43,6 +44,7 @@ import org.macaroon3145.world.EntityHitboxRegistry
 import org.macaroon3145.world.World
 import org.macaroon3145.world.WorldManager
 import org.macaroon3145.world.VanillaMiningRules
+import org.macaroon3145.plugin.PluginSystem
 import java.nio.file.Files
 import java.nio.file.Path
 import java.io.BufferedReader
@@ -142,6 +144,7 @@ fun main() {
     ServerConfig.setGameMode(parseGameMode(props.getProperty("default-gamemode")))
     ServerI18n.initialize()
     WorldManager.bootstrap(worldSeeds = worldSeeds, defaultWorld = defaultWorld)
+    PluginSystem.initialize()
     warmupPickBlockLookups()
     if (ServerConfig.compressionThreshold >= 0 && ServerConfig.compressionChunkLevel < 0) {
         ServerI18n.log("aerogel.log.warn.chunk_compression_disabled")
@@ -167,6 +170,7 @@ fun main() {
                     val pipeline = ch.pipeline()
                     pipeline.addLast("frameDecoder", MinecraftVarIntFrameDecoder())
                     pipeline.addLast("frameEncoder", MinecraftVarIntFrameEncoder())
+                    pipeline.addLast("pluginPacketBridge", PluginPacketBridgeHandler())
                     pipeline.addLast("handshakeHandler", HandshakeHandler())
                 }
             }).bind(Aerogel.PORT).sync().channel()
@@ -189,7 +193,6 @@ fun main() {
         ServerI18n.style("${ServerI18n.tr("aerogel.unit.seconds.short")})", ServerI18n.Color.GREEN)
     )
     startConsoleCommandLoop()
-    ServerDashboard.start()
     PerformanceMonitor.start()
     GameLoop.start()
 }

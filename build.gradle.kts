@@ -7,6 +7,8 @@ plugins {
 group = "org.macaroon3145"
 version = "1.0-SNAPSHOT"
 
+val skikoVersion = "0.9.18"
+
 repositories {
     mavenCentral()
     maven("https://repo.papermc.io/repository/maven-public/")
@@ -14,6 +16,7 @@ repositories {
 
 dependencies {
     testImplementation(kotlin("test"))
+    implementation(project(":api"))
 
     implementation("io.netty:netty-all:4.2.10.Final")
     runtimeOnly("io.netty:netty-transport-native-epoll:4.2.10.Final:linux-x86_64")
@@ -28,7 +31,17 @@ dependencies {
     implementation("org.slf4j:slf4j-api:2.0.16")
     implementation("org.recast4j:recast:1.5.11")
     implementation("org.recast4j:detour:1.5.11")
+    implementation("org.ow2.asm:asm:9.7.1")
+    implementation("org.ow2.asm:asm-commons:9.7.1")
+    implementation("net.bytebuddy:byte-buddy-agent:1.15.10")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.16")
+    implementation("org.jetbrains.skiko:skiko-awt:$skikoVersion")
+    runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-windows-x64:$skikoVersion")
+    runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-windows-arm64:$skikoVersion")
+    runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-macos-x64:$skikoVersion")
+    runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-macos-arm64:$skikoVersion")
+    runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-linux-x64:$skikoVersion")
+    runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-linux-arm64:$skikoVersion")
 
     // Mojang-mapped NMS classes via Paper userdev.
     paperweight.paperDevBundle("1.21.11-R0.1-SNAPSHOT")
@@ -55,6 +68,7 @@ tasks.register<Jar>("aerogelJar") {
     group = "build"
     description = "Builds Aerogel.jar"
     dependsOn("classes")
+    dependsOn(":api:jar")
     archiveBaseName.set("Aerogel")
     archiveVersion.set("")
     archiveClassifier.set("")
@@ -116,6 +130,7 @@ tasks.named("build") {
 val aerogelJarTask = tasks.named<Jar>("aerogelJar")
 val aerogelRunJvmArgs = listOf(
     "--enable-native-access=ALL-UNNAMED",
+    "--sun-misc-unsafe-memory-access=allow",
     "-Xms4G",
     "-Xmx4G"
 )
@@ -132,7 +147,11 @@ tasks.register<Exec>("runAerogelJar") {
 
     doFirst {
         val jarFile = aerogelJarTask.get().archiveFile.get().asFile
-        commandLine(listOf("java") + aerogelRunJvmArgs + listOf("-jar", jarFile.absolutePath))
+        commandLine(
+            listOf("java") +
+                aerogelRunJvmArgs +
+                listOf("-jar", jarFile.absolutePath)
+        )
     }
 }
 
@@ -150,7 +169,11 @@ tasks.register<Exec>("runAerogelJarInOsTerminal") {
 
         when {
             os.contains("win") -> {
-                val javaCommand = (listOf("java") + aerogelRunJvmArgs + listOf("-jar", "\"$jarPath\"")).joinToString(" ")
+                val javaCommand = (
+                    listOf("java") +
+                        aerogelRunJvmArgs +
+                        listOf("-jar", "\"$jarPath\"")
+                    ).joinToString(" ")
                 // Opens a new cmd window and keeps it open after process exit.
                 commandLine(
                     "cmd", "/c",
@@ -162,7 +185,11 @@ tasks.register<Exec>("runAerogelJarInOsTerminal") {
             os.contains("mac") -> {
                 val escapedProjectDir = project.projectDir.absolutePath.replace("\"", "\\\"")
                 val escapedJarPath = jarPath.replace("\"", "\\\"")
-                val javaCommand = (listOf("java") + aerogelRunJvmArgs + listOf("-jar", "\"$escapedJarPath\"")).joinToString(" ")
+                val javaCommand = (
+                    listOf("java") +
+                        aerogelRunJvmArgs +
+                        listOf("-jar", "\"$escapedJarPath\"")
+                    ).joinToString(" ")
                 commandLine(
                     "osascript", "-e",
                     "tell application \"Terminal\" to do script \"cd \\\"$escapedProjectDir\\\"; $javaCommand\""
@@ -172,7 +199,11 @@ tasks.register<Exec>("runAerogelJarInOsTerminal") {
                 // Linux/Unix: tries common terminal emulators.
                 val escapedProjectDir = project.projectDir.absolutePath.replace("'", "'\"'\"'")
                 val escapedJarPath = jarPath.replace("'", "'\"'\"'")
-                val javaCommand = (listOf("java") + aerogelRunJvmArgs + listOf("-jar", "\"$escapedJarPath\"")).joinToString(" ")
+                val javaCommand = (
+                    listOf("java") +
+                        aerogelRunJvmArgs +
+                        listOf("-jar", "\"$escapedJarPath\"")
+                    ).joinToString(" ")
                 val script = """
                     if command -v x-terminal-emulator >/dev/null 2>&1; then
                       x-terminal-emulator -e sh -lc 'cd "$escapedProjectDir"; $javaCommand; exec sh'
