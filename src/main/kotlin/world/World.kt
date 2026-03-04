@@ -917,6 +917,42 @@ class World(
         )
     }
 
+    fun setAnimalPosition(entityId: Int, x: Double, y: Double, z: Double, yaw: Float? = null, pitch: Float? = null): Boolean {
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return false
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.setPosition(entityId, x, y, z, yaw, pitch) },
+            enqueuedFromOtherChunkActor = { true }
+        )
+    }
+
+    fun setAnimalPushable(entityId: Int, value: Boolean): Boolean {
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return false
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.setPushable(entityId, value) },
+            enqueuedFromOtherChunkActor = { true }
+        )
+    }
+
+    fun setAnimalCollision(entityId: Int, value: Boolean): Boolean {
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return false
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.setCollision(entityId, value) },
+            enqueuedFromOtherChunkActor = { true }
+        )
+    }
+
+    fun setAnimalGravity(entityId: Int, value: Boolean): Boolean {
+        val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return false
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.setGravity(entityId, value) },
+            enqueuedFromOtherChunkActor = { true }
+        )
+    }
+
     fun addAnimalHorizontalImpulse(entityId: Int, impulseX: Double, impulseZ: Double): Boolean {
         val chunkPos = animalSystem.snapshot(entityId)?.chunkPos ?: return false
         return runOnAnimalChunk(

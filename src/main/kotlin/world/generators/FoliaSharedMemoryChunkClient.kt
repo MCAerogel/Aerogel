@@ -6,6 +6,7 @@ import org.macaroon3145.world.GeneratedChunk
 import org.macaroon3145.world.HeightmapData
 import org.macaroon3145.world.BlockStateLookupWorldGenerator
 import org.macaroon3145.world.WorldGenerator
+import org.macaroon3145.api.world.ChunkState
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream
@@ -54,6 +55,22 @@ object FoliaSharedMemoryWorldGenerator : WorldGenerator, BlockStateLookupWorldGe
 
     fun retainLoadedChunks(worldKey: String, chunks: Set<ChunkPos>) {
         client.retainLoadedChunks(worldKey, chunks)
+    }
+
+    fun loadChunk(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
+        return client.loadChunk(worldKey, chunkX, chunkZ)
+    }
+
+    fun unloadChunk(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
+        return client.unloadChunk(worldKey, chunkX, chunkZ)
+    }
+
+    fun isChunkLoaded(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
+        return client.isChunkLoaded(worldKey, chunkX, chunkZ)
+    }
+
+    fun chunkState(worldKey: String, chunkX: Int, chunkZ: Int): ChunkState {
+        return client.chunkState(worldKey, chunkX, chunkZ)
     }
 }
 
@@ -337,6 +354,63 @@ private class FoliaSharedMemoryChunkClient {
             retainedChunkKeys.add(ChunkCacheKey(worldKey, chunk.x, chunk.z))
         }
         trimDecodedChunkCache()
+    }
+
+    fun loadChunk(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
+        val chunkKey = ChunkCacheKey(worldKey, chunkX, chunkZ)
+        return requestAndAwaitSnapshot(chunkKey) != null
+    }
+
+    fun unloadChunk(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
+        val chunkKey = ChunkCacheKey(worldKey, chunkX, chunkZ)
+        val bridgeRequested = requestBridgeChunkUnload(worldKey, chunkX, chunkZ)
+        retainedChunkKeys.remove(chunkKey)
+        val removed = chunkCache.remove(chunkKey)
+        return bridgeRequested || removed != null
+    }
+
+    fun isChunkLoaded(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
+        val chunkKey = ChunkCacheKey(worldKey, chunkX, chunkZ)
+        val entry = chunkCache[chunkKey] ?: return false
+        return entry.snapshot.get() != null
+    }
+
+    fun chunkState(worldKey: String, chunkX: Int, chunkZ: Int): ChunkState {
+        val chunkKey = ChunkCacheKey(worldKey, chunkX, chunkZ)
+        val entry = chunkCache[chunkKey] ?: return ChunkState.UNLOADED
+        if (entry.snapshot.get() != null) return ChunkState.LOADED
+        val decodeTask = entry.decodeTask.get()
+        if (decodeTask != null && !decodeTask.isDone) return ChunkState.LOADING
+        val loadTask = entry.loadTask.get()
+        if (loadTask != null && !loadTask.isDone) return ChunkState.LOADING
+        return ChunkState.UNLOADED
+    }
+
+    private fun requestBridgeChunkUnload(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
+        val sanitizedWorldKey = worldKey.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+        val payload = "$sanitizedWorldKey\t$chunkX\t$chunkZ\n"
+        val requestPath = ipcDir.resolve("chunk-unload-requests.tsv")
+        return runCatching {
+            Files.createDirectories(ipcDir)
+            Files.writeString(
+                requestPath,
+                payload,
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.APPEND
+            )
+            true
+        }.getOrElse { throwable ->
+            logger.warn(
+                "Failed to request bridge chunk unload for {} {},{}",
+                worldKey,
+                chunkX,
+                chunkZ,
+                throwable
+            )
+            false
+        }
     }
 
     private fun loadSnapshotOnDemand(chunkKey: ChunkCacheKey): ChunkStateSnapshot? {

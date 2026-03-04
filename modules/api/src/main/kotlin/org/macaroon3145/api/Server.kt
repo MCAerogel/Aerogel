@@ -17,12 +17,22 @@ object Server {
     private var boundTaskScheduler: TaskScheduler? = null
     @Volatile
     private var playerRegistry: PlayerRegistry? = null
+    @Volatile
+    private var currentTps: Double = 0.0
+    @Volatile
+    private var currentMspt: Double = 0.0
 
     val mainTickScheduler: TickScheduler
         get() = checkNotNull(boundMainTickScheduler) { "Server is not initialized yet: mainTickScheduler is unavailable." }
 
     val taskScheduler: TaskScheduler
         get() = checkNotNull(boundTaskScheduler) { "Server is not initialized yet: taskScheduler is unavailable." }
+
+    val tps: Double
+        get() = currentTps
+
+    val mspt: Double
+        get() = currentMspt
 
     val defaultWorld: World
         get() = checkNotNull(worldRegistry?.defaultWorld()) { "Server is not initialized yet: defaultWorld is unavailable." }
@@ -61,10 +71,17 @@ object Server {
         playerRegistry = registry
     }
 
+    fun updateTickPerformance(tps: Double, mspt: Double) {
+        currentTps = if (tps.isFinite()) tps else 0.0
+        currentMspt = if (mspt.isFinite()) mspt else 0.0
+    }
+
     fun clearBindings() {
         worldRegistry = null
         boundMainTickScheduler = null
         boundTaskScheduler = null
         playerRegistry = null
+        currentTps = 0.0
+        currentMspt = 0.0
     }
 }

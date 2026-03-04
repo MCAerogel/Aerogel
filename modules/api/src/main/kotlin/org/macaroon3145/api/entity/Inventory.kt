@@ -56,6 +56,14 @@ data class Item(
     var name: String? = null,
     var lore: List<String> = emptyList()
 ) {
+    data class Translation(
+        val key: String,
+        val args: List<String> = emptyList()
+    )
+
+    private var translatedName: Translation? = null
+    private var translatedLore: List<Translation> = emptyList()
+
     @JvmOverloads
     constructor(
         type: ItemType,
@@ -72,31 +80,95 @@ data class Item(
 
     fun setName(name: String?): Item {
         this.name = name
+        this.translatedName = null
         return this
     }
 
     fun resetName(): Item {
         this.name = null
+        this.translatedName = null
         return this
     }
 
     fun setLore(lines: List<String>): Item {
         lore = lines.toList()
+        translatedLore = emptyList()
         return this
     }
 
     fun setLore(vararg lines: String): Item {
         lore = lines.toList()
+        translatedLore = emptyList()
         return this
     }
 
     fun resetLore(): Item {
         lore = emptyList()
+        translatedLore = emptyList()
+        return this
+    }
+
+    fun trName(key: String, vararg args: String): Item {
+        val normalizedKey = normalizeTranslationKey(key)
+        translatedName = Translation(key = normalizedKey, args = args.toList())
+        name = null
+        return this
+    }
+
+    fun trLore(vararg keys: String): Item {
+        translatedLore = keys
+            .map(::normalizeTranslationKey)
+            .filter { it.isNotEmpty() }
+            .map { Translation(key = it) }
+        lore = emptyList()
+        return this
+    }
+
+    fun trLore(translations: List<Translation>): Item {
+        translatedLore = translations
+            .map { Translation(key = normalizeTranslationKey(it.key), args = it.args.toList()) }
+            .filter { it.key.isNotEmpty() }
+        lore = emptyList()
+        return this
+    }
+
+    fun translatedName(): Translation? {
+        val tr = translatedName ?: return null
+        return tr.copy(args = tr.args.toList())
+    }
+
+    fun translatedLore(): List<Translation> = translatedLore.map { it.copy(args = it.args.toList()) }
+
+    fun resolvedName(translator: (key: String, args: List<String>) -> String): String? {
+        val tr = translatedName
+        if (tr != null) return translator(tr.key, tr.args)
+        return name
+    }
+
+    fun resolvedLore(translator: (key: String, args: List<String>) -> String): List<String> {
+        if (translatedLore.isNotEmpty()) {
+            return translatedLore.map { translator(it.key, it.args) }
+        }
+        return lore.toList()
+    }
+
+    fun clearTranslations(): Item {
+        translatedName = null
+        translatedLore = emptyList()
         return this
     }
 
     fun clone(): Item {
-        return copy(lore = lore.toList())
+        val cloned = Item(
+            id = id,
+            type = type,
+            amount = amount,
+            name = name,
+            lore = lore.toList()
+        )
+        cloned.translatedName = translatedName?.let { it.copy(args = it.args.toList()) }
+        cloned.translatedLore = translatedLore.map { it.copy(args = it.args.toList()) }
+        return cloned
     }
 
     fun toJsonString(pretty: Boolean = false): String {
@@ -140,6 +212,10 @@ data class Item(
         private val prettyJson = Json { prettyPrint = true; ignoreUnknownKeys = true }
         private const val ITEM_BINARY_MAGIC = 0x41475249 // 'AGRI'
         private const val ITEM_BINARY_VERSION = 1
+
+        private fun normalizeTranslationKey(key: String): String {
+            return key.trim()
+        }
 
         fun fromJsonString(jsonText: String): Item {
             val root = compactJson.parseToJsonElement(jsonText).jsonObject
@@ -240,7 +316,7 @@ class InventorySlotView(
     }
 }
 
-data class PlayerInventorySnapshot(
+data class PlayerInventory(
     val selectedHotbarSlot: Int,
     val hotbar: MutableList<Item?>,
     val main: MutableList<Item?>,
@@ -277,3 +353,6 @@ data class PlayerInventorySnapshot(
         return hand
     }
 }
+
+typealias PlayerInventorySnapshot = PlayerInventory
+typealias Translation = Item.Translation

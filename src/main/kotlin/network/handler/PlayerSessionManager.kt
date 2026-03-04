@@ -104,6 +104,7 @@ data class PlayerSession(
     val entityId: Int,
     val skinPartsMask: Int,
     @Volatile var pingMs: Int,
+    @Volatile var pingMsExact: Double,
     @Volatile var x: Double,
     @Volatile var y: Double,
     @Volatile var z: Double,
@@ -333,8 +334,15 @@ data class SimulationChunkDelta(
 private data class ItemTextMeta(
     val expectedItemId: Int,
     val name: String?,
-    val lore: List<String>
-)
+    val lore: List<String>,
+    val translatedNameKey: String? = null,
+    val translatedNameArgs: List<String> = emptyList(),
+    val translatedLore: List<Pair<String, List<String>>> = emptyList()
+) {
+    fun hasTranslations(): Boolean {
+        return translatedNameKey != null || translatedLore.isNotEmpty()
+    }
+}
 
 private data class PlayerItemTextMeta(
     val hotbar: Array<ItemTextMeta?> = arrayOfNulls(9),
@@ -348,6 +356,7 @@ private data class PlayerItemTextMeta(
     private val nextEntityId = AtomicInteger(1)
     private val sessions = ConcurrentHashMap<ChannelId, PlayerSession>()
     private val itemTextMetaByPlayerUuid = ConcurrentHashMap<UUID, PlayerItemTextMeta>()
+    private val droppedItemTextMetaByEntityId = ConcurrentHashMap<Int, ItemTextMeta>()
     private val contexts = ConcurrentHashMap<ChannelId, ChannelHandlerContext>()
     private val channelFlushStates = ConcurrentHashMap<ChannelId, ChannelFlushState>()
     private val pendingAnimalRemovals = ConcurrentLinkedQueue<PendingAnimalRemoval>()
@@ -699,6 +708,7 @@ private data class PlayerItemTextMeta(
             entityId = allocateEntityId(),
             skinPartsMask = skinPartsMask,
             pingMs = 0,
+            pingMsExact = 0.0,
             x = spawnX,
             y = spawnY,
             z = spawnZ,
@@ -923,6 +933,8 @@ private data class PlayerItemTextMeta(
         return sessions.values.filter { it.worldKey == worldKey }
     }
 
+    fun players(): List<PlayerSession> = sessions.values.toList()
+
     fun setPlayerHealth(uuid: UUID, health: Float): Boolean {
         val session = sessions.values.firstOrNull { it.profile.uuid == uuid } ?: return false
         session.health = health.coerceAtLeast(0f)
@@ -963,6 +975,54 @@ private data class PlayerItemTextMeta(
         } else {
             transferPlayerToWorld(session, worldKey, x, y, z, resolvedYaw, resolvedPitch)
         }
+    }
+
+    fun jumpPlayer(uuid: UUID, heightBlocks: Double = VANILLA_DEFAULT_JUMP_HEIGHT_BLOCKS): Boolean {
+        val session = sessions.values.firstOrNull { it.profile.uuid == uuid } ?: return false
+        if (session.dead || session.gameMode == GAME_MODE_SPECTATOR) return false
+        val targetHeightBlocks = heightBlocks.coerceAtLeast(0.0)
+        val launchVelocityPerTick = launchVelocityForJumpHeight(targetHeightBlocks)
+        val jumpSpeed = launchVelocityPerTick * MINECRAFT_TICKS_PER_SECOND
+        return setPlayerSpeedMetersPerSecond(
+            uuid = uuid,
+            x = session.velocityX * MINECRAFT_TICKS_PER_SECOND,
+            y = jumpSpeed,
+            z = session.velocityZ * MINECRAFT_TICKS_PER_SECOND
+        )
+    }
+
+    private fun launchVelocityForJumpHeight(heightBlocks: Double): Double {
+        if (heightBlocks <= 0.0) return 0.0
+        var low = 0.0
+        var high = VANILLA_DEFAULT_JUMP_VELOCITY_PER_TICK
+        while (jumpApexHeightForLaunchVelocity(high) < heightBlocks && high < MAX_JUMP_LAUNCH_VELOCITY_PER_TICK) {
+            high = (high * 2.0).coerceAtMost(MAX_JUMP_LAUNCH_VELOCITY_PER_TICK)
+            if (high == MAX_JUMP_LAUNCH_VELOCITY_PER_TICK) break
+        }
+        repeat(JUMP_HEIGHT_BINARY_SEARCH_STEPS) {
+            val mid = (low + high) * 0.5
+            if (jumpApexHeightForLaunchVelocity(mid) >= heightBlocks) {
+                high = mid
+            } else {
+                low = mid
+            }
+        }
+        return high
+    }
+
+    private fun jumpApexHeightForLaunchVelocity(initialVelocityPerTick: Double): Double {
+        if (initialVelocityPerTick <= 0.0) return 0.0
+        var y = 0.0
+        var vy = initialVelocityPerTick
+        var apex = 0.0
+        repeat(MAX_JUMP_SIMULATION_TICKS) {
+            y += vy
+            if (y > apex) apex = y
+            val nextVy = (vy - VANILLA_GRAVITY_PER_TICK) * VANILLA_AIR_DRAG_PER_TICK
+            if (nextVy <= 0.0) return apex
+            vy = nextVy
+        }
+        return apex
     }
 
     private fun transferPlayerToWorld(
@@ -1147,10 +1207,23 @@ private data class PlayerItemTextMeta(
         itemId: Int,
         amount: Int,
         name: String? = null,
-        lore: List<String> = emptyList()
+        lore: List<String> = emptyList(),
+        translatedNameKey: String? = null,
+        translatedNameArgs: List<String> = emptyList(),
+        translatedLore: List<Pair<String, List<String>>> = emptyList()
     ): Boolean {
         val session = sessions.values.firstOrNull { it.profile.uuid == uuid } ?: return false
-        return setHotbarItem(session.channelId, slot, itemId, amount, name, lore)
+        return setHotbarItem(
+            channelId = session.channelId,
+            slot = slot,
+            itemId = itemId,
+            amount = amount,
+            name = name,
+            lore = lore,
+            translatedNameKey = translatedNameKey,
+            translatedNameArgs = translatedNameArgs,
+            translatedLore = translatedLore
+        )
     }
 
     fun setHotbarItem(
@@ -1159,7 +1232,10 @@ private data class PlayerItemTextMeta(
         itemId: Int,
         amount: Int,
         name: String? = null,
-        lore: List<String> = emptyList()
+        lore: List<String> = emptyList(),
+        translatedNameKey: String? = null,
+        translatedNameArgs: List<String> = emptyList(),
+        translatedLore: List<Pair<String, List<String>>> = emptyList()
     ): Boolean {
         val session = sessions[channelId] ?: return false
         if (slot !in 0..8) return false
@@ -1170,7 +1246,10 @@ private data class PlayerItemTextMeta(
             hotbarSlot = slot,
             itemId = normalizedId,
             name = name,
-            lore = lore
+            lore = lore,
+            translatedNameKey = translatedNameKey,
+            translatedNameArgs = translatedNameArgs,
+            translatedLore = translatedLore
         )
         session.pendingPickedBlockStateId = 0
         updateSelectedBlockStateAndEquipmentAfterHotbarMutation(session, changedHotbarA = slot, changedHotbarB = null)
@@ -1185,10 +1264,23 @@ private data class PlayerItemTextMeta(
         itemId: Int,
         amount: Int,
         name: String? = null,
-        lore: List<String> = emptyList()
+        lore: List<String> = emptyList(),
+        translatedNameKey: String? = null,
+        translatedNameArgs: List<String> = emptyList(),
+        translatedLore: List<Pair<String, List<String>>> = emptyList()
     ): Boolean {
         val session = sessions.values.firstOrNull { it.profile.uuid == uuid } ?: return false
-        return setMainInventoryItem(session.channelId, index, itemId, amount, name, lore)
+        return setMainInventoryItem(
+            channelId = session.channelId,
+            index = index,
+            itemId = itemId,
+            amount = amount,
+            name = name,
+            lore = lore,
+            translatedNameKey = translatedNameKey,
+            translatedNameArgs = translatedNameArgs,
+            translatedLore = translatedLore
+        )
     }
 
     fun setMainInventoryItem(
@@ -1197,7 +1289,10 @@ private data class PlayerItemTextMeta(
         itemId: Int,
         amount: Int,
         name: String? = null,
-        lore: List<String> = emptyList()
+        lore: List<String> = emptyList(),
+        translatedNameKey: String? = null,
+        translatedNameArgs: List<String> = emptyList(),
+        translatedLore: List<Pair<String, List<String>>> = emptyList()
     ): Boolean {
         val session = sessions[channelId] ?: return false
         if (index !in 0..26) return false
@@ -1209,7 +1304,10 @@ private data class PlayerItemTextMeta(
             mainIndex = index,
             itemId = normalizedId,
             name = name,
-            lore = lore
+            lore = lore,
+            translatedNameKey = translatedNameKey,
+            translatedNameArgs = translatedNameArgs,
+            translatedLore = translatedLore
         )
         session.pendingPickedBlockStateId = 0
         resyncPlayerInventoryViewsForSession(session)
@@ -1222,10 +1320,23 @@ private data class PlayerItemTextMeta(
         itemId: Int,
         amount: Int,
         name: String? = null,
-        lore: List<String> = emptyList()
+        lore: List<String> = emptyList(),
+        translatedNameKey: String? = null,
+        translatedNameArgs: List<String> = emptyList(),
+        translatedLore: List<Pair<String, List<String>>> = emptyList()
     ): Boolean {
         val session = sessions.values.firstOrNull { it.profile.uuid == uuid } ?: return false
-        return setArmorItem(session.channelId, slot, itemId, amount, name, lore)
+        return setArmorItem(
+            channelId = session.channelId,
+            slot = slot,
+            itemId = itemId,
+            amount = amount,
+            name = name,
+            lore = lore,
+            translatedNameKey = translatedNameKey,
+            translatedNameArgs = translatedNameArgs,
+            translatedLore = translatedLore
+        )
     }
 
     fun setArmorItem(
@@ -1234,7 +1345,10 @@ private data class PlayerItemTextMeta(
         itemId: Int,
         amount: Int,
         name: String? = null,
-        lore: List<String> = emptyList()
+        lore: List<String> = emptyList(),
+        translatedNameKey: String? = null,
+        translatedNameArgs: List<String> = emptyList(),
+        translatedLore: List<Pair<String, List<String>>> = emptyList()
     ): Boolean {
         val session = sessions[channelId] ?: return false
         val armorIndex = when (slot) {
@@ -1253,7 +1367,10 @@ private data class PlayerItemTextMeta(
             armorIndex = armorIndex,
             itemId = normalizedId,
             name = name,
-            lore = lore
+            lore = lore,
+            translatedNameKey = translatedNameKey,
+            translatedNameArgs = translatedNameArgs,
+            translatedLore = translatedLore
         )
         session.pendingPickedBlockStateId = 0
         broadcastHeldItemEquipment(session)
@@ -1273,10 +1390,22 @@ private data class PlayerItemTextMeta(
         itemId: Int,
         amount: Int,
         name: String? = null,
-        lore: List<String> = emptyList()
+        lore: List<String> = emptyList(),
+        translatedNameKey: String? = null,
+        translatedNameArgs: List<String> = emptyList(),
+        translatedLore: List<Pair<String, List<String>>> = emptyList()
     ): Boolean {
         val session = sessions.values.firstOrNull { it.profile.uuid == uuid } ?: return false
-        return setOffhandItem(session.channelId, itemId, amount, name, lore)
+        return setOffhandItem(
+            channelId = session.channelId,
+            itemId = itemId,
+            amount = amount,
+            name = name,
+            lore = lore,
+            translatedNameKey = translatedNameKey,
+            translatedNameArgs = translatedNameArgs,
+            translatedLore = translatedLore
+        )
     }
 
     fun setOffhandItem(
@@ -1284,7 +1413,10 @@ private data class PlayerItemTextMeta(
         itemId: Int,
         amount: Int,
         name: String? = null,
-        lore: List<String> = emptyList()
+        lore: List<String> = emptyList(),
+        translatedNameKey: String? = null,
+        translatedNameArgs: List<String> = emptyList(),
+        translatedLore: List<Pair<String, List<String>>> = emptyList()
     ): Boolean {
         val session = sessions[channelId] ?: return false
         val previousItemId = session.offhandItemId
@@ -1296,7 +1428,10 @@ private data class PlayerItemTextMeta(
             session = session,
             itemId = normalizedId,
             name = name,
-            lore = lore
+            lore = lore,
+            translatedNameKey = translatedNameKey,
+            translatedNameArgs = translatedNameArgs,
+            translatedLore = translatedLore
         )
         session.pendingPickedBlockStateId = 0
         broadcastHeldItemEquipment(session)
@@ -1339,6 +1474,10 @@ private data class PlayerItemTextMeta(
 
     fun onlineCount(): Int = sessions.size
 
+    fun allocateRuntimeEntityId(): Int = allocateEntityId()
+
+    fun channelContext(channelId: ChannelId): ChannelHandlerContext? = contexts[channelId]
+
     private fun normalizePluginInventoryStack(itemId: Int, amount: Int): Pair<Int, Int> {
         if (itemId < 0 || amount <= 0) return -1 to 0
         return itemId to amount.coerceAtMost(itemMaxStackSize(itemId))
@@ -1349,35 +1488,100 @@ private data class PlayerItemTextMeta(
         return itemMaxStackSizeByItemId[itemId].coerceIn(1, MAX_HOTBAR_STACK_SIZE)
     }
 
-    private fun setHotbarTextMeta(session: PlayerSession, hotbarSlot: Int, itemId: Int, name: String?, lore: List<String>) {
+    private fun setHotbarTextMeta(
+        session: PlayerSession,
+        hotbarSlot: Int,
+        itemId: Int,
+        name: String?,
+        lore: List<String>,
+        translatedNameKey: String?,
+        translatedNameArgs: List<String>,
+        translatedLore: List<Pair<String, List<String>>>
+    ) {
         val meta = itemTextMetaByPlayerUuid.computeIfAbsent(session.profile.uuid) { PlayerItemTextMeta() }
-        meta.hotbar[hotbarSlot] = buildItemTextMeta(itemId, name, lore)
+        meta.hotbar[hotbarSlot] = buildItemTextMeta(itemId, name, lore, translatedNameKey, translatedNameArgs, translatedLore)
     }
 
-    private fun setMainTextMeta(session: PlayerSession, mainIndex: Int, itemId: Int, name: String?, lore: List<String>) {
+    private fun setMainTextMeta(
+        session: PlayerSession,
+        mainIndex: Int,
+        itemId: Int,
+        name: String?,
+        lore: List<String>,
+        translatedNameKey: String?,
+        translatedNameArgs: List<String>,
+        translatedLore: List<Pair<String, List<String>>>
+    ) {
         val meta = itemTextMetaByPlayerUuid.computeIfAbsent(session.profile.uuid) { PlayerItemTextMeta() }
-        meta.main[mainIndex] = buildItemTextMeta(itemId, name, lore)
+        meta.main[mainIndex] = buildItemTextMeta(itemId, name, lore, translatedNameKey, translatedNameArgs, translatedLore)
     }
 
-    private fun setArmorTextMeta(session: PlayerSession, armorIndex: Int, itemId: Int, name: String?, lore: List<String>) {
+    private fun setArmorTextMeta(
+        session: PlayerSession,
+        armorIndex: Int,
+        itemId: Int,
+        name: String?,
+        lore: List<String>,
+        translatedNameKey: String?,
+        translatedNameArgs: List<String>,
+        translatedLore: List<Pair<String, List<String>>>
+    ) {
         val meta = itemTextMetaByPlayerUuid.computeIfAbsent(session.profile.uuid) { PlayerItemTextMeta() }
-        meta.armor[armorIndex] = buildItemTextMeta(itemId, name, lore)
+        meta.armor[armorIndex] = buildItemTextMeta(itemId, name, lore, translatedNameKey, translatedNameArgs, translatedLore)
     }
 
-    private fun setOffhandTextMeta(session: PlayerSession, itemId: Int, name: String?, lore: List<String>) {
+    private fun setOffhandTextMeta(
+        session: PlayerSession,
+        itemId: Int,
+        name: String?,
+        lore: List<String>,
+        translatedNameKey: String?,
+        translatedNameArgs: List<String>,
+        translatedLore: List<Pair<String, List<String>>>
+    ) {
         val meta = itemTextMetaByPlayerUuid.computeIfAbsent(session.profile.uuid) { PlayerItemTextMeta() }
-        meta.offhand = buildItemTextMeta(itemId, name, lore)
+        meta.offhand = buildItemTextMeta(itemId, name, lore, translatedNameKey, translatedNameArgs, translatedLore)
     }
 
-    private fun buildItemTextMeta(itemId: Int, name: String?, lore: List<String>): ItemTextMeta? {
+    private fun buildItemTextMeta(
+        itemId: Int,
+        name: String?,
+        lore: List<String>,
+        translatedNameKey: String?,
+        translatedNameArgs: List<String>,
+        translatedLore: List<Pair<String, List<String>>>
+    ): ItemTextMeta? {
         if (itemId < 0) return null
         val normalizedName = name?.trim()?.takeIf { it.isNotEmpty() }
         val normalizedLore = lore.asSequence()
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .toList()
-        if (normalizedName == null && normalizedLore.isEmpty()) return null
-        return ItemTextMeta(expectedItemId = itemId, name = normalizedName, lore = normalizedLore)
+        val normalizedTranslatedNameKey = translatedNameKey?.trim()?.takeIf { it.isNotEmpty() }
+        val normalizedTranslatedNameArgs = translatedNameArgs
+            .asSequence()
+            .map { it.trim() }
+            .toList()
+        val normalizedTranslatedLore = translatedLore
+            .asSequence()
+            .map { it.first.trim() to it.second.asSequence().map(String::trim).toList() }
+            .filter { it.first.isNotEmpty() }
+            .toList()
+        if (normalizedName == null &&
+            normalizedLore.isEmpty() &&
+            normalizedTranslatedNameKey == null &&
+            normalizedTranslatedLore.isEmpty()
+        ) {
+            return null
+        }
+        return ItemTextMeta(
+            expectedItemId = itemId,
+            name = normalizedName,
+            lore = normalizedLore,
+            translatedNameKey = normalizedTranslatedNameKey,
+            translatedNameArgs = normalizedTranslatedNameArgs,
+            translatedLore = normalizedTranslatedLore
+        )
     }
 
     private fun resyncPlayerInventoryViewsForSession(session: PlayerSession) {
@@ -2058,6 +2262,7 @@ private data class PlayerItemTextMeta(
             val playerMinY = player.y
             val playerMaxY = player.y + playerCollisionHeight(player)
             for (animal in animals) {
+                if (!animal.pushable) continue
                 val animalMinY = animal.y
                 val animalMaxY = animal.y + animal.hitboxHeight
                 if (playerMaxY <= animalMinY || playerMinY >= animalMaxY) continue
@@ -2171,10 +2376,12 @@ private data class PlayerItemTextMeta(
     ) {
         for (i in 0 until animals.size) {
             val a = animals[i]
+            if (!a.pushable) continue
             val aMinY = a.y
             val aMaxY = a.y + a.hitboxHeight
             for (j in (i + 1) until animals.size) {
                 val b = animals[j]
+                if (!b.pushable) continue
                 val bMinY = b.y
                 val bMaxY = b.y + b.hitboxHeight
                 if (aMaxY <= bMinY || aMinY >= bMaxY) continue
@@ -2521,6 +2728,120 @@ private data class PlayerItemTextMeta(
         return SpawnedEntityRef(entityId = entityId, uuid = uuid)
     }
 
+    fun spawnAnimalEntityAt(
+        worldKey: String,
+        kind: AnimalKind,
+        x: Double,
+        y: Double,
+        z: Double,
+        yaw: Float = 0f,
+        pitch: Float = 0f
+    ): SpawnedEntityRef? {
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite()) {
+            logger.warn("spawnAnimalEntityAt rejected non-finite position: world={}, kind={}, x={}, y={}, z={}", worldKey, kind, x, y, z)
+            return null
+        }
+        if (!yaw.isFinite() || !pitch.isFinite()) {
+            logger.warn("spawnAnimalEntityAt rejected non-finite rotation: world={}, kind={}, yaw={}, pitch={}", worldKey, kind, yaw, pitch)
+            return null
+        }
+        val world = WorldManager.world(worldKey)
+        if (world == null) {
+            logger.warn("spawnAnimalEntityAt failed: world not found: world={}, kind={}", worldKey, kind)
+            return null
+        }
+        val entityId = allocateEntityId()
+        val spawned = world.spawnAnimal(
+            entityId = entityId,
+            kind = kind,
+            x = x,
+            y = y,
+            z = z,
+            yaw = yaw,
+            pitch = pitch
+        )
+        if (!spawned) {
+            logger.warn(
+                "spawnAnimalEntityAt failed: world.spawnAnimal=false (world={}, kind={}, entityId={}, x={}, y={}, z={}, yaw={}, pitch={})",
+                worldKey,
+                kind,
+                entityId,
+                x,
+                y,
+                z,
+                yaw,
+                pitch
+            )
+            return null
+        }
+        val snapshot = world.animalSnapshot(entityId)
+        if (snapshot == null) {
+            logger.warn(
+                "spawnAnimalEntityAt failed: spawned animal snapshot missing (world={}, kind={}, entityId={})",
+                worldKey,
+                kind,
+                entityId
+            )
+            return null
+        }
+        return SpawnedEntityRef(entityId = entityId, uuid = snapshot.uuid)
+    }
+
+    fun animalSnapshot(worldKey: String, entityId: Int): AnimalSnapshot? {
+        return WorldManager.world(worldKey)?.animalSnapshot(entityId)
+    }
+
+    fun animalSnapshots(worldKey: String): List<AnimalSnapshot> {
+        return WorldManager.world(worldKey)?.animalSnapshots() ?: emptyList()
+    }
+
+    fun removeAnimalEntity(worldKey: String, entityId: Int): Boolean {
+        val world = WorldManager.world(worldKey) ?: return false
+        return world.removeAnimal(entityId) != null
+    }
+
+    fun setAnimalSpeedMetersPerSecond(worldKey: String, entityId: Int, x: Double, y: Double, z: Double): Boolean {
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return false
+        val world = WorldManager.world(worldKey) ?: return false
+        return world.setAnimalVelocity(
+            entityId = entityId,
+            vx = x / MINECRAFT_TICKS_PER_SECOND,
+            vy = y / MINECRAFT_TICKS_PER_SECOND,
+            vz = z / MINECRAFT_TICKS_PER_SECOND
+        )
+    }
+
+    fun setAnimalPosition(
+        worldKey: String,
+        entityId: Int,
+        x: Double,
+        y: Double,
+        z: Double,
+        yaw: Float? = null,
+        pitch: Float? = null
+    ): Boolean {
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return false
+        if (yaw != null && !yaw.isFinite()) return false
+        if (pitch != null && !pitch.isFinite()) return false
+        val world = WorldManager.world(worldKey) ?: return false
+        return world.setAnimalPosition(entityId, x, y, z, yaw, pitch)
+    }
+
+    fun setAnimalPushable(worldKey: String, entityId: Int, value: Boolean): Boolean {
+        val world = WorldManager.world(worldKey) ?: return false
+        return world.setAnimalPushable(entityId, value)
+    }
+
+    fun setAnimalCollision(worldKey: String, entityId: Int, value: Boolean): Boolean {
+        val world = WorldManager.world(worldKey) ?: return false
+        return world.setAnimalCollision(entityId, value)
+    }
+
+    fun setAnimalGravity(worldKey: String, entityId: Int, value: Boolean): Boolean {
+        val world = WorldManager.world(worldKey) ?: return false
+        return world.setAnimalGravity(entityId, value)
+    }
+
     fun droppedItemSnapshot(worldKey: String, entityId: Int): DroppedItemSnapshot? {
         return WorldManager.world(worldKey)?.droppedItemSnapshot(entityId)
     }
@@ -2545,10 +2866,35 @@ private data class PlayerItemTextMeta(
         return WorldManager.world(worldKey)?.thrownItemSnapshotByUuid(uuid)
     }
 
+    fun entityUuidByEntityId(worldKey: String, entityId: Int): UUID? {
+        playersInWorld(worldKey).firstOrNull { it.entityId == entityId }?.let { return it.profile.uuid }
+        WorldManager.world(worldKey)?.animalSnapshot(entityId)?.let { return it.uuid }
+        droppedItemSnapshot(worldKey, entityId)?.let { return it.uuid }
+        thrownItemSnapshot(worldKey, entityId)?.let { return it.uuid }
+        return null
+    }
+
+    fun entityIdByUuid(worldKey: String, uuid: UUID): Int? {
+        playersInWorld(worldKey).firstOrNull { it.profile.uuid == uuid }?.let { return it.entityId }
+        WorldManager.world(worldKey)?.animalSnapshots()?.firstOrNull { it.uuid == uuid }?.let { return it.entityId }
+        droppedItemSnapshotByUuid(worldKey, uuid)?.let { return it.entityId }
+        thrownItemSnapshotByUuid(worldKey, uuid)?.let { return it.entityId }
+        return null
+    }
+
+    fun simulationChunk(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
+        return activeSimulationChunksByWorldSnapshot()[worldKey]?.contains(ChunkPos(chunkX, chunkZ)) == true
+    }
+
     fun setDroppedItemStack(worldKey: String, entityId: Int, itemId: Int, amount: Int): Boolean {
         if (itemId < 0 || amount <= 0) return false
         val world = WorldManager.world(worldKey) ?: return false
-        return world.setDroppedItemStack(entityId, itemId, amount) != null
+        val updated = world.setDroppedItemStack(entityId, itemId, amount) ?: return false
+        val meta = droppedItemTextMetaByEntityId[entityId]
+        if (meta != null && meta.expectedItemId != updated.itemId) {
+            droppedItemTextMetaByEntityId.remove(entityId)
+        }
+        return true
     }
 
     fun setDroppedItemPosition(worldKey: String, entityId: Int, x: Double, y: Double, z: Double): Boolean {
@@ -2918,6 +3264,7 @@ private data class PlayerItemTextMeta(
 
         for (chunkPos in chunksInOrder) {
             for (pickup in pickupsByChunk[chunkPos].orEmpty()) {
+                droppedItemTextMetaByEntityId.remove(pickup.entityId)
                 val takePacket = PlayPackets.takeItemEntityPacket(
                     collectedEntityId = pickup.entityId,
                     collectorEntityId = pickup.collectorEntityId,
@@ -2941,6 +3288,7 @@ private data class PlayerItemTextMeta(
             }
 
             for (removed in droppedRemovedByChunk[chunkPos].orEmpty()) {
+                droppedItemTextMetaByEntityId.remove(removed.entityId)
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
                     val wasVisible = session.visibleDroppedItemEntityIds.remove(removed.entityId)
@@ -4920,6 +5268,9 @@ private data class PlayerItemTextMeta(
             session.yaw = targetYaw
             session.pitch = targetPitch
             session.onGround = onGround
+            if (onGround) {
+                session.airJumpAttemptCount = 0
+            }
             session.clientEyeX = session.x
             session.clientEyeY = session.y + playerEyeOffset(session)
             session.clientEyeZ = session.z
@@ -5286,6 +5637,51 @@ private data class PlayerItemTextMeta(
                 )
             }
             playAttackFeedback(attacker, knockbackAttack, criticalAttack, strongAttack, playedSweep)
+            return
+        }
+
+        val botSnapshot = org.macaroon3145.plugin.PluginSystem.runtimeBotSnapshot(attacker.worldKey, targetEntityId)
+        if (botSnapshot != null) {
+            val dx = attacker.x - botSnapshot.x
+            val dy = attacker.y - botSnapshot.y
+            val dz = attacker.z - botSnapshot.z
+            val distanceSq = dx * dx + dy * dy + dz * dz
+            if (distanceSq > MAX_PLAYER_MELEE_REACH_SQ) return
+            resetPlayerAttackStrengthTicker(attacker)
+
+            val criticalAttack = strongAttack && canCriticalAttackAgainstPoint(attacker, botSnapshot.x, botSnapshot.y, botSnapshot.z)
+            var damage = scaledPlayerBaseDamage(meleeAttackDamage(attacker).coerceAtLeast(1.0f), attackStrengthScale)
+            if (criticalAttack) {
+                damage *= VANILLA_CRITICAL_DAMAGE_MULTIPLIER
+            }
+            val knockbackStrength = if (knockbackAttack) ANIMAL_SPRINT_ATTACK_KNOCKBACK else ANIMAL_BASE_ATTACK_KNOCKBACK
+            val botDamageResult = org.macaroon3145.plugin.PluginSystem.damageRuntimeBot(
+                worldKey = attacker.worldKey,
+                entityId = targetEntityId,
+                amount = damage,
+                attackerX = attacker.x,
+                attackerZ = attacker.z,
+                knockbackStrength = knockbackStrength
+            ) ?: return
+
+            if (criticalAttack) {
+                broadcastEntityAnimation(attacker.worldKey, targetEntityId, ENTITY_ANIMATION_CRITICAL_HIT)
+            }
+            if (botDamageResult.knockbackApplied) {
+                broadcastAttackKnockbackAt(
+                    worldKey = attacker.worldKey,
+                    x = botDamageResult.x,
+                    y = botDamageResult.y + 0.9,
+                    z = botDamageResult.z
+                )
+            }
+            playAttackFeedback(
+                attacker = attacker,
+                knockbackAttack = knockbackAttack,
+                criticalAttack = criticalAttack,
+                strongAttack = strongAttack,
+                sweepAttack = false
+            )
             return
         }
 
@@ -6471,8 +6867,9 @@ private data class PlayerItemTextMeta(
         session.inputJump = jump
         session.previousInputJump = jump
         if (jumpPressed) {
-            val fromGround = session.onGround
+            val fromGround = session.onGround || isPlayerGroundedNow(session)
             val airJumpAttemptCount = if (fromGround) {
+                session.airJumpAttemptCount = 0
                 0
             } else {
                 val next = session.airJumpAttemptCount + 1
@@ -6501,6 +6898,18 @@ private data class PlayerItemTextMeta(
         if (!wasSneaking && sneaking && session.ridingAnimalEntityId >= 0) {
             handlePlayerDismountRequest(channelId)
         }
+    }
+
+    private fun isPlayerGroundedNow(session: PlayerSession): Boolean {
+        val world = WorldManager.world(session.worldKey) ?: return session.onGround
+        return playerCollisionAt(
+            world = world,
+            x = session.x,
+            y = session.y - GROUND_CONTACT_EPSILON,
+            z = session.z,
+            halfWidth = PLAYER_HITBOX_HALF_WIDTH,
+            height = playerCollisionHeight(session)
+        )
     }
 
     fun updatePlayerFlyingState(channelId: ChannelId, flying: Boolean) {
@@ -6633,6 +7042,7 @@ private data class PlayerItemTextMeta(
         contexts.clear()
         sessions.clear()
         itemTextMetaByPlayerUuid.clear()
+        droppedItemTextMetaByEntityId.clear()
         animalSourceDirtyWorlds.clear()
         animalRideControlsActiveWorlds.clear()
         attackCooldownActiveChannelIds.clear()
@@ -6730,7 +7140,54 @@ private data class PlayerItemTextMeta(
 
     fun updateLocale(channelId: ChannelId, locale: String) {
         val session = sessions[channelId] ?: return
+        if (session.locale == locale) return
         session.locale = locale
+        resyncTranslatedItemTextForLocaleChange(session)
+    }
+
+    private fun resyncTranslatedItemTextForLocaleChange(session: PlayerSession) {
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+
+        if (hasTranslatedInventoryTextMeta(session)) {
+            resyncPlayerInventoryViewsForSession(session)
+        }
+        if (!hasVisibleTranslatedDroppedItems(session)) return
+
+        val world = WorldManager.world(session.worldKey) ?: return
+        for (entityId in session.visibleDroppedItemEntityIds) {
+            val meta = droppedItemTextMetaByEntityId[entityId] ?: continue
+            if (!meta.hasTranslations()) continue
+            val snapshot = world.droppedItemSnapshot(entityId) ?: continue
+            if (snapshot.itemId != meta.expectedItemId || snapshot.itemCount <= 0) continue
+            ctx.write(
+                PlayPackets.itemEntityMetadataPacket(
+                    entityId = entityId,
+                    encodedItemStack = encodedItemStack(
+                        itemId = snapshot.itemId,
+                        count = snapshot.itemCount,
+                        textMeta = meta,
+                        localeTag = session.locale
+                    )
+                )
+            )
+        }
+        ctx.flush()
+    }
+
+    private fun hasTranslatedInventoryTextMeta(session: PlayerSession): Boolean {
+        val playerMeta = itemTextMetaByPlayerUuid[session.profile.uuid] ?: return false
+        if (playerMeta.hotbar.any { it?.hasTranslations() == true }) return true
+        if (playerMeta.main.any { it?.hasTranslations() == true }) return true
+        if (playerMeta.armor.any { it?.hasTranslations() == true }) return true
+        return playerMeta.offhand?.hasTranslations() == true
+    }
+
+    private fun hasVisibleTranslatedDroppedItems(session: PlayerSession): Boolean {
+        for (entityId in session.visibleDroppedItemEntityIds) {
+            if (droppedItemTextMetaByEntityId[entityId]?.hasTranslations() == true) return true
+        }
+        return false
     }
 
     fun inGameCommandSuggestions(sender: PlayerSession?, input: String, includeOperatorCommands: Boolean): CommandSuggestionWindow {
@@ -9464,7 +9921,7 @@ private data class PlayerItemTextMeta(
         val count = session.hotbarItemCounts[slot]
         if (itemId < 0 || count <= 0) return emptyItemStack()
         val meta = resolveHotbarTextMeta(session, slot, itemId)
-        return encodedItemStack(itemId, count, meta)
+        return encodedItemStack(itemId, count, meta, session.locale)
     }
 
     private fun encodedMainSlot(session: PlayerSession, index: Int): ByteArray {
@@ -9473,7 +9930,7 @@ private data class PlayerItemTextMeta(
         val count = session.mainInventoryItemCounts[index]
         if (itemId < 0 || count <= 0) return emptyItemStack()
         val meta = resolveMainTextMeta(session, index, itemId)
-        return encodedItemStack(itemId, count, meta)
+        return encodedItemStack(itemId, count, meta, session.locale)
     }
 
     private fun encodedArmorSlot(session: PlayerSession, armorIndex: Int): ByteArray {
@@ -9482,7 +9939,7 @@ private data class PlayerItemTextMeta(
         val count = session.armorItemCounts[armorIndex]
         if (itemId < 0 || count <= 0) return emptyItemStack()
         val meta = resolveArmorTextMeta(session, armorIndex, itemId)
-        return encodedItemStack(itemId, count, meta)
+        return encodedItemStack(itemId, count, meta, session.locale)
     }
 
     private fun encodedOffhandSlot(session: PlayerSession): ByteArray {
@@ -9490,7 +9947,7 @@ private data class PlayerItemTextMeta(
         val count = session.offhandItemCount
         if (itemId < 0 || count <= 0) return emptyItemStack()
         val meta = resolveOffhandTextMeta(session, itemId)
-        return encodedItemStack(itemId, count, meta)
+        return encodedItemStack(itemId, count, meta, session.locale)
     }
 
     private fun encodePlayerInventoryContainerItems(session: PlayerSession): List<ByteArray> {
@@ -10223,11 +10680,13 @@ private data class PlayerItemTextMeta(
 
         val dropCount = if (dropStack) count else 1
         if (dropCount <= 0) return
+        val dropTextMeta = resolveHotbarTextMeta(session, slot, itemId)
         val spawned = spawnDroppedItemFromPlayer(
             session = session,
             itemId = itemId,
             itemCount = dropCount,
-            dropStackMotion = dropStack
+            dropStackMotion = dropStack,
+            textMeta = dropTextMeta
         )
         if (!spawned) return
 
@@ -10246,11 +10705,7 @@ private data class PlayerItemTextMeta(
         val ctx = contexts[channelId]
         if (ctx != null && ctx.channel().isActive) {
             val inventoryStateId = nextInventoryStateId(session)
-            val encoded = if (session.hotbarItemIds[slot] >= 0 && session.hotbarItemCounts[slot] > 0) {
-                encodedItemStack(session.hotbarItemIds[slot], session.hotbarItemCounts[slot])
-            } else {
-                emptyItemStack()
-            }
+            val encoded = encodedHotbarSlot(session, slot)
             ctx.writeAndFlush(
                 PlayPackets.containerSetSlotPacket(
                     containerId = 0,
@@ -11535,7 +11990,8 @@ private data class PlayerItemTextMeta(
         session: PlayerSession,
         itemId: Int,
         itemCount: Int,
-        dropStackMotion: Boolean
+        dropStackMotion: Boolean,
+        textMeta: ItemTextMeta? = null
     ): Boolean {
         if (itemId < 0 || itemCount <= 0) return false
         val world = WorldManager.world(session.worldKey) ?: return false
@@ -11555,8 +12011,9 @@ private data class PlayerItemTextMeta(
         val vy = dirY * launchSpeed + 0.16
         val vz = dirZ * launchSpeed
 
-        return world.spawnDroppedItem(
-            entityId = allocateEntityId(),
+        val entityId = allocateEntityId()
+        val spawned = world.spawnDroppedItem(
+            entityId = entityId,
             itemId = itemId,
             itemCount = itemCount,
             x = spawnX,
@@ -11567,6 +12024,17 @@ private data class PlayerItemTextMeta(
             vz = vz,
             pickupDelaySeconds = PLAYER_DROPPED_ITEM_PICKUP_DELAY_SECONDS
         )
+        if (spawned) {
+            val normalizedMeta = textMeta?.takeIf { it.expectedItemId == itemId }
+            if (normalizedMeta != null) {
+                droppedItemTextMetaByEntityId[entityId] = normalizedMeta
+            } else {
+                droppedItemTextMetaByEntityId.remove(entityId)
+            }
+        } else {
+            droppedItemTextMetaByEntityId.remove(entityId)
+        }
+        return spawned
     }
 
     private fun collectDroppedItemPickups(
@@ -11635,6 +12103,7 @@ private data class PlayerItemTextMeta(
             if (!canAbsorbDroppedItem(collector, snapshot.itemId, snapshot.itemCount)) continue
 
             val removedSnapshot = world.removeDroppedItemIfUuidMatches(snapshot.entityId, snapshot.uuid) ?: continue
+            droppedItemTextMetaByEntityId.remove(removedSnapshot.entityId)
             if (!absorbDroppedItemIntoHotbar(
                     session = collector,
                     itemId = removedSnapshot.itemId,
@@ -11790,11 +12259,7 @@ private data class PlayerItemTextMeta(
         val ctx = contexts[session.channelId]
         if (ctx != null && ctx.channel().isActive) {
             for (slot in changedHotbarSlots) {
-                val encoded = if (session.hotbarItemIds[slot] >= 0 && session.hotbarItemCounts[slot] > 0) {
-                    encodedItemStack(session.hotbarItemIds[slot], session.hotbarItemCounts[slot])
-                } else {
-                    emptyItemStack()
-                }
+                val encoded = encodedHotbarSlot(session, slot)
                 enqueueDroppedItemPacket(
                     outboundByContext,
                     ctx,
@@ -11808,11 +12273,7 @@ private data class PlayerItemTextMeta(
             }
             for (index in changedMainInventorySlots) {
                 val inventorySlot = inventorySlotForMainInventoryIndex(index)
-                val encoded = if (session.mainInventoryItemIds[index] >= 0 && session.mainInventoryItemCounts[index] > 0) {
-                    encodedItemStack(session.mainInventoryItemIds[index], session.mainInventoryItemCounts[index])
-                } else {
-                    emptyItemStack()
-                }
+                val encoded = encodedMainSlot(session, index)
                 enqueueDroppedItemPacket(
                     outboundByContext,
                     ctx,
@@ -12080,7 +12541,7 @@ private data class PlayerItemTextMeta(
             ctx,
             PlayPackets.itemEntityMetadataPacket(
                 entityId = snapshot.entityId,
-                encodedItemStack = PlayPackets.encodeItemStack(snapshot.itemId, snapshot.itemCount)
+                encodedItemStack = encodedDroppedItemStackForSession(session, snapshot)
             )
         )
         enqueueDroppedItemPacket(
@@ -12114,7 +12575,7 @@ private data class PlayerItemTextMeta(
         ctx.write(
             PlayPackets.itemEntityMetadataPacket(
                 entityId = snapshot.entityId,
-                encodedItemStack = PlayPackets.encodeItemStack(snapshot.itemId, snapshot.itemCount)
+                encodedItemStack = encodedDroppedItemStackForSession(session, snapshot)
             )
         )
         ctx.write(
@@ -12126,6 +12587,12 @@ private data class PlayerItemTextMeta(
             )
         )
         session.droppedItemTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(snapshot, syncVx, syncVy, syncVz)
+    }
+
+    private fun encodedDroppedItemStackForSession(session: PlayerSession, snapshot: DroppedItemSnapshot): ByteArray {
+        val meta = droppedItemTextMetaByEntityId[snapshot.entityId]
+            ?.takeIf { it.expectedItemId == snapshot.itemId }
+        return encodedItemStack(snapshot.itemId, snapshot.itemCount, meta, session.locale)
     }
 
     private fun droppedItemMovementPackets(
@@ -13889,10 +14356,16 @@ private data class PlayerItemTextMeta(
     }
 
     fun updateAndBroadcastPing(channelId: ChannelId, pingMs: Int) {
+        updateAndBroadcastPing(channelId, pingMs.toDouble())
+    }
+
+    fun updateAndBroadcastPing(channelId: ChannelId, pingMsExact: Double) {
         val session = sessions[channelId] ?: return
-        val clamped = pingMs.coerceIn(0, 60_000)
-        if (session.pingMs == clamped) return
+        val clampedExact = pingMsExact.coerceIn(0.0, 60_000.0)
+        val clamped = clampedExact.toInt()
+        if (session.pingMs == clamped && session.pingMsExact == clampedExact) return
         session.pingMs = clamped
+        session.pingMsExact = clampedExact
 
         val packet = PlayPackets.playerInfoLatencyUpdatePacket(session.profile.uuid, clamped)
         for ((id, other) in sessions) {
@@ -15118,15 +15591,28 @@ private data class PlayerItemTextMeta(
         return meta
     }
 
-    private fun encodedItemStack(itemId: Int, count: Int = 1, textMeta: ItemTextMeta? = null): ByteArray {
+    private fun encodedItemStack(
+        itemId: Int,
+        count: Int = 1,
+        textMeta: ItemTextMeta? = null,
+        localeTag: String? = null
+    ): ByteArray {
         val out = ByteArrayOutputStream(8)
         // 1.20.5+ Slot shape:
         // [count VarInt][itemId VarInt][added_components VarInt][components...][removed_components VarInt]
         NetworkUtils.writeVarInt(out, count.coerceAtLeast(1))
         NetworkUtils.writeVarInt(out, itemId)
         val meta = textMeta
-        val name = meta?.name
-        val lore = meta?.lore ?: emptyList()
+        val name = if (meta?.translatedNameKey != null) {
+            resolveItemTranslation(localeTag, meta.translatedNameKey, meta.translatedNameArgs)
+        } else {
+            meta?.name
+        }
+        val lore = if (meta != null && meta.translatedLore.isNotEmpty()) {
+            meta.translatedLore.map { (key, args) -> resolveItemTranslation(localeTag, key, args) }
+        } else {
+            meta?.lore ?: emptyList()
+        }
         val hasName = name != null
         val hasLore = lore.isNotEmpty()
         val added = (if (hasName) 1 else 0) + (if (hasLore) 1 else 0)
@@ -15141,6 +15627,10 @@ private data class PlayerItemTextMeta(
             out.write(componentListPayload(lore))
         }
         return out.toByteArray()
+    }
+
+    private fun resolveItemTranslation(localeTag: String?, key: String, args: List<String>): String {
+        return org.macaroon3145.plugin.PluginSystem.resolveTranslationForLocale(localeTag, key, args) ?: key
     }
 
     private fun styledTextComponentPayload(text: String): ByteArray {
@@ -15435,6 +15925,14 @@ private data class PlayerItemTextMeta(
     private const val VANILLA_JUMP_EXHAUSTION = 0.05f
     private const val VANILLA_SPRINT_JUMP_EXHAUSTION = 0.2f
     private const val VANILLA_JUMP_MIN_ASCENT_METERS = 1.0e-6
+    private const val VANILLA_GRAVITY_PER_TICK = 0.08
+    private const val VANILLA_AIR_DRAG_PER_TICK = 0.98
+    private const val VANILLA_DEFAULT_JUMP_VELOCITY_PER_TICK = 0.42
+    private const val VANILLA_DEFAULT_JUMP_HEIGHT_BLOCKS = 1.252203352512
+    private const val MAX_JUMP_LAUNCH_VELOCITY_PER_TICK = 32.0
+    private const val MAX_JUMP_SIMULATION_TICKS = 1024
+    private const val JUMP_HEIGHT_BINARY_SEARCH_STEPS = 32
+    private const val GROUND_CONTACT_EPSILON = 1.0e-4
     private const val FOOD_USE_SOUND_INITIAL_DELAY_SECONDS = 0.2
     private const val FOOD_USE_SOUND_INTERVAL_SECONDS = 0.2
     private const val MAX_ITEM_USE_SOUND_LOOPS_PER_TICK = 8

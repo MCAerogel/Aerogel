@@ -683,10 +683,20 @@ object PlayPackets {
         return packet.toByteArray()
     }
 
-    fun playerInfoPacket(profile: ConnectionProfile, displayName: String, gameMode: Int, latencyMs: Int): ByteArray {
+    fun playerInfoPacket(
+        profile: ConnectionProfile,
+        displayName: String,
+        gameMode: Int,
+        latencyMs: Int,
+        listed: Boolean = true
+    ): ByteArray {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
         val clampedGameMode = gameMode.coerceIn(0, 3)
+        val safeDisplayName = displayName
+            .trim()
+            .ifEmpty { profile.username }
+            .take(16)
         NetworkUtils.writeVarInt(packet, PLAYER_INFO_PACKET_ID)
 
         val actionFlags = 0x01 or 0x04 or 0x08 or 0x10 or 0x40
@@ -694,7 +704,7 @@ object PlayPackets {
         NetworkUtils.writeVarInt(packet, 1)
         NetworkUtils.writeUUID(packet, profile.uuid)
 
-        NetworkUtils.writeString(packet, displayName)
+        NetworkUtils.writeString(packet, safeDisplayName)
         NetworkUtils.writeVarInt(packet, profile.properties.size)
         for (property in profile.properties) {
             NetworkUtils.writeString(packet, property.name)
@@ -708,7 +718,7 @@ object PlayPackets {
         }
 
         NetworkUtils.writeVarInt(packet, clampedGameMode) // gamemode
-        NetworkUtils.writeVarInt(packet, 1) // listed
+        NetworkUtils.writeVarInt(packet, if (listed) 1 else 0) // listed
         NetworkUtils.writeVarInt(packet, latencyMs.coerceAtLeast(0)) // latency
         out.writeBoolean(true) // show hat
 
@@ -1229,7 +1239,7 @@ object PlayPackets {
         out.writeInt(chunkX)
         out.writeInt(chunkZ)
 
-        // heightmaps
+        // heightmaps map<type,long[]> (1.21.11 level_chunk_with_light).
         NetworkUtils.writeVarInt(packet, generated.heightmaps.size)
         for (heightmap in generated.heightmaps) {
             NetworkUtils.writeVarInt(packet, heightmap.typeId)

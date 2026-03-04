@@ -175,3 +175,55 @@ data class PlayerInteractEvent(
     override var cancelled: Boolean = false,
     override var cancelReason: String? = null
 ) : CancellableEvent
+
+fun PlayerMoveEvent.cancelPosition(reason: String? = null, skipRemainingHandlers: Boolean = true) {
+    cancelPosition = true
+    cancelReason = reason
+    if (skipRemainingHandlers) {
+        EventDispatchHints.requestSkipRemainingHandlers(this)
+    }
+}
+
+fun PlayerMoveEvent.cancelRotation(reason: String? = null, skipRemainingHandlers: Boolean = true) {
+    cancelRotation = true
+    cancelReason = reason
+    if (skipRemainingHandlers) {
+        EventDispatchHints.requestSkipRemainingHandlers(this)
+    }
+}
+
+fun PlayerMoveEvent.cancel(reason: String? = null, skipRemainingHandlers: Boolean = true) {
+    cancelled = true
+    cancelPosition = true
+    cancelRotation = true
+    cancelReason = reason
+    if (skipRemainingHandlers) {
+        EventDispatchHints.requestSkipRemainingHandlers(this)
+    }
+}
+
+fun EntityMoveEvent.cancelPosition(reason: String? = null, skipRemainingHandlers: Boolean = true) {
+    cancelPosition = true
+    cancelReason = reason
+    if (skipRemainingHandlers) {
+        EventDispatchHints.requestSkipRemainingHandlers(this)
+    }
+}
+
+fun EntityMoveEvent.cancelRotation(reason: String? = null, skipRemainingHandlers: Boolean = true) {
+    cancelRotation = true
+    cancelReason = reason
+    if (skipRemainingHandlers) {
+        EventDispatchHints.requestSkipRemainingHandlers(this)
+    }
+}
+
+fun EntityMoveEvent.cancel(reason: String? = null, skipRemainingHandlers: Boolean = true) {
+    cancelled = true
+    cancelPosition = true
+    cancelRotation = true
+    cancelReason = reason
+    if (skipRemainingHandlers) {
+        EventDispatchHints.requestSkipRemainingHandlers(this)
+    }
+}

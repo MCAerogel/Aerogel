@@ -35,6 +35,17 @@ data class Location(
     val chunk: Chunk
         get() = world.chunkAt(chunkX, chunkZ)
 
+    fun clone(): Location {
+        return Location(
+            world = world,
+            x = x,
+            y = y,
+            z = z,
+            yaw = yaw,
+            pitch = pitch
+        )
+    }
+
     fun dropItem(item: Item, impulse: Boolean = false): DroppedItem {
         return world.dropItem(this, item, impulse)
     }

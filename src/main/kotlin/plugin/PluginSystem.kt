@@ -4,6 +4,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import io.netty.channel.ChannelId
 import org.macaroon3145.DebugConsole
 import org.macaroon3145.api.Server
 import org.macaroon3145.api.command.CommandInvocation
@@ -35,6 +36,7 @@ import org.macaroon3145.api.event.PluginStateChangeEvent
 import org.macaroon3145.api.event.PlayerJoinEvent
 import org.macaroon3145.api.event.PlayerQuitEvent
 import org.macaroon3145.api.entity.ArmorSlot
+import org.macaroon3145.api.entity.Bot
 import org.macaroon3145.api.entity.ConnectedPlayer
 import org.macaroon3145.api.entity.DroppedItem
 import org.macaroon3145.api.entity.Egg
@@ -45,13 +47,14 @@ import org.macaroon3145.api.entity.Hand
 import org.macaroon3145.api.entity.Item
 import org.macaroon3145.api.entity.InventorySlotView
 import org.macaroon3145.api.entity.Player
-import org.macaroon3145.api.entity.PlayerInventorySnapshot
+import org.macaroon3145.api.entity.PlayerInventory
 import org.macaroon3145.api.entity.PlayerRegistry
 import org.macaroon3145.api.entity.Snowball
 import org.macaroon3145.api.entity.EntityType
 import org.macaroon3145.api.entity.Thrown
 import org.macaroon3145.api.world.Block
 import org.macaroon3145.api.world.Chunk
+import org.macaroon3145.api.world.ChunkState
 import org.macaroon3145.api.world.BlockState
 import org.macaroon3145.api.world.BlockFace
 import org.macaroon3145.api.world.Location
@@ -86,12 +89,17 @@ import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.command.Command
 import org.macaroon3145.network.command.CommandContext
 import org.macaroon3145.network.codec.BlockStateRegistry
+import org.macaroon3145.network.codec.RegistryCodec
+import org.macaroon3145.network.handler.ConnectionProfile
+import org.macaroon3145.network.handler.PlayPackets
 import org.macaroon3145.network.handler.PlayerSession
 import org.macaroon3145.network.handler.PlayerSessionManager
 import org.macaroon3145.plugin.mixin.MixinWeavingEngine
+import org.macaroon3145.world.BlockCollisionRegistry
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.ThrownItemKind
 import org.macaroon3145.world.WorldManager
+import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
 import org.slf4j.LoggerFactory
 import java.lang.invoke.MethodHandles
 import java.lang.reflect.Modifier
@@ -112,6 +120,8 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.time.Duration
 
 object PluginSystem {
@@ -183,6 +193,87 @@ object PluginSystem {
 
     fun onGameTick(gameTick: Long) {
         tickScheduler.pulse(gameTick)
+        dispatchRuntimeBotTicks()
+        syncRuntimeBotNetwork()
+    }
+
+    fun runtimeBotSnapshot(worldKey: String, entityId: Int): RuntimeBotSnapshot? {
+        val botUuid = runtimeBotUuidByEntityId[entityId] ?: return null
+        val state = runtimeBotsByUuid[botUuid] ?: return null
+        synchronized(state) {
+            if (state.worldKey != worldKey) return null
+            if (state.health <= 0f) return null
+            return RuntimeBotSnapshot(
+                entityId = state.entityId,
+                x = state.x,
+                y = state.y,
+                z = state.z
+            )
+        }
+    }
+
+    fun damageRuntimeBot(
+        worldKey: String,
+        entityId: Int,
+        amount: Float,
+        attackerX: Double,
+        attackerZ: Double,
+        knockbackStrength: Double
+    ): RuntimeBotDamageResult? {
+        if (amount <= 0f) return null
+        val botUuid = runtimeBotUuidByEntityId[entityId] ?: return null
+        val state = runtimeBotsByUuid[botUuid] ?: return null
+        val result = synchronized(state) {
+            if (state.worldKey != worldKey) return null
+            if (state.health <= 0f) return null
+            if (!state.attackable || state.invulnerable) return null
+            if (state.damageDelayRemainingSeconds > 1.0e-6) return null
+
+            var knockbackApplied = false
+            if (knockbackStrength > 0.0) {
+                val dx = state.x - attackerX
+                val dz = state.z - attackerZ
+                val distSq = (dx * dx) + (dz * dz)
+                if (distSq > 1.0e-9) {
+                    val dist = kotlin.math.sqrt(distSq)
+                    val nx = dx / dist
+                    val nz = dz / dist
+                    val impulse = knockbackStrength * 0.4
+                    state.speedX += nx * impulse * 20.0
+                    state.speedY += 0.15 * 20.0
+                    state.speedZ += nz * impulse * 20.0
+                    knockbackApplied = true
+                }
+            }
+
+            state.health = (state.health - amount).coerceAtLeast(0f)
+            state.damageDelayRemainingSeconds = state.damageDelaySeconds.coerceAtLeast(0.0)
+            RuntimeBotDamageResult(
+                x = state.x,
+                y = state.y,
+                z = state.z,
+                knockbackApplied = knockbackApplied,
+                died = state.health <= 0f
+            )
+        } ?: return null
+
+        broadcastRuntimeBotDamage(worldKey, entityId, result.x, result.y, result.z)
+        if (result.died) {
+            removeRuntimeBot(botUuid)
+        }
+        return result
+    }
+
+    fun resolveTranslationForLocale(localeTag: String?, key: String, args: List<String> = emptyList()): String? {
+        val normalizedKey = key.trim()
+        if (normalizedKey.isEmpty()) return null
+        synchronized(pluginStateLock) {
+            for (loaded in pluginsInLoadOrder) {
+                val translated = loaded.context.i18n.trFor(localeTag, normalizedKey, *args.toTypedArray())
+                if (translated != normalizedKey) return translated
+            }
+        }
+        return null
     }
 
     fun chunkTickScheduler(worldKey: String, chunkX: Int, chunkZ: Int): TickScheduler {
@@ -1153,6 +1244,66 @@ private val runtimePluginRegistry: PluginRegistry by lazy { RuntimePluginRegistr
 private val runtimeFallbackAirBlockType: BlockType by lazy {
     BlockType.fromKey("minecraft:air") ?: BlockType.entries.first()
 }
+private val runtimeBotsByUuid = ConcurrentHashMap<UUID, RuntimeBotState>()
+private val runtimeBotUuidByEntityId = ConcurrentHashMap<Int, UUID>()
+private val runtimeBotViewerStatesByChannelId = ConcurrentHashMap<ChannelId, MutableMap<UUID, RuntimeBotViewerState>>()
+
+private data class RuntimeBotState(
+    val uuid: UUID,
+    val entityId: Int,
+    var worldKey: String,
+    var x: Double,
+    var y: Double,
+    var z: Double,
+    var yaw: Float,
+    var pitch: Float,
+    var onGround: Boolean,
+    var speedX: Double,
+    var speedY: Double,
+    var speedZ: Double,
+    var name: String,
+    var tabList: Boolean,
+    var pushable: Boolean,
+    var attackable: Boolean,
+    var gravity: Boolean,
+    var collision: Boolean,
+    var invulnerable: Boolean,
+    var fallDamage: Boolean,
+    var damageDelaySeconds: Double,
+    var damageDelayRemainingSeconds: Double,
+    var maxHealth: Float,
+    var health: Float,
+    var accelerationX: Double,
+    var accelerationY: Double,
+    var accelerationZ: Double
+)
+
+private data class RuntimeBotViewerState(
+    val entityId: Int,
+    var listed: Boolean,
+    var name: String,
+    var x: Double,
+    var y: Double,
+    var z: Double,
+    var yaw: Float,
+    var pitch: Float,
+    var onGround: Boolean
+)
+
+data class RuntimeBotSnapshot(
+    val entityId: Int,
+    val x: Double,
+    val y: Double,
+    val z: Double
+)
+
+data class RuntimeBotDamageResult(
+    val x: Double,
+    val y: Double,
+    val z: Double,
+    val knockbackApplied: Boolean,
+    val died: Boolean
+)
 
 private class RuntimeWorldRegistry : WorldRegistry {
     override fun defaultWorld(): World {
@@ -1293,10 +1444,10 @@ private class RuntimeConnectedPlayer(
     override val online: Boolean
         get() = true
 
-    override val inventory: PlayerInventorySnapshot
+    override val inventory: PlayerInventory
         get() {
             val session = liveSession()
-            return PlayerInventorySnapshot(
+            return PlayerInventory(
                 selectedHotbarSlot = session.selectedHotbarSlot.coerceIn(0, 8),
                 hotbar = InventorySlotView(
                     size = session.hotbarItemIds.size,
@@ -1333,8 +1484,14 @@ private class RuntimeConnectedPlayer(
             )
         }
 
-    override val locale: String
-        get() = liveSession().locale
+    override val settings: ConnectedPlayer.PlayerSettings
+        get() {
+            val session = liveSession()
+            return ConnectedPlayer.PlayerSettings(
+                locale = session.locale,
+                viewDistance = session.requestedViewDistance
+            )
+        }
 
     override val op: Boolean
         get() = PlayerSessionManager.isOperatorSession(liveSession())
@@ -1350,6 +1507,18 @@ private class RuntimeConnectedPlayer(
 
     override val flying: Boolean
         get() = liveSession().flying
+
+    override val sneaking: Boolean
+        get() = liveSession().sneaking
+
+    override val pingMs: Double
+        get() = liveSession().pingMsExact
+
+    override val fallDistance: Double
+        get() = liveSession().fallDistance
+
+    override val dead: Boolean
+        get() = liveSession().dead
 
     override var location: Location
         get() {
@@ -1399,6 +1568,10 @@ private class RuntimeConnectedPlayer(
 
     override fun accelerate(x: Double, y: Double, z: Double): Boolean {
         return PlayerSessionManager.acceleratePlayer(playerUuid, x, y, z)
+    }
+
+    override fun jump(heightBlocks: Double): Boolean {
+        return PlayerSessionManager.jumpPlayer(playerUuid, heightBlocks)
     }
 
     override var speedX: Double
@@ -1505,6 +1678,14 @@ private class RuntimeConnectedPlayer(
                 .toList()
         }
 
+    override val ridingEntityId: UUID?
+        get() {
+            val session = liveSession()
+            val animalEntityId = session.ridingAnimalEntityId
+            if (animalEntityId < 0) return null
+            return WorldManager.world(session.worldKey)?.animalSnapshot(animalEntityId)?.uuid
+        }
+
     override var health: Float?
         get() = liveSession().health
         set(value) {
@@ -1519,45 +1700,65 @@ private class RuntimeConnectedPlayer(
         get() = liveSession().saturation
 
     override fun setHotbarItem(slot: Int, item: Item?): Boolean {
+        val translatedName = item?.translatedName()
+        val translatedLore = item?.translatedLore()?.map { it.key to it.args }.orEmpty()
         return PlayerSessionManager.setHotbarItem(
             uuid = playerUuid,
             slot = slot,
             itemId = item?.id ?: -1,
             amount = item?.amount ?: 0,
             name = item?.name,
-            lore = item?.lore ?: emptyList()
+            lore = item?.lore.orEmpty(),
+            translatedNameKey = translatedName?.key,
+            translatedNameArgs = translatedName?.args.orEmpty(),
+            translatedLore = translatedLore
         )
     }
 
     override fun setMainItem(slot: Int, item: Item?): Boolean {
+        val translatedName = item?.translatedName()
+        val translatedLore = item?.translatedLore()?.map { it.key to it.args }.orEmpty()
         return PlayerSessionManager.setMainInventoryItem(
             uuid = playerUuid,
             index = slot,
             itemId = item?.id ?: -1,
             amount = item?.amount ?: 0,
             name = item?.name,
-            lore = item?.lore ?: emptyList()
+            lore = item?.lore.orEmpty(),
+            translatedNameKey = translatedName?.key,
+            translatedNameArgs = translatedName?.args.orEmpty(),
+            translatedLore = translatedLore
         )
     }
 
     override fun setArmorItem(slot: ArmorSlot, item: Item?): Boolean {
+        val translatedName = item?.translatedName()
+        val translatedLore = item?.translatedLore()?.map { it.key to it.args }.orEmpty()
         return PlayerSessionManager.setArmorItem(
             uuid = playerUuid,
             slot = slot,
             itemId = item?.id ?: -1,
             amount = item?.amount ?: 0,
             name = item?.name,
-            lore = item?.lore ?: emptyList()
+            lore = item?.lore.orEmpty(),
+            translatedNameKey = translatedName?.key,
+            translatedNameArgs = translatedName?.args.orEmpty(),
+            translatedLore = translatedLore
         )
     }
 
     override fun setOffhandItem(item: Item?): Boolean {
+        val translatedName = item?.translatedName()
+        val translatedLore = item?.translatedLore()?.map { it.key to it.args }.orEmpty()
         return PlayerSessionManager.setOffhandItem(
             uuid = playerUuid,
             itemId = item?.id ?: -1,
             amount = item?.amount ?: 0,
             name = item?.name,
-            lore = item?.lore ?: emptyList()
+            lore = item?.lore.orEmpty(),
+            translatedNameKey = translatedName?.key,
+            translatedNameArgs = translatedName?.args.orEmpty(),
+            translatedLore = translatedLore
         )
     }
 
@@ -1574,6 +1775,14 @@ private class RuntimeConnectedPlayer(
     override fun sendMessage(message: String) {
         val session = liveSession()
         PlayerSessionManager.sendPluginMessage(session.channelId, message)
+    }
+
+    override fun respawn(): Boolean {
+        val session = liveSession()
+        val wasDead = session.dead
+        if (!wasDead) return false
+        PlayerSessionManager.respawnIfDead(session.channelId)
+        return true
     }
 
     private fun inventoryStackOf(itemId: Int, count: Int): Item? {
@@ -1600,26 +1809,11 @@ private class RuntimePlayerReference(
 
     private fun liveSession(): PlayerSession? = PlayerSessionManager.byUuid(playerUuid)
 
-    override val name: String?
-        get() = liveSession()?.profile?.username ?: fallbackName
-
     override val online: Boolean
         get() = liveSession() != null
 
     override val op: Boolean
         get() = liveSession()?.let { PlayerSessionManager.isOperatorSession(it) } ?: false
-
-    override val gameMode: GameMode
-        get() = GameMode.fromId(liveSession()?.gameMode ?: 0)
-
-    override val sprinting: Boolean
-        get() = liveSession()?.sprinting ?: false
-
-    override val swimming: Boolean
-        get() = liveSession()?.swimming ?: false
-
-    override val flying: Boolean
-        get() = liveSession()?.flying ?: false
 
     override var location: Location
         get() {
@@ -1683,6 +1877,11 @@ private class RuntimePlayerReference(
     override fun accelerate(x: Double, y: Double, z: Double): Boolean {
         val live = liveSession() ?: return false
         return PlayerSessionManager.acceleratePlayer(live.profile.uuid, x, y, z)
+    }
+
+    override fun jump(heightBlocks: Double): Boolean {
+        val live = liveSession() ?: return false
+        return PlayerSessionManager.jumpPlayer(live.profile.uuid, heightBlocks)
     }
 
     override var speedX: Double
@@ -1765,13 +1964,6 @@ private class RuntimePlayerReference(
             PlayerSessionManager.setPlayerHealth(live.profile.uuid, next)
         }
 
-    override var displayName: String?
-        get() = liveSession()?.displayName ?: fallbackDisplayName
-        set(value) {
-            fallbackDisplayName = value
-            PlayerSessionManager.setDisplayName(playerUuid, value)
-        }
-
     companion object {
         fun offlineReference(playerUuid: UUID, fallbackName: String?): RuntimePlayerReference {
             return RuntimePlayerReference(
@@ -1783,9 +1975,157 @@ private class RuntimePlayerReference(
     }
 }
 
+private class RuntimeBot(
+    private val botUuid: UUID
+) : Bot(botUuid) {
+
+    private fun liveState(): RuntimeBotState {
+        return checkNotNull(runtimeBotsByUuid[botUuid]) { "Bot no longer exists: $botUuid" }
+    }
+
+    override var name: String
+        get() = liveState().name
+        set(value) {
+            liveState().name = value
+        }
+
+    override var tabList: Boolean
+        get() = liveState().tabList
+        set(value) {
+            liveState().tabList = value
+        }
+
+    override var pushable: Boolean
+        get() = liveState().pushable
+        set(value) {
+            liveState().pushable = value
+        }
+
+    override var attackable: Boolean
+        get() = liveState().attackable
+        set(value) {
+            liveState().attackable = value
+        }
+
+    override var gravity: Boolean
+        get() = liveState().gravity
+        set(value) {
+            liveState().gravity = value
+        }
+
+    override var collision: Boolean
+        get() = liveState().collision
+        set(value) {
+            liveState().collision = value
+        }
+
+    override var invulnerable: Boolean
+        get() = liveState().invulnerable
+        set(value) {
+            liveState().invulnerable = value
+        }
+
+    override var fallDamage: Boolean
+        get() = liveState().fallDamage
+        set(value) {
+            liveState().fallDamage = value
+        }
+
+    override var damageDelaySeconds: Double
+        get() = liveState().damageDelaySeconds
+        set(value) {
+            liveState().damageDelaySeconds = value.coerceAtLeast(0.0)
+        }
+
+    override var damageDelayRemainingSeconds: Double
+        get() = liveState().damageDelayRemainingSeconds
+        set(value) {
+            liveState().damageDelayRemainingSeconds = value.coerceAtLeast(0.0)
+        }
+
+    override var maxHealth: Float
+        get() = liveState().maxHealth
+        set(value) {
+            val state = liveState()
+            state.maxHealth = value.coerceAtLeast(0.0f)
+            state.health = state.health.coerceAtMost(state.maxHealth)
+        }
+
+    override var health: Float?
+        get() = liveState().health
+        set(value) {
+            val state = liveState()
+            state.health = (value ?: return).coerceIn(0f, state.maxHealth)
+        }
+
+    override var location: Location
+        get() {
+            val state = liveState()
+            return Location(
+                world = runtimeWorldFor(state.worldKey),
+                x = state.x,
+                y = state.y,
+                z = state.z,
+                yaw = state.yaw,
+                pitch = state.pitch
+            )
+        }
+        set(value) {
+            val state = liveState()
+            state.worldKey = value.world.key
+            state.x = value.x
+            state.y = value.y
+            state.z = value.z
+            state.yaw = value.yaw
+            state.pitch = value.pitch
+        }
+
+    override var onGround: Boolean
+        get() = liveState().onGround
+        set(value) {
+            liveState().onGround = value
+        }
+
+    override var speedX: Double
+        get() = liveState().speedX
+        set(value) {
+            liveState().speedX = value
+        }
+
+    override var speedY: Double
+        get() = liveState().speedY
+        set(value) {
+            liveState().speedY = value
+        }
+
+    override var speedZ: Double
+        get() = liveState().speedZ
+        set(value) {
+            liveState().speedZ = value
+        }
+
+    override var accelerationX: Double
+        get() = liveState().accelerationX
+        set(value) {
+            liveState().accelerationX = value
+        }
+
+    override var accelerationY: Double
+        get() = liveState().accelerationY
+        set(value) {
+            liveState().accelerationY = value
+        }
+
+    override var accelerationZ: Double
+        get() = liveState().accelerationZ
+        set(value) {
+            liveState().accelerationZ = value
+        }
+}
+
 private class RuntimeThrown(
     protected var worldKey: String,
-    final override val entityId: Int,
+    private val entityId: Int,
     uniqueId: UUID
 ) : Thrown(uniqueId) {
     override val type: EntityType
@@ -1873,10 +2213,32 @@ private class RuntimeThrown(
             worldKey = targetWorldKey
         }
 
-    override var ownerEntityId: Int
-        get() = liveSnapshotOrNull()?.ownerEntityId ?: -1
+    override var ownerUniqueId: UUID?
+        get() {
+            val ownerEntityId = liveSnapshotOrNull()?.ownerEntityId ?: -1
+            if (ownerEntityId < 0) return null
+            val player = PlayerSessionManager.playersInWorld(worldKey).firstOrNull { it.entityId == ownerEntityId }
+            if (player != null) return player.profile.uuid
+            return WorldManager.world(worldKey)?.animalSnapshot(ownerEntityId)?.uuid
+        }
         set(value) {
-            check(PlayerSessionManager.setThrownItemOwnerEntityId(worldKey, entityId, value)) {
+            val ownerEntityId = if (value == null) {
+                -1
+            } else {
+                val playerEntityId = PlayerSessionManager.playersInWorld(worldKey)
+                    .firstOrNull { it.profile.uuid == value }
+                    ?.entityId
+                if (playerEntityId != null) {
+                    playerEntityId
+                } else {
+                    WorldManager.world(worldKey)
+                        ?.animalSnapshots()
+                        ?.firstOrNull { it.uuid == value }
+                        ?.entityId
+                        ?: -1
+                }
+            }
+            check(PlayerSessionManager.setThrownItemOwnerEntityId(worldKey, entityId, ownerEntityId)) {
                 "Failed to set thrown owner: $worldKey#$entityId owner=$value"
             }
         }
@@ -2011,7 +2373,7 @@ private data class DroppedItemRotation(
 
 private class RuntimeDroppedItem(
     private var worldKey: String,
-    override val entityId: Int,
+    private val entityId: Int,
     uniqueId: UUID
 ) : DroppedItem(uniqueId) {
     private fun rotationKey(): String = "$worldKey:$entityId"
@@ -2304,9 +2666,389 @@ private val CLIMBABLE_MEDIUM_BLOCK_KEYS = setOf(
     "minecraft:twisting_vines_plant",
     "minecraft:scaffolding"
 )
+private val BOT_NON_COLLIDING_BLOCK_KEYS = setOf(
+    "minecraft:air",
+    "minecraft:cave_air",
+    "minecraft:void_air",
+    "minecraft:water",
+    "minecraft:lava",
+    "minecraft:bubble_column",
+    "minecraft:fire",
+    "minecraft:soul_fire"
+)
+private const val BOT_HALF_WIDTH = 0.3
+private const val BOT_HEIGHT = 1.8
+private const val BOT_GRAVITY_PER_TICK = 0.08
+private const val BOT_AIR_DRAG_PER_TICK = 0.91
+private const val BOT_VERTICAL_DRAG_PER_TICK = 0.98
+private const val BOT_VELOCITY_EPSILON = 1.0e-6
+private const val PLAYER_HALF_WIDTH = 0.3
+private const val BOT_PUSH_STRENGTH = 0.08
+private const val BOT_NETWORK_POSITION_EPSILON = 1.0e-4
+private const val BOT_HURT_SOUND_KEY = "minecraft:entity.player.hurt"
+private val BOT_PLAYER_ATTACK_DAMAGE_TYPE_ID: Int by lazy {
+    RegistryCodec.entryIndex("minecraft:damage_type", "minecraft:player_attack") ?: 0
+}
 
 private fun runtimeWorldFor(worldKey: String): RuntimeWorld {
     return runtimeWorldCache.computeIfAbsent(worldKey) { RuntimeWorld(it) }
+}
+
+private fun runtimeBotProfile(state: RuntimeBotState): ConnectionProfile {
+    val username = runtimeBotWireName(state)
+    return ConnectionProfile(
+        protocolVersion = 0,
+        username = username,
+        uuid = state.uuid
+    )
+}
+
+private fun runtimeBotWireName(state: RuntimeBotState): String {
+    return state.name.trim().ifEmpty { "Bot-${state.uuid.toString().take(8)}" }.take(16)
+}
+
+private fun syncRuntimeBotNetwork() {
+    if (runtimeBotsByUuid.isEmpty()) {
+        if (runtimeBotViewerStatesByChannelId.isEmpty()) return
+            for ((channelId, viewers) in runtimeBotViewerStatesByChannelId) {
+                if (viewers.isEmpty()) continue
+                val ctx = PlayerSessionManager.channelContext(channelId) ?: continue
+                if (!ctx.channel().isActive) continue
+            for ((botUuid, viewerState) in viewers) {
+                ctx.write(PlayPackets.removeEntitiesPacket(intArrayOf(viewerState.entityId)))
+                ctx.write(PlayPackets.playerInfoRemovePacket(listOf(botUuid)))
+            }
+            ctx.flush()
+        }
+        runtimeBotViewerStatesByChannelId.clear()
+        return
+    }
+
+    val activeSessionIds = PlayerSessionManager.players().map { it.channelId }.toHashSet()
+    runtimeBotViewerStatesByChannelId.keys.removeIf { it !in activeSessionIds }
+
+    val botStates = runtimeBotsByUuid.values.toList()
+    val botSetByWorld = botStates.groupBy { it.worldKey }
+
+    for (session in PlayerSessionManager.players()) {
+        val ctx = PlayerSessionManager.channelContext(session.channelId) ?: continue
+        if (!ctx.channel().isActive) continue
+        val worldBots = botSetByWorld[session.worldKey].orEmpty()
+        val viewerStates = runtimeBotViewerStatesByChannelId.computeIfAbsent(session.channelId) { ConcurrentHashMap() }
+        val seenBots = HashSet<UUID>(worldBots.size)
+
+        for (state in worldBots) {
+            val snapshot = synchronized(state) {
+                RuntimeBotViewerState(
+                    entityId = state.entityId,
+                    listed = state.tabList,
+                    name = state.name,
+                    x = state.x,
+                    y = state.y,
+                    z = state.z,
+                    yaw = state.yaw,
+                    pitch = state.pitch,
+                    onGround = state.onGround
+                )
+            }
+            seenBots.add(state.uuid)
+            val botChunk = ChunkPos(floor(snapshot.x / 16.0).toInt(), floor(snapshot.z / 16.0).toInt())
+            val visible = session.loadedChunks.contains(botChunk)
+            val previous = viewerStates[state.uuid]
+
+            if (!visible) {
+                if (previous != null) {
+                    ctx.write(PlayPackets.removeEntitiesPacket(intArrayOf(state.entityId)))
+                    ctx.write(PlayPackets.playerInfoRemovePacket(listOf(state.uuid)))
+                    viewerStates.remove(state.uuid)
+                }
+                continue
+            }
+
+            val profile = runtimeBotProfile(state)
+            val wireName = runtimeBotWireName(state)
+            if (previous == null) {
+                ctx.write(
+                    PlayPackets.playerInfoPacket(
+                        profile = profile,
+                        displayName = wireName,
+                        gameMode = 0,
+                        latencyMs = 0,
+                        listed = snapshot.listed
+                    )
+                )
+                ctx.write(
+                    PlayPackets.addPlayerEntityPacket(
+                        entityId = state.entityId,
+                        uuid = state.uuid,
+                        x = snapshot.x,
+                        y = snapshot.y,
+                        z = snapshot.z,
+                        yaw = snapshot.yaw,
+                        pitch = snapshot.pitch
+                    )
+                )
+                ctx.write(PlayPackets.entityHeadLookPacket(state.entityId, snapshot.yaw))
+                viewerStates[state.uuid] = snapshot
+                continue
+            }
+
+            if (previous.listed != snapshot.listed || previous.name != snapshot.name) {
+                ctx.write(
+                    PlayPackets.playerInfoPacket(
+                        profile = profile,
+                        displayName = wireName,
+                        gameMode = 0,
+                        latencyMs = 0,
+                        listed = snapshot.listed
+                    )
+                )
+                previous.listed = snapshot.listed
+                previous.name = snapshot.name
+            }
+
+            val moved =
+                abs(previous.x - snapshot.x) > BOT_NETWORK_POSITION_EPSILON ||
+                    abs(previous.y - snapshot.y) > BOT_NETWORK_POSITION_EPSILON ||
+                    abs(previous.z - snapshot.z) > BOT_NETWORK_POSITION_EPSILON ||
+                    previous.yaw != snapshot.yaw ||
+                    previous.pitch != snapshot.pitch ||
+                    previous.onGround != snapshot.onGround
+            if (moved) {
+                ctx.write(
+                    PlayPackets.entityPositionSyncPacket(
+                        entityId = state.entityId,
+                        x = snapshot.x,
+                        y = snapshot.y,
+                        z = snapshot.z,
+                        vx = 0.0,
+                        vy = 0.0,
+                        vz = 0.0,
+                        yaw = snapshot.yaw,
+                        pitch = snapshot.pitch,
+                        onGround = snapshot.onGround
+                    )
+                )
+                ctx.write(PlayPackets.entityHeadLookPacket(state.entityId, snapshot.yaw))
+                previous.x = snapshot.x
+                previous.y = snapshot.y
+                previous.z = snapshot.z
+                previous.yaw = snapshot.yaw
+                previous.pitch = snapshot.pitch
+                previous.onGround = snapshot.onGround
+            }
+        }
+
+        val removeUuids = viewerStates.keys.filter { it !in seenBots }
+        for (uuid in removeUuids) {
+            val state = runtimeBotsByUuid[uuid]
+            if (state != null) {
+                ctx.write(PlayPackets.removeEntitiesPacket(intArrayOf(state.entityId)))
+            }
+            ctx.write(PlayPackets.playerInfoRemovePacket(listOf(uuid)))
+            viewerStates.remove(uuid)
+        }
+        ctx.flush()
+    }
+}
+
+private fun broadcastRuntimeBotDamage(worldKey: String, entityId: Int, x: Double, y: Double, z: Double) {
+    val chunkPos = ChunkPos(floor(x / 16.0).toInt(), floor(z / 16.0).toInt())
+    val hurtPacket = PlayPackets.hurtAnimationPacket(entityId, 0f)
+    val damagePacket = PlayPackets.damageEventPacket(entityId, BOT_PLAYER_ATTACK_DAMAGE_TYPE_ID)
+    val soundPacket = PlayPackets.soundPacketByKey(
+        soundKey = BOT_HURT_SOUND_KEY,
+        soundSourceId = 7,
+        x = x,
+        y = y + 0.9,
+        z = z,
+        volume = 1.0f,
+        pitch = 1.0f,
+        seed = 0L
+    )
+    for (session in PlayerSessionManager.playersInWorld(worldKey)) {
+        if (!session.loadedChunks.contains(chunkPos)) continue
+        val ctx = PlayerSessionManager.channelContext(session.channelId) ?: continue
+        if (!ctx.channel().isActive) continue
+        ctx.write(hurtPacket)
+        ctx.write(damagePacket)
+        ctx.write(soundPacket)
+        ctx.flush()
+    }
+}
+
+private fun removeRuntimeBot(botUuid: UUID) {
+    val removed = runtimeBotsByUuid.remove(botUuid) ?: return
+    runtimeBotUuidByEntityId.remove(removed.entityId, botUuid)
+    for ((channelId, viewerStates) in runtimeBotViewerStatesByChannelId) {
+        if (viewerStates.remove(botUuid) == null) continue
+        val ctx = PlayerSessionManager.channelContext(channelId) ?: continue
+        if (!ctx.channel().isActive) continue
+        ctx.write(PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId)))
+        ctx.write(PlayPackets.playerInfoRemovePacket(listOf(botUuid)))
+        ctx.flush()
+    }
+}
+
+private fun dispatchRuntimeBotTicks() {
+    if (runtimeBotsByUuid.isEmpty()) return
+    for ((_, state) in runtimeBotsByUuid) {
+        val world = WorldManager.world(state.worldKey) ?: continue
+        val chunkPos = ChunkPos(floor(state.x / 16.0).toInt(), floor(state.z / 16.0).toInt())
+        world.submitOnChunkActor(chunkPos) {
+            tickRuntimeBotOnChunkActor(world, state)
+        }
+    }
+}
+
+private fun tickRuntimeBotOnChunkActor(
+    world: org.macaroon3145.world.World,
+    state: RuntimeBotState
+) {
+    synchronized(state) {
+        if (state.damageDelayRemainingSeconds > 0.0) {
+            state.damageDelayRemainingSeconds = (state.damageDelayRemainingSeconds - (1.0 / 20.0)).coerceAtLeast(0.0)
+        }
+        val nextSpeedXMps = state.speedX + (state.accelerationX / 20.0)
+        val nextSpeedYMps = state.speedY + (state.accelerationY / 20.0)
+        val nextSpeedZMps = state.speedZ + (state.accelerationZ / 20.0)
+        var vx = nextSpeedXMps / 20.0
+        var vy = nextSpeedYMps / 20.0
+        var vz = nextSpeedZMps / 20.0
+
+        if (state.pushable) {
+            val pushRadius = BOT_HALF_WIDTH + PLAYER_HALF_WIDTH
+            val players = PlayerSessionManager.playersInWorld(state.worldKey)
+            for (player in players) {
+                if (player.dead) continue
+                val dx = state.x - player.x
+                val dz = state.z - player.z
+                val distSq = (dx * dx) + (dz * dz)
+                if (distSq <= 1.0e-9 || distSq >= (pushRadius * pushRadius)) continue
+                val dist = kotlin.math.sqrt(distSq)
+                val overlap = pushRadius - dist
+                if (overlap <= 0.0) continue
+                val nx = dx / dist
+                val nz = dz / dist
+                val impulse = overlap * BOT_PUSH_STRENGTH
+                vx += nx * impulse
+                vz += nz * impulse
+            }
+        }
+
+        if (state.gravity) {
+            vy -= BOT_GRAVITY_PER_TICK
+        }
+
+        var onGround = false
+        var nextY = state.y + vy
+        if (state.collision && botCollidesAt(world, state.x, nextY, state.z)) {
+            if (vy < 0.0) onGround = true
+            vy = 0.0
+            nextY = state.y
+        }
+        state.y = nextY
+
+        var nextX = state.x + vx
+        if (state.collision && botCollidesAt(world, nextX, state.y, state.z)) {
+            vx = 0.0
+            nextX = state.x
+        }
+        state.x = nextX
+
+        var nextZ = state.z + vz
+        if (state.collision && botCollidesAt(world, state.x, state.y, nextZ)) {
+            vz = 0.0
+            nextZ = state.z
+        }
+        state.z = nextZ
+
+        state.onGround = onGround
+        val drag = if (state.onGround) BOT_AIR_DRAG_PER_TICK else BOT_AIR_DRAG_PER_TICK
+        vx *= drag
+        vy *= BOT_VERTICAL_DRAG_PER_TICK
+        vz *= drag
+        if (abs(vx) < BOT_VELOCITY_EPSILON) vx = 0.0
+        if (abs(vy) < BOT_VELOCITY_EPSILON) vy = 0.0
+        if (abs(vz) < BOT_VELOCITY_EPSILON) vz = 0.0
+
+        state.speedX = vx * 20.0
+        state.speedY = vy * 20.0
+        state.speedZ = vz * 20.0
+    }
+}
+
+private fun botCollidesAt(world: org.macaroon3145.world.World, x: Double, y: Double, z: Double): Boolean {
+    val minX = x - BOT_HALF_WIDTH
+    val maxX = x + BOT_HALF_WIDTH
+    val minY = y
+    val maxY = y + BOT_HEIGHT
+    val minZ = z - BOT_HALF_WIDTH
+    val maxZ = z + BOT_HALF_WIDTH
+
+    val startX = floor(minX).toInt()
+    val endX = floor(maxX - 1.0e-7).toInt()
+    val startY = floor(minY).toInt()
+    val endY = floor(maxY - 1.0e-7).toInt()
+    val startZ = floor(minZ).toInt()
+    val endZ = floor(maxZ - 1.0e-7).toInt()
+
+    for (bx in startX..endX) {
+        for (by in startY..endY) {
+            for (bz in startZ..endZ) {
+                val stateId = world.blockStateAt(bx, by, bz)
+                if (stateId <= 0) continue
+                val parsed = BlockStateRegistry.parsedState(stateId) ?: continue
+                if (parsed.blockKey in BOT_NON_COLLIDING_BLOCK_KEYS) continue
+                val resolved = BlockCollisionRegistry.boxesForStateId(stateId, parsed)
+                if (resolved == null) {
+                    if (aabbOverlap(minX, minY, minZ, maxX, maxY, maxZ, bx.toDouble(), by.toDouble(), bz.toDouble(), bx + 1.0, by + 1.0, bz + 1.0)) {
+                        return true
+                    }
+                    continue
+                }
+                for (collisionBox in resolved) {
+                    if (aabbOverlap(
+                            minX,
+                            minY,
+                            minZ,
+                            maxX,
+                            maxY,
+                            maxZ,
+                            bx + collisionBox.minX,
+                            by + collisionBox.minY,
+                            bz + collisionBox.minZ,
+                            bx + collisionBox.maxX,
+                            by + collisionBox.maxY,
+                            bz + collisionBox.maxZ
+                        )
+                    ) {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+private fun aabbOverlap(
+    aMinX: Double,
+    aMinY: Double,
+    aMinZ: Double,
+    aMaxX: Double,
+    aMaxY: Double,
+    aMaxZ: Double,
+    bMinX: Double,
+    bMinY: Double,
+    bMinZ: Double,
+    bMaxX: Double,
+    bMaxY: Double,
+    bMaxZ: Double
+): Boolean {
+    return aMaxX > bMinX && aMinX < bMaxX &&
+        aMaxY > bMinY && aMinY < bMaxY &&
+        aMaxZ > bMinZ && aMinZ < bMaxZ
 }
 
 private class RuntimeWorld(
@@ -2356,6 +3098,41 @@ private class RuntimeWorld(
                 return dropped
             }
             EntityType.PLAYER -> return null
+            EntityType.BOT -> {
+                val botUuid = UUID.randomUUID()
+                val entityId = PlayerSessionManager.allocateRuntimeEntityId()
+                runtimeBotsByUuid[botUuid] = RuntimeBotState(
+                    uuid = botUuid,
+                    entityId = entityId,
+                    worldKey = key,
+                    x = location.x,
+                    y = location.y,
+                    z = location.z,
+                    yaw = location.yaw,
+                    pitch = location.pitch,
+                    onGround = false,
+                    speedX = 0.0,
+                    speedY = 0.0,
+                    speedZ = 0.0,
+                    name = "Bot-${botUuid.toString().take(8)}",
+                    tabList = false,
+                    pushable = true,
+                    attackable = true,
+                    gravity = true,
+                    collision = true,
+                    invulnerable = false,
+                    fallDamage = true,
+                    damageDelaySeconds = 0.5,
+                    damageDelayRemainingSeconds = 0.0,
+                    maxHealth = 20f,
+                    health = 20f,
+                    accelerationX = 0.0,
+                    accelerationY = 0.0,
+                    accelerationZ = 0.0
+                )
+                runtimeBotUuidByEntityId[entityId] = botUuid
+                return RuntimeBot(botUuid)
+            }
         }
         val spawned = PlayerSessionManager.spawnThrownItemEntityAt(
             worldKey = key,
@@ -2374,6 +3151,10 @@ private class RuntimeWorld(
     override fun pluginInternalEntitiesByType(type: EntityType): List<Entity> {
         return when (type) {
             EntityType.PLAYER -> PlayerSessionManager.playersInWorld(key).map { RuntimeConnectedPlayer.fromSession(it) }
+            EntityType.BOT -> runtimeBotsByUuid.entries.asSequence()
+                .filter { (_, state) -> state.worldKey == key }
+                .map { (uuid, _) -> RuntimeBot(uuid) }
+                .toList()
             EntityType.DROPPED_ITEM -> PlayerSessionManager.droppedItemSnapshots(key).map { snapshot ->
                 RuntimeDroppedItem(
                     worldKey = key,
@@ -2422,6 +3203,10 @@ private class RuntimeWorld(
     }
 
     override fun pluginInternalEntityById(entityId: UUID): Entity? {
+        val botState = runtimeBotsByUuid[entityId]
+        if (botState != null && botState.worldKey == key) {
+            return RuntimeBot(entityId)
+        }
         val player = PlayerSessionManager.byUuid(entityId)
         if (player != null && player.worldKey == key) {
             return RuntimeConnectedPlayer.fromSession(player)
@@ -2493,11 +3278,31 @@ private class RuntimeChunk(
     override val z: Int
         get() = chunkZ
 
+    override val state: ChunkState
+        get() = FoliaSharedMemoryWorldGenerator.chunkState(world.key, chunkX, chunkZ)
+
+    override val simulationChunk: Boolean
+        get() = PlayerSessionManager.activeSimulationChunksByWorldSnapshot()[world.key]?.contains(ChunkPos(chunkX, chunkZ)) == true
+
+    override val tps: Double
+        get() = WorldManager.world(world.key)?.chunkEwmaTps(chunkX, chunkZ) ?: 0.0
+
+    override val mspt: Double
+        get() = WorldManager.world(world.key)?.chunkEwmaMspt(chunkX, chunkZ) ?: 0.0
+
     override val virtualThread: Thread?
         get() = WorldManager.world(world.key)?.chunkActorVirtualThread(chunkX, chunkZ)
 
     override val tickScheduler: TickScheduler
         get() = PluginSystem.chunkTickScheduler(world.key, chunkX, chunkZ)
+
+    override fun load(): Boolean {
+        return FoliaSharedMemoryWorldGenerator.loadChunk(world.key, chunkX, chunkZ)
+    }
+
+    override fun unload(): Boolean {
+        return FoliaSharedMemoryWorldGenerator.unloadChunk(world.key, chunkX, chunkZ)
+    }
 
     override fun pluginInternalEntitiesByType(type: EntityType): List<Entity> {
         return world.getEntityByType(type).filter { entity ->
@@ -2855,6 +3660,10 @@ private class FastEventBus : EventBus {
             }
         }
         return event
+    }
+
+    override fun hasListeners(eventType: Class<out Event>): Boolean {
+        return dispatchHandlersFor(eventType).isNotEmpty()
     }
 
     private fun dispatchHandlersFor(eventClass: Class<out Event>): List<RegisteredHandler> {

@@ -141,6 +141,7 @@ fun main() {
     ServerConfig.compressionChunkLevel = props.getProperty("compression-chunk-level")?.toIntOrNull()
         ?.coerceIn(-1, 9)
         ?: 1
+    val dashboardAutoStart = parseDashboardAutoStart(props)
     ServerConfig.setGameMode(parseGameMode(props.getProperty("default-gamemode")))
     ServerI18n.initialize()
     WorldManager.bootstrap(worldSeeds = worldSeeds, defaultWorld = defaultWorld)
@@ -194,6 +195,9 @@ fun main() {
     )
     startConsoleCommandLoop()
     PerformanceMonitor.start()
+    if (dashboardAutoStart) {
+        ServerDashboard.start()
+    }
     GameLoop.start()
 }
 
@@ -271,6 +275,23 @@ private fun resolveWorldSeeds(props: Properties): LinkedHashMap<String, Long> {
         worldSeeds.computeIfAbsent(worldKey) { Random.nextLong() }
     }
     return worldSeeds
+}
+
+private fun parseDashboardAutoStart(props: Properties): Boolean {
+    // Compatibility keys:
+    // - dashboard-auto-start (recommended)
+    // - dashboard-auto-open
+    // - dashboard-enabled
+    val autoStartValue = props.getProperty("dashboard-auto-start")
+        ?: props.getProperty("dashboard-auto-open")
+    if (autoStartValue != null) {
+        return autoStartValue.toBooleanStrictOrNull() ?: false
+    }
+    val enabledValue = props.getProperty("dashboard-enabled")
+    if (enabledValue != null) {
+        return enabledValue.toBooleanStrictOrNull() ?: false
+    }
+    return false
 }
 
 private fun ensureExternalConfigFile(path: Path) {

@@ -1510,7 +1510,12 @@ enum class ItemType(val id: Int, val key: String, val blockType: BlockType?) {
     companion object {
         private val byId = entries.associateBy { it.id }
         private val byKey = entries.associateBy { it.key.lowercase() }
+        private val byBlockType = entries
+            .asSequence()
+            .mapNotNull { item -> item.blockType?.let { block -> block to item } }
+            .toMap()
         fun fromId(id: Int): ItemType? = byId[id]
         fun fromKey(key: String): ItemType? = byKey[key.lowercase()]
+        fun fromBlockType(blockType: BlockType): ItemType? = byBlockType[blockType]
     }
 }

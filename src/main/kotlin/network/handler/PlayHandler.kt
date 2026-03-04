@@ -3,7 +3,6 @@ package org.macaroon3145.network.handler
 import io.netty.buffer.ByteBuf
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.SimpleChannelInboundHandler
-import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.NetworkUtils
 import org.macaroon3145.world.BlockPos
 import org.slf4j.LoggerFactory
@@ -141,10 +140,10 @@ class PlayHandler(
             readable == (4 * 2 + 1) -> handleMoveRotation(buf) // 9 bytes
             readable == 8 && (packetId == 0x0B || packetId == 0x1B) -> {
                 val echoedId = buf.readLong()
-                val now = System.currentTimeMillis()
-                val rtt = (now - echoedId).coerceIn(0L, 60_000L).toInt()
-                lastKeepAliveResponseAt = now
-                PlayerSessionManager.updateAndBroadcastPing(session.channelId, rtt)
+                val nowNano = System.nanoTime()
+                val rttMsExact = ((nowNano - echoedId).toDouble() / 1_000_000.0).coerceIn(0.0, 60_000.0)
+                lastKeepAliveResponseAt = System.currentTimeMillis()
+                PlayerSessionManager.updateAndBroadcastPing(session.channelId, rttMsExact)
             }
             readable == 1 && (packetId == 0x1D || packetId == 0x20) -> handleMoveStatusOnly(buf) // 1 byte
             else -> return false
@@ -211,25 +210,6 @@ class PlayHandler(
         clientSkinPartsMask = skinParts
         PlayerSessionManager.updateLocale(session.channelId, locale)
         PlayerSessionManager.updateViewDistance(session.channelId, viewDistance)
-        ServerI18n.logCustom(
-            ServerI18n.label("aerogel.label.client_settings_received"),
-            ServerI18n.punct(": "),
-            ServerI18n.style("user", ServerI18n.Color.GRAY),
-            ServerI18n.punct("="),
-            ServerI18n.style(profile.username, ServerI18n.Color.GREEN),
-            ServerI18n.punct(", "),
-            ServerI18n.style("locale", ServerI18n.Color.GRAY),
-            ServerI18n.punct("="),
-            ServerI18n.style(locale, ServerI18n.Color.GREEN),
-            ServerI18n.punct(", "),
-            ServerI18n.style("viewDistance", ServerI18n.Color.GRAY),
-            ServerI18n.punct("="),
-            ServerI18n.typed(viewDistance),
-            ServerI18n.punct(", "),
-            ServerI18n.style("skinPartsMask", ServerI18n.Color.GRAY),
-            ServerI18n.punct("="),
-            ServerI18n.style("0x${skinParts.toString(16)}", ServerI18n.Color.CYAN)
-        )
     }
 
     private fun handleEntityAction(buf: ByteBuf) {
@@ -769,7 +749,7 @@ class PlayHandler(
         keepAliveTask = ctx.executor().scheduleAtFixedRate(
             {
                 if (!ctx.channel().isActive) return@scheduleAtFixedRate
-                val now = System.currentTimeMillis()
+                val now = System.nanoTime()
                 ctx.writeAndFlush(PlayPackets.keepAlivePacket(now))
             },
             5,

@@ -1,5 +1,6 @@
 package org.macaroon3145.perf
 
+import org.macaroon3145.api.Server
 import org.macaroon3145.i18n.ServerI18n
 import kotlin.math.abs
 
@@ -27,6 +28,7 @@ object PerformanceMonitor {
         rawMspt = 0.0
         mspt = 0.0
         tps = 0.0
+        Server.updateTickPerformance(tps = 0.0, mspt = 0.0)
     }
 
     fun recordTick(tickStartNanos: Long, tickEndNanos: Long) {
@@ -48,6 +50,7 @@ object PerformanceMonitor {
             mspt = (mspt * EWMA_KEEP) + (tickMs * EWMA_NEW)
             tps = (tps * EWMA_KEEP) + (instantTps.coerceAtLeast(0.0) * EWMA_NEW)
         }
+        Server.updateTickPerformance(tps = tps, mspt = mspt)
         if (LOG_TO_CONSOLE) {
             ServerI18n.log("aerogel.log.perf", format(tps), format(mspt))
         }

@@ -84,7 +84,13 @@ data class AnimalEntity(
     override var chunkX: Int,
     override var chunkZ: Int,
     var hitboxWidth: Double,
-    var hitboxHeight: Double
+    var hitboxHeight: Double,
+    var pushable: Boolean,
+    var collision: Boolean,
+    var gravity: Boolean,
+    var attackable: Boolean,
+    var invulnerable: Boolean,
+    var fallDamage: Boolean
 ) : LivingEntity(
     entityId = entityId,
     uuid = uuid,
@@ -122,6 +128,12 @@ data class AnimalSnapshot(
     val maxHealth: Float,
     val hitboxWidth: Double,
     val hitboxHeight: Double,
+    val pushable: Boolean,
+    val collision: Boolean,
+    val gravity: Boolean,
+    val attackable: Boolean,
+    val invulnerable: Boolean,
+    val fallDamage: Boolean,
     val chunkPos: ChunkPos
 )
 
@@ -333,7 +345,13 @@ class AnimalSystem(
             chunkX = chunkX,
             chunkZ = chunkZ,
             hitboxWidth = dimension.width,
-            hitboxHeight = dimension.height
+            hitboxHeight = dimension.height,
+            pushable = true,
+            collision = true,
+            gravity = true,
+            attackable = true,
+            invulnerable = false,
+            fallDamage = true
         )
         if (entities.putIfAbsent(entityId, entity) != null) return false
         brains[entityId] = AnimalBrain()
@@ -558,6 +576,47 @@ class AnimalSystem(
         return true
     }
 
+    fun setPosition(entityId: Int, x: Double, y: Double, z: Double, yaw: Float? = null, pitch: Float? = null): Boolean {
+        val entity = entities[entityId] ?: return false
+        val oldChunk = ChunkPos(entity.chunkX, entity.chunkZ)
+        entity.x = x
+        entity.y = y
+        entity.z = z
+        if (yaw != null) entity.yaw = yaw
+        if (pitch != null) entity.pitch = pitch
+        val newChunkX = chunkXFromBlockX(x)
+        val newChunkZ = chunkZFromBlockZ(z)
+        entity.chunkX = newChunkX
+        entity.chunkZ = newChunkZ
+        val newChunk = ChunkPos(newChunkX, newChunkZ)
+        if (oldChunk != newChunk) {
+            moveChunkIndex(entity.entityId, oldChunk, newChunk)
+        }
+        snapshots[entityId] = toSnapshot(entity)
+        return true
+    }
+
+    fun setPushable(entityId: Int, value: Boolean): Boolean {
+        val entity = entities[entityId] ?: return false
+        entity.pushable = value
+        snapshots[entityId] = toSnapshot(entity)
+        return true
+    }
+
+    fun setCollision(entityId: Int, value: Boolean): Boolean {
+        val entity = entities[entityId] ?: return false
+        entity.collision = value
+        snapshots[entityId] = toSnapshot(entity)
+        return true
+    }
+
+    fun setGravity(entityId: Int, value: Boolean): Boolean {
+        val entity = entities[entityId] ?: return false
+        entity.gravity = value
+        snapshots[entityId] = toSnapshot(entity)
+        return true
+    }
+
     fun addHorizontalImpulse(entityId: Int, impulseX: Double, impulseZ: Double): Boolean {
         val entity = entities[entityId] ?: return false
         entity.vx += impulseX
@@ -638,7 +697,7 @@ class AnimalSystem(
             if (!entity.dead && !oldOnGround && entity.onGround) {
                 val fallDamage = floor((entity.fallDistance + FALL_DAMAGE_EPSILON - SAFE_FALL_DISTANCE_BLOCKS) * FALL_DAMAGE_MULTIPLIER).toInt()
                 entity.fallDistance = 0.0
-                if (fallDamage > 0) {
+                if (entity.fallDamage && fallDamage > 0) {
                     val result = applyDamageInternal(entity, fallDamage.toFloat(), AnimalDamageCause.FALL)
                     if (result != null) {
                         damaged.add(result.damage)
@@ -759,7 +818,22 @@ class AnimalSystem(
     }
 
     private fun stepEntity(entity: AnimalEntity, brain: AnimalBrain, tickScale: Double) {
-        entity.vy -= GRAVITY_PER_TICK * tickScale
+        if (entity.gravity) {
+            entity.vy -= GRAVITY_PER_TICK * tickScale
+        }
+        if (!entity.collision) {
+            entity.x += entity.vx * tickScale
+            entity.y += entity.vy * tickScale
+            entity.z += entity.vz * tickScale
+            entity.onGround = false
+            entity.vx *= AIR_DRAG_PER_TICK.pow(tickScale)
+            entity.vy *= VERTICAL_DRAG_PER_TICK.pow(tickScale)
+            entity.vz *= AIR_DRAG_PER_TICK.pow(tickScale)
+            if (abs(entity.vx) < VELOCITY_EPSILON) entity.vx = 0.0
+            if (abs(entity.vy) < VELOCITY_EPSILON) entity.vy = 0.0
+            if (abs(entity.vz) < VELOCITY_EPSILON) entity.vz = 0.0
+            return
+        }
         val totalDx = entity.vx * tickScale
         val totalDy = entity.vy * tickScale
         val totalDz = entity.vz * tickScale
@@ -900,7 +974,7 @@ class AnimalSystem(
     }
 
     private fun applyDamageInternal(entity: AnimalEntity, amount: Float, cause: AnimalDamageCause): AnimalDamageResult? {
-        if (amount <= 0f || entity.dead) return null
+        if (amount <= 0f || entity.dead || !entity.attackable || entity.invulnerable) return null
         val effectiveAmount = effectiveDamageAfterInvulnerability(entity, amount)
         if (effectiveAmount <= DAMAGE_EPSILON) return null
         val nextHealth = (entity.health - effectiveAmount).coerceAtLeast(0f)
@@ -1950,6 +2024,12 @@ class AnimalSystem(
             maxHealth = entity.maxHealth,
             hitboxWidth = entity.hitboxWidth,
             hitboxHeight = entity.hitboxHeight,
+            pushable = entity.pushable,
+            collision = entity.collision,
+            gravity = entity.gravity,
+            attackable = entity.attackable,
+            invulnerable = entity.invulnerable,
+            fallDamage = entity.fallDamage,
             chunkPos = ChunkPos(entity.chunkX, entity.chunkZ)
         )
     }
