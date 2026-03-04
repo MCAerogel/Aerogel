@@ -15,6 +15,7 @@ import org.macaroon3145.ServerLifecycle
 import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.ui.ServerDashboard
 import org.macaroon3145.network.command.CommandContext
+import org.macaroon3145.network.command.CommandCompletionEncoding
 import org.macaroon3145.network.command.CommandDispatcher
 import org.macaroon3145.network.command.Command
 import org.macaroon3145.network.command.EntitySelectorCompletions
@@ -288,6 +289,11 @@ data class CommandSuggestionWindow(
     val start: Int,
     val length: Int,
     val suggestions: List<String>
+)
+
+private data class CommandCompletionResult(
+    val suggestions: List<String>,
+    val appendToCurrentInput: Boolean = false
 )
 
 object PlayerSessionManager {
@@ -7108,6 +7114,7 @@ private data class PlayerItemTextMeta(
         for (alias in aliases) {
             commandDispatcher.register(alias, command)
         }
+        refreshCommandTreesForAllPlayers()
     }
 
     fun unregisterDynamicCommand(name: String, aliases: List<String>) {
@@ -7115,9 +7122,12 @@ private data class PlayerItemTextMeta(
         for (alias in aliases) {
             commandDispatcher.unregister(alias)
         }
+        refreshCommandTreesForAllPlayers()
     }
 
     fun dynamicAndBuiltinCommandNames(): Set<String> = commandDispatcher.commandNames()
+
+    fun visibleCommandNames(sender: PlayerSession?): Set<String> = commandDispatcher.commandNames(sender)
 
     fun sendPluginMessage(channelId: ChannelId, message: String) {
         val session = sessions[channelId] ?: return
@@ -7192,7 +7202,7 @@ private data class PlayerItemTextMeta(
 
     fun inGameCommandSuggestions(sender: PlayerSession?, input: String, includeOperatorCommands: Boolean): CommandSuggestionWindow {
         val commandNames = if (includeOperatorCommands) {
-            commandDispatcher.commandNames().sortedWith(String.CASE_INSENSITIVE_ORDER)
+            commandDispatcher.commandNames(sender).sortedWith(String.CASE_INSENSITIVE_ORDER)
         } else {
             emptyList()
         }
@@ -7247,15 +7257,18 @@ private data class PlayerItemTextMeta(
                 suggestions = selectorFragment.suggestions
             )
         }
+        val completionResult = commandArgumentCompletions(sender, commandName, providedArgs, activeArgIndex, activeArgPrefix)
+        val appendUnitSuffix = shouldAppendTimeSetUnitSuffix(commandName, providedArgs, activeArgIndex, activeArgPrefix) ||
+            completionResult.appendToCurrentInput
         return CommandSuggestionWindow(
             start = (activeArgStart + if (hasSlash) 1 else 0) +
-                if (shouldAppendTimeSetUnitSuffix(commandName, providedArgs, activeArgIndex, activeArgPrefix)) activeArgPrefix.length else 0,
-            length = if (shouldAppendTimeSetUnitSuffix(commandName, providedArgs, activeArgIndex, activeArgPrefix)) {
+                if (appendUnitSuffix) activeArgPrefix.length else 0,
+            length = if (appendUnitSuffix) {
                 0
             } else {
                 if (trailingWhitespace) 0 else normalized.length - activeArgStart
             },
-            suggestions = commandArgumentCompletions(sender, commandName, providedArgs, activeArgIndex, activeArgPrefix)
+            suggestions = completionResult.suggestions
         )
     }
 
@@ -7273,7 +7286,7 @@ private data class PlayerItemTextMeta(
 
     fun consoleCommandCompletions(input: String): List<String> {
         val line = input.trimStart()
-        val commandNames = commandDispatcher.commandNames().sorted()
+        val commandNames = commandDispatcher.commandNames(sender = null).sorted()
         if (line.isEmpty()) return commandNames
 
         val hasSlash = line.startsWith("/")
@@ -7299,7 +7312,7 @@ private data class PlayerItemTextMeta(
         val providedArgs = if (tokens.size > 1) tokens.drop(1) else emptyList()
         val activeArgIndex = if (trailingWhitespace) providedArgs.size else providedArgs.size - 1
         val activeArgPrefix = if (trailingWhitespace) "" else providedArgs.lastOrNull().orEmpty()
-        return commandArgumentCompletions(null, commandName, providedArgs, activeArgIndex, activeArgPrefix)
+        return commandArgumentCompletions(null, commandName, providedArgs, activeArgIndex, activeArgPrefix).suggestions
     }
 
     private fun commandArgumentCompletions(
@@ -7308,8 +7321,9 @@ private data class PlayerItemTextMeta(
         providedArgs: List<String>,
         activeArgIndex: Int,
         activeArgPrefix: String
-    ): List<String> {
-        return when (commandName) {
+    ): CommandCompletionResult {
+        var appendToCurrentInput = false
+        val suggestions = when (commandName) {
             "op" -> if (activeArgIndex == 0) {
                 sessions.values.asSequence()
                     .map { it.profile.username }
@@ -7348,8 +7362,29 @@ private data class PlayerItemTextMeta(
             "time" -> timeCommandCompletions(sender, providedArgs, activeArgIndex, activeArgPrefix)
             "perf" -> perfCommandCompletions(activeArgIndex, activeArgPrefix)
             "reload" -> reloadCommandCompletions(activeArgIndex, activeArgPrefix)
-            else -> emptyList()
+            else -> {
+                val raw = commandDispatcher.complete(
+                    context = commandContext,
+                    sender = sender,
+                    commandName = commandName,
+                    providedArgs = providedArgs,
+                    activeArgIndex = activeArgIndex,
+                    activeArgPrefix = activeArgPrefix
+                )
+                appendToCurrentInput = raw.any(CommandCompletionEncoding::isAppendEncoded)
+                if (!appendToCurrentInput) {
+                    raw
+                } else {
+                    raw.asSequence()
+                        .map(CommandCompletionEncoding::decode)
+                        .toList()
+                }
+            }
         }
+        return CommandCompletionResult(
+            suggestions = suggestions,
+            appendToCurrentInput = appendToCurrentInput
+        )
     }
 
     private fun reloadCommandCompletions(
@@ -7578,7 +7613,12 @@ private data class PlayerItemTextMeta(
             if (ctx != null && ctx.channel().isActive) {
                 ctx.executor().execute {
                     if (ctx.channel().isActive) {
-                        ctx.writeAndFlush(PlayPackets.commandsPacket(includeOperatorCommands = true))
+                        ctx.writeAndFlush(
+                            PlayPackets.commandsPacket(
+                                includeOperatorCommands = true,
+                                dynamicCommands = visibleCommandNames(target)
+                            )
+                        )
                     }
                 }
             }
@@ -7595,12 +7635,35 @@ private data class PlayerItemTextMeta(
             if (ctx != null && ctx.channel().isActive) {
                 ctx.executor().execute {
                     if (ctx.channel().isActive) {
-                        ctx.writeAndFlush(PlayPackets.commandsPacket(includeOperatorCommands = false))
+                        ctx.writeAndFlush(
+                            PlayPackets.commandsPacket(
+                                includeOperatorCommands = false,
+                                dynamicCommands = visibleCommandNames(target)
+                            )
+                        )
                     }
                 }
             }
         }
         return removedPersisted || removedActive
+    }
+
+    private fun refreshCommandTreesForAllPlayers() {
+        for ((id, session) in sessions) {
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            val includeOperator = isOperator(session)
+            val dynamicNames = visibleCommandNames(session)
+            ctx.executor().execute {
+                if (!ctx.channel().isActive) return@execute
+                ctx.writeAndFlush(
+                    PlayPackets.commandsPacket(
+                        includeOperatorCommands = includeOperator,
+                        dynamicCommands = dynamicNames
+                    )
+                )
+            }
+        }
     }
 
     private fun isOperator(session: PlayerSession?): Boolean {
@@ -8045,23 +8108,31 @@ private data class PlayerItemTextMeta(
         val safeStart = errorStart.coerceIn(0, input.length)
         val validPrefix = input.substring(0, safeStart)
         val invalidSuffix = input.substring(safeStart)
+        val invalidParts = buildList<PlayPackets.ChatComponent> {
+            if (invalidSuffix.isNotEmpty()) {
+                Regex("\\s+|\\S+").findAll(invalidSuffix).forEach { match ->
+                    val segment = match.value
+                    add(
+                        PlayPackets.ChatComponent.Text(
+                            text = segment,
+                            color = "red",
+                            underlined = segment.any { it.isWhitespace().not() }
+                        )
+                    )
+                }
+            }
+            add(
+                PlayPackets.ChatComponent.Translate(
+                    key = "command.context.here",
+                    color = "red",
+                    underlined = false
+                )
+            )
+        }
         val pointer = PlayPackets.ChatComponent.Text(
             text = validPrefix,
             color = if (validPrefix.isEmpty()) null else "gray",
-            extra = listOf(
-                PlayPackets.ChatComponent.Text(
-                    text = invalidSuffix,
-                    color = "red",
-                    underlined = true,
-                    extra = listOf(
-                        PlayPackets.ChatComponent.Translate(
-                            key = "command.context.here",
-                            color = "red",
-                            underlined = false
-                        )
-                    )
-                )
-            )
+            extra = invalidParts
         )
         val ctx = contexts[session.channelId] ?: return
         if (!ctx.channel().isActive) return

@@ -47,7 +47,12 @@ class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChann
         ctx.writeAndFlush(PlayPackets.loginPacket(session.entityId, world.key, session.gameMode))
         ctx.writeAndFlush(PlayPackets.serverBrandPacket("Aerogel"))
         ctx.writeAndFlush(PlayPackets.playerInfoPacket(profile, PlayerSessionManager.displayNameOrUsername(session), session.gameMode, session.pingMs))
-        ctx.writeAndFlush(PlayPackets.commandsPacket(includeOperatorCommands = PlayerSessionManager.isOperatorSession(session)))
+        ctx.writeAndFlush(
+            PlayPackets.commandsPacket(
+                includeOperatorCommands = PlayerSessionManager.isOperatorSession(session),
+                dynamicCommands = PlayerSessionManager.visibleCommandNames(session)
+            )
+        )
         ctx.writeAndFlush(PlayPackets.playerSkinPartsMetadataPacket(entityId = session.entityId, skinPartsMask = skinPartsMask))
         ctx.writeAndFlush(PlayPackets.updateViewDistancePacket(session.chunkRadius))
         ctx.writeAndFlush(PlayPackets.updateViewPositionPacket(session.centerChunkX, session.centerChunkZ))

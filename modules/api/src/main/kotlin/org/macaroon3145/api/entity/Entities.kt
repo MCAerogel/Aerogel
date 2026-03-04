@@ -1,5 +1,6 @@
 package org.macaroon3145.api.entity
 
+import org.macaroon3145.api.command.CommandSender
 import org.macaroon3145.api.type.ItemType
 import org.macaroon3145.api.world.Location
 import org.macaroon3145.api.world.Chunk
@@ -202,6 +203,8 @@ abstract class Player(
 
     abstract val online: Boolean
     abstract val op: Boolean
+
+    open fun hasPermission(node: String): Boolean = op
 }
 
 abstract class Bot(
@@ -226,13 +229,13 @@ abstract class Bot(
 
 abstract class ConnectedPlayer(
     uniqueId: UUID
-) : Player(uniqueId) {
+) : Player(uniqueId), CommandSender {
     data class PlayerSettings(
         val locale: String,
         val viewDistance: Int
     )
 
-    abstract val name: String
+    abstract override val name: String
     abstract val world: World
     abstract override var location: Location
     abstract val settings: PlayerSettings
@@ -293,5 +296,7 @@ abstract class ConnectedPlayer(
     }
 
     abstract fun tr(key: String, vararg args: String): String
-    abstract fun sendMessage(message: String)
+    abstract override fun sendMessage(message: String)
+
+    override fun hasPermission(node: String): Boolean = op
 }

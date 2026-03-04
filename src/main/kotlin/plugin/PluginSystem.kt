@@ -8,9 +8,17 @@ import io.netty.channel.ChannelId
 import org.macaroon3145.DebugConsole
 import org.macaroon3145.api.Server
 import org.macaroon3145.api.command.CommandInvocation
+import org.macaroon3145.api.command.CommandHandler
+import org.macaroon3145.api.command.CommandExecutor
 import org.macaroon3145.api.command.CommandRegistrar
 import org.macaroon3145.api.command.CommandSender
 import org.macaroon3145.api.command.CommandSpec
+import org.macaroon3145.api.command.FunctionalCommandSpec
+import org.macaroon3145.api.command.Command as ApiCommand
+import org.macaroon3145.api.command.CommandContext as ApiCommandContext
+import org.macaroon3145.api.command.ConsoleOnly
+import org.macaroon3145.api.command.Permission as ApiPermission
+import org.macaroon3145.api.command.PlayerOnly
 import org.macaroon3145.api.command.RegisteredCommand
 import org.macaroon3145.api.data.PluginDataStore
 import org.macaroon3145.api.event.CancellableEvent
@@ -75,6 +83,7 @@ import org.macaroon3145.api.plugin.PluginMetadata
 import org.macaroon3145.api.plugin.PluginI18n
 import org.macaroon3145.api.plugin.PluginRegistry
 import org.macaroon3145.api.plugin.PluginReloadReason
+import org.macaroon3145.api.plugin.PluginRuntime
 import org.macaroon3145.api.plugin.PluginState
 import org.macaroon3145.api.scheduler.ScheduledTask
 import org.macaroon3145.api.scheduler.TaskScheduler
@@ -87,6 +96,7 @@ import org.macaroon3145.api.type.ItemType
 import org.macaroon3145.api.type.TypeRegistry
 import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.command.Command
+import org.macaroon3145.network.command.CommandCompletionEncoding
 import org.macaroon3145.network.command.CommandContext
 import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.network.codec.RegistryCodec
@@ -137,6 +147,7 @@ object PluginSystem {
     private val tickScheduler = SimpleTickScheduler()
     private val pluginJarHotReloadLoop = PluginJarHotReloadLoop(::handlePluginJarChanged)
     private val activePluginOwner = ThreadLocal<String?>()
+    private val activePluginContext = ThreadLocal<PluginContext?>()
 
     private val pluginsById = ConcurrentHashMap<String, LoadedPlugin>()
     private val pluginsInLoadOrder = CopyOnWriteArrayList<LoadedPlugin>()
@@ -170,6 +181,11 @@ object PluginSystem {
 
     fun initialize() {
         if (!initialized.compareAndSet(false, true)) return
+        PluginRuntime.bind(
+            ownerProvider = ::currentPluginOwner,
+            currentContextProvider = ::currentPluginContext,
+            contextProvider = ::pluginContext
+        )
         Server.bindWorldRegistry(runtimeWorldRegistry)
         Server.bindMainTickScheduler(tickScheduler.global())
         Server.bindTaskScheduler(scheduler)
@@ -188,6 +204,7 @@ object PluginSystem {
             tickScheduler.shutdownAll()
             initialized.set(false)
         }
+        PluginRuntime.clearBindings()
         Server.clearBindings()
     }
 
@@ -283,6 +300,21 @@ object PluginSystem {
     fun pluginIds(): List<String> {
         synchronized(pluginStateLock) {
             return pluginsInLoadOrder.map { it.metadata.id }
+        }
+    }
+
+    fun pluginCompletionCandidates(): List<String> {
+        synchronized(pluginStateLock) {
+            val out = LinkedHashSet<String>()
+            for (loaded in pluginsInLoadOrder) {
+                val displayName = loaded.metadata.name.trim()
+                if (displayName.isNotEmpty()) {
+                    out += displayName
+                } else {
+                    out += loaded.metadata.id
+                }
+            }
+            return out.toList()
         }
     }
 
@@ -400,7 +432,30 @@ object PluginSystem {
         }
     }
 
+    internal fun <T> withPluginContext(owner: String, context: PluginContext, block: () -> T): T {
+        val previousOwner = activePluginOwner.get()
+        val previousContext = activePluginContext.get()
+        activePluginOwner.set(owner)
+        activePluginContext.set(context)
+        return try {
+            block()
+        } finally {
+            if (previousOwner == null) {
+                activePluginOwner.remove()
+            } else {
+                activePluginOwner.set(previousOwner)
+            }
+            if (previousContext == null) {
+                activePluginContext.remove()
+            } else {
+                activePluginContext.set(previousContext)
+            }
+        }
+    }
+
     internal fun currentPluginOwner(): String? = activePluginOwner.get()
+
+    internal fun currentPluginContext(): PluginContext? = activePluginContext.get()
 
     internal fun postPluginStateChange(
         context: PluginContext,
@@ -935,13 +990,16 @@ object PluginSystem {
 
             try {
                 context.updateState(PluginState.LOADING)
-                withPluginOwner(pluginId) { plugin.onLoad(context) }
+                withPluginContext(pluginId, context) { plugin.onLoad(context) }
                 context.updateState(PluginState.LOADED)
+                val commandRegistrar = context.commands as RuntimeCommandRegistrar
                 eventBus.registerAnnotated(pluginId, plugin)
+                commandRegistrar.registerAnnotated(pluginId, plugin)
                 val registeredListenerClasses = HashSet<String>()
                 registeredListenerClasses.add(plugin.javaClass.name)
                 for (listener in plugin.listeners()) {
                     eventBus.registerAnnotated(pluginId, listener)
+                    commandRegistrar.registerAnnotated(pluginId, listener)
                     registeredListenerClasses.add(listener.javaClass.name)
                 }
                 val autoListeners = discoverAutoListeners(
@@ -952,12 +1010,25 @@ object PluginSystem {
                 )
                 for (listener in autoListeners) {
                     eventBus.registerAnnotated(pluginId, listener)
+                    commandRegistrar.registerAnnotated(pluginId, listener)
+                }
+                val registeredCommandHandlerClasses = HashSet<String>()
+                registeredCommandHandlerClasses.add(plugin.javaClass.name)
+                registeredCommandHandlerClasses.addAll(registeredListenerClasses)
+                val autoCommandHandlers = discoverAutoCommandHandlers(
+                    classLoader = classLoader,
+                    pluginJar = jarPath,
+                    mainClassName = descriptor.mainClass,
+                    excludedClassNames = registeredCommandHandlerClasses
+                )
+                for (handler in autoCommandHandlers) {
+                    commandRegistrar.registerAnnotated(pluginId, handler)
                 }
                 context.updateState(PluginState.ENABLING)
-                withPluginOwner(pluginId) { plugin.onEnable(context) }
+                withPluginContext(pluginId, context) { plugin.onEnable(context) }
                 context.updateState(PluginState.ENABLED)
                 if (loadReason != PluginLoadReason.STARTUP) {
-                    runCatching { withPluginOwner(pluginId) { plugin.onReload(context, loadReason.toPluginReloadReason()) } }
+                    runCatching { withPluginContext(pluginId, context) { plugin.onReload(context, loadReason.toPluginReloadReason()) } }
                         .onFailure { logger.error("Plugin '{}' onReload failed", pluginId, it) }
                 }
                 pluginsById[pluginId] = loaded
@@ -965,7 +1036,7 @@ object PluginSystem {
                 return PluginLoadOutcome.ENABLED
             } catch (error: Throwable) {
                 context.updateState(PluginState.FAILED)
-                runCatching { withPluginOwner(pluginId) { plugin.onDisable(context, PluginDisableReason.LOAD_FAILURE) } }
+                runCatching { withPluginContext(pluginId, context) { plugin.onDisable(context, PluginDisableReason.LOAD_FAILURE) } }
                 cleanupPluginResources(loaded)
                 throw error
             }
@@ -1012,6 +1083,49 @@ object PluginSystem {
                 clazz.methods.any { method -> method.getAnnotation(Subscribe::class.java) != null }
             }.getOrDefault(false)
             if (!hasSubscribeMethod) continue
+
+            val instance = createListenerInstance(clazz) ?: continue
+            out.add(instance)
+        }
+        return out
+    }
+
+    private fun discoverAutoCommandHandlers(
+        classLoader: ClassLoader,
+        pluginJar: Path,
+        mainClassName: String,
+        excludedClassNames: Set<String>
+    ): List<Any> {
+        val out = ArrayList<Any>()
+        val classNames = runCatching {
+            FileSystems.newFileSystem(pluginJar).use { fs ->
+                Files.walk(fs.getPath("/")).use { stream ->
+                    stream
+                        .filter { Files.isRegularFile(it) && it.toString().endsWith(".class") }
+                        .map { path ->
+                            val normalized = path.toString().removePrefix("/").removeSuffix(".class")
+                            normalized.replace('/', '.')
+                        }
+                        .filter { name -> name.isNotBlank() && !name.contains("module-info") }
+                        .toList()
+                }
+            }
+        }.getOrElse { error ->
+            logger.warn("Failed to scan plugin classes for auto commands: {}", pluginJar, error)
+            return emptyList()
+        }
+
+        for (className in classNames) {
+            if (className == mainClassName) continue
+            if (excludedClassNames.contains(className)) continue
+
+            val clazz = runCatching { Class.forName(className, false, classLoader) }.getOrNull() ?: continue
+            if (clazz.isInterface || clazz.isAnnotation || clazz.isEnum || Modifier.isAbstract(clazz.modifiers)) continue
+
+            val hasCommandMethod = runCatching {
+                clazz.methods.any { method -> method.getAnnotation(ApiCommand::class.java) != null }
+            }.getOrDefault(false)
+            if (!hasCommandMethod) continue
 
             val instance = createListenerInstance(clazz) ?: continue
             out.add(instance)
@@ -1079,7 +1193,7 @@ object PluginSystem {
         pluginsInLoadOrder.remove(plugin)
 
         plugin.context.updateState(PluginState.DISABLING)
-        runCatching { withPluginOwner(plugin.metadata.id) { plugin.plugin.onDisable(plugin.context, reason) } }
+        runCatching { withPluginContext(plugin.metadata.id, plugin.context) { plugin.plugin.onDisable(plugin.context, reason) } }
             .onFailure { logger.error("Plugin '{}' onDisable failed", plugin.metadata.id, it) }
         plugin.context.updateState(PluginState.DISABLED)
 
@@ -2131,7 +2245,9 @@ private class RuntimeThrown(
     override val type: EntityType
         get() = when (liveSnapshotOrNull()?.kind ?: ThrownItemKind.SNOWBALL) {
             ThrownItemKind.SNOWBALL -> EntityType.SNOWBALL
-            ThrownItemKind.EGG, ThrownItemKind.BLUE_EGG, ThrownItemKind.BROWN_EGG -> EntityType.EGG
+            ThrownItemKind.EGG -> EntityType.EGG
+            ThrownItemKind.BLUE_EGG -> EntityType.BLUE_EGG
+            ThrownItemKind.BROWN_EGG -> EntityType.BROWN_EGG
             ThrownItemKind.ENDER_PEARL -> EntityType.ENDER_PEARL
         }
 
@@ -3088,6 +3204,8 @@ private class RuntimeWorld(
         val kind = when (entityType) {
             EntityType.SNOWBALL -> ThrownItemKind.SNOWBALL
             EntityType.EGG -> ThrownItemKind.EGG
+            EntityType.BLUE_EGG -> ThrownItemKind.BLUE_EGG
+            EntityType.BROWN_EGG -> ThrownItemKind.BROWN_EGG
             EntityType.ENDER_PEARL -> ThrownItemKind.ENDER_PEARL
             EntityType.DROPPED_ITEM -> {
                 val dropped = pluginInternalDropItem(
@@ -3175,11 +3293,29 @@ private class RuntimeWorld(
                 .toList()
             EntityType.EGG -> PlayerSessionManager.thrownItemSnapshots(key)
                 .asSequence()
-                .filter {
-                    it.kind == ThrownItemKind.EGG ||
-                        it.kind == ThrownItemKind.BLUE_EGG ||
-                        it.kind == ThrownItemKind.BROWN_EGG
+                .filter { it.kind == ThrownItemKind.EGG }
+                .map { snapshot ->
+                    RuntimeThrown(
+                        worldKey = key,
+                        entityId = snapshot.entityId,
+                        uniqueId = snapshot.uuid
+                    )
                 }
+                .toList()
+            EntityType.BLUE_EGG -> PlayerSessionManager.thrownItemSnapshots(key)
+                .asSequence()
+                .filter { it.kind == ThrownItemKind.BLUE_EGG }
+                .map { snapshot ->
+                    RuntimeThrown(
+                        worldKey = key,
+                        entityId = snapshot.entityId,
+                        uniqueId = snapshot.uuid
+                    )
+                }
+                .toList()
+            EntityType.BROWN_EGG -> PlayerSessionManager.thrownItemSnapshots(key)
+                .asSequence()
+                .filter { it.kind == ThrownItemKind.BROWN_EGG }
                 .map { snapshot ->
                     RuntimeThrown(
                         worldKey = key,
@@ -3435,7 +3571,7 @@ private class RuntimeCommandSender private constructor(
     }
 
     companion object {
-        fun fromSession(session: PlayerSession?): CommandSender? {
+        fun fromSession(session: PlayerSession?): CommandSender {
             return if (session == null) {
                 RuntimeCommandSender(
                     name = "CONSOLE",
@@ -3444,12 +3580,7 @@ private class RuntimeCommandSender private constructor(
                     hasPermissionImpl = { true }
                 )
             } else {
-                RuntimeCommandSender(
-                    name = PlayerSessionManager.displayNameOrUsername(session),
-                    subjectName = session.profile.uuid.toString(),
-                    send = { message -> PlayerSessionManager.sendPluginMessage(session.channelId, message) },
-                    hasPermissionImpl = { PlayerSessionManager.isOperatorSession(session) }
-                )
+                RuntimeConnectedPlayer.fromSession(session)
             }
         }
     }
@@ -3459,6 +3590,7 @@ private class RuntimeCommandRegistrar(
     private val owner: String,
     private val permissions: StandardPermissionService
 ) : CommandRegistrar {
+    private val logger = LoggerFactory.getLogger(RuntimeCommandRegistrar::class.java)
     private val specsByPrimaryName = ConcurrentHashMap<String, CommandSpec>()
     private val aliasesByPrimaryName = ConcurrentHashMap<String, List<String>>()
 
@@ -3469,17 +3601,49 @@ private class RuntimeCommandRegistrar(
         val primary = spec.name.lowercase()
         val aliases = spec.aliases.map { it.lowercase() }.filter { it.isNotBlank() && it != primary }
         val wrapped = object : Command {
+            override fun visibleTo(sender: PlayerSession?): Boolean {
+                val permission = spec.permission ?: return true
+                val commandSender = RuntimeCommandSender.fromSession(sender)
+                return permissions.has(commandSender, permission)
+            }
+
             override fun execute(context: CommandContext, sender: PlayerSession?, args: List<String>) {
                 val commandSender = RuntimeCommandSender.fromSession(sender)
                 val permission = spec.permission
                 if (permission != null && !permissions.has(commandSender, permission)) {
-                    commandSender?.sendMessage("No permission: $permission")
+                    commandSender.sendMessage("No permission: $permission")
                     return
                 }
                 val invocation = CommandInvocation(name = primary, args = args, sender = commandSender)
                 PluginSystem.withPluginOwner(this@RuntimeCommandRegistrar.owner) {
                     spec.executor.execute(invocation)
                 }
+            }
+
+            override fun complete(
+                context: CommandContext,
+                sender: PlayerSession?,
+                providedArgs: List<String>,
+                activeArgIndex: Int,
+                activeArgPrefix: String
+            ): List<String> {
+                val completer = spec.completer ?: return emptyList()
+                val commandSender = RuntimeCommandSender.fromSession(sender)
+                val completionArgs = providedArgs.toMutableList()
+                if (activeArgIndex >= 0) {
+                    while (completionArgs.size <= activeArgIndex) {
+                        completionArgs += ""
+                    }
+                    completionArgs[activeArgIndex] = activeArgPrefix
+                }
+                val invocation = CommandInvocation(name = primary, args = completionArgs, sender = commandSender)
+                return PluginSystem.withPluginOwner(this@RuntimeCommandRegistrar.owner) {
+                    completer.complete(invocation)
+                }.asSequence()
+                    .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+                    .distinct()
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .toList()
             }
         }
 
@@ -3495,6 +3659,459 @@ private class RuntimeCommandRegistrar(
                 PlayerSessionManager.unregisterDynamicCommand(primary, removedAliases)
             }
         }
+    }
+
+    override fun register(owner: String, spec: FunctionalCommandSpec): RegisteredCommand {
+        if (owner != this.owner) {
+            throw IllegalArgumentException("Owner mismatch: expected '${this.owner}', got '$owner'")
+        }
+        require(!spec.playerOnly || !spec.consoleOnly) {
+            "Cannot use both playerOnly and consoleOnly: ${spec.name}"
+        }
+
+        val commandName = spec.name.trim().lowercase()
+        require(commandName.isNotEmpty()) { "Command name must not be blank." }
+        val aliases = spec.aliases
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.equals(commandName, ignoreCase = true) }
+            .map { it.lowercase() }
+            .filter { it.isNotBlank() && it != commandName }
+        val permission = spec.permission?.trim()?.takeIf { it.isNotEmpty() }
+
+        val wrappedCommand = object : Command {
+            override fun visibleTo(sender: PlayerSession?): Boolean {
+                if (spec.playerOnly) return sender != null
+                if (spec.consoleOnly) return sender == null
+                val permissionNode = permission
+                if (permissionNode != null) {
+                    val commandSender = RuntimeCommandSender.fromSession(sender)
+                    if (!permissions.has(commandSender, permissionNode)) {
+                        return false
+                    }
+                }
+                return true
+            }
+
+            override fun execute(context: CommandContext, sender: PlayerSession?, args: List<String>) {
+                val commandSender = RuntimeCommandSender.fromSession(sender)
+                val invocation = CommandInvocation(name = commandName, args = args, sender = commandSender)
+                PluginSystem.withPluginOwner(this@RuntimeCommandRegistrar.owner) {
+                    val permissionNode = permission
+                    if (permissionNode != null && !permissions.has(commandSender, permissionNode)) {
+                        commandSender.sendMessage("No permission: $permissionNode")
+                        return@withPluginOwner
+                    }
+
+                    val executeContext = buildApiCommandContext(
+                        commandName = invocation.name,
+                        args = invocation.args,
+                        sender = invocation.sender,
+                        activeArgIndex = invocation.args.size,
+                        activeArgPrefix = ""
+                    )
+                    val built = runCatching { spec.handler(executeContext) }
+                        .onFailure { throwable ->
+                            logger.error(
+                                "Functional command handler failed (owner={}, command={})",
+                                this@RuntimeCommandRegistrar.owner,
+                                invocation.name,
+                                throwable
+                            )
+                        }
+                        .getOrNull() ?: return@withPluginOwner
+
+                    if (built.strict && built.complete != null && args.isNotEmpty()) {
+                        val invalidArgIndex = args.indices.firstOrNull { argIndex ->
+                            val current = args[argIndex]
+                            val completion = resolveCompletions(
+                                built = built,
+                                commandSender = commandSender,
+                                providedArgs = args,
+                                activeArgIndex = argIndex,
+                                activeArgPrefix = current
+                            )
+                            val suggestions = completion.first
+                            val appendMode = completion.second
+                            if (suggestions.isEmpty()) {
+                                true
+                            } else if (appendMode) {
+                                suggestions.any { suffix ->
+                                    current.endsWith(suffix, ignoreCase = true)
+                                }.not()
+                            } else {
+                                suggestions.any { suggestion ->
+                                    suggestion.equals(current, ignoreCase = true)
+                                }.not()
+                            }
+                        }
+                        if (invalidArgIndex != null) {
+                            val rawInput = if (args.isEmpty()) {
+                                commandName
+                            } else {
+                                "$commandName ${args.joinToString(" ")}"
+                            }
+                            var errorStart = commandName.length
+                            if (args.isNotEmpty()) {
+                                errorStart += 1
+                                for (i in 0 until invalidArgIndex) {
+                                    errorStart += args[i].length + 1
+                                }
+                            }
+                            context.sendSourceTranslationWithContext(
+                                sender,
+                                "command.unknown.command",
+                                rawInput,
+                                errorStart
+                            )
+                            return@withPluginOwner
+                        }
+                    }
+
+                    runCatching {
+                        built.execute?.invoke()
+                    }.onFailure { throwable ->
+                        logger.error(
+                            "Functional command execution failed (owner={}, command={})",
+                            this@RuntimeCommandRegistrar.owner,
+                            invocation.name,
+                            throwable
+                        )
+                        invocation.sender.sendMessage("Command failed: ${throwable.message ?: throwable.javaClass.simpleName}")
+                    }
+                }
+            }
+
+            override fun complete(
+                context: CommandContext,
+                sender: PlayerSession?,
+                providedArgs: List<String>,
+                activeArgIndex: Int,
+                activeArgPrefix: String
+            ): List<String> {
+                val commandSender = RuntimeCommandSender.fromSession(sender)
+                val completion = resolveCompletions(
+                    built = null,
+                    commandSender = commandSender,
+                    providedArgs = providedArgs,
+                    activeArgIndex = activeArgIndex,
+                    activeArgPrefix = activeArgPrefix
+                )
+                val suggestions = completion.first
+                val appendMode = completion.second
+                if (!appendMode) return suggestions
+                return suggestions.map(CommandCompletionEncoding::encodeAppend)
+            }
+
+            private fun resolveCompletions(
+                built: CommandHandler?,
+                commandSender: CommandSender,
+                providedArgs: List<String>,
+                activeArgIndex: Int,
+                activeArgPrefix: String
+            ): Pair<List<String>, Boolean> {
+                val completionArgs = providedArgs.toMutableList()
+                if (activeArgIndex >= 0) {
+                    while (completionArgs.size <= activeArgIndex) {
+                        completionArgs += ""
+                    }
+                    completionArgs[activeArgIndex] = activeArgPrefix
+                }
+                val invocation = CommandInvocation(name = commandName, args = completionArgs, sender = commandSender)
+                val permissionNode = permission
+                if (permissionNode != null && !permissions.has(commandSender, permissionNode)) {
+                    return emptyList<String>() to false
+                }
+                val apiContext = buildApiCommandContext(
+                    commandName = invocation.name,
+                    args = invocation.args,
+                    sender = invocation.sender,
+                    activeArgIndex = activeArgIndex,
+                    activeArgPrefix = activeArgPrefix
+                )
+                val resolved = built ?: runCatching { spec.handler(apiContext) }
+                    .onFailure { throwable ->
+                        logger.error(
+                            "Functional command completer failed (owner={}, command={})",
+                            this@RuntimeCommandRegistrar.owner,
+                            invocation.name,
+                            throwable
+                        )
+                    }
+                    .getOrNull()
+                    ?: return emptyList<String>() to false
+                val completions = resolved.complete?.invoke().orEmpty()
+                val appendMode = apiContext.appendCompletionsToInput
+                val normalized = if (appendMode) {
+                    completions.asSequence()
+                        .map(String::trim)
+                        .filter { it.isNotEmpty() }
+                        .distinct()
+                        .toList()
+                } else {
+                    completions.asSequence()
+                        .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+                        .distinct()
+                        .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                        .toList()
+                }
+                return normalized to appendMode
+            }
+        }
+
+        PlayerSessionManager.registerDynamicCommand(commandName, aliases, wrappedCommand)
+        specsByPrimaryName[commandName] = CommandSpec(
+            name = commandName,
+            aliases = aliases,
+            permission = permission,
+            executor = CommandExecutor { },
+            completer = null
+        )
+        aliasesByPrimaryName[commandName] = aliases
+        return object : RegisteredCommand {
+            override val name: String = commandName
+
+            override fun unregister() {
+                val removedAliases = aliasesByPrimaryName.remove(commandName).orEmpty()
+                specsByPrimaryName.remove(commandName)
+                PlayerSessionManager.unregisterDynamicCommand(commandName, removedAliases)
+            }
+        }
+    }
+
+    override fun registerAnnotated(owner: String, handler: Any): List<RegisteredCommand> {
+        if (owner != this.owner) {
+            throw IllegalArgumentException("Owner mismatch: expected '${this.owner}', got '$owner'")
+        }
+        val out = ArrayList<RegisteredCommand>()
+        for (method in handler.javaClass.methods) {
+            val command = method.getAnnotation(ApiCommand::class.java) ?: continue
+            if (method.parameterCount != 1 || method.parameterTypes[0] != ApiCommandContext::class.java) {
+                throw IllegalArgumentException(
+                    "Invalid @Command method signature: ${handler.javaClass.name}#${method.name}. " +
+                        "Expected: fun method(context: org.macaroon3145.api.command.CommandContext): CommandHandler"
+                )
+            }
+            if (!CommandHandler::class.java.isAssignableFrom(method.returnType)) {
+                throw IllegalArgumentException(
+                    "Invalid @Command return type: ${handler.javaClass.name}#${method.name}. " +
+                        "Expected: org.macaroon3145.api.command.CommandHandler"
+                )
+            }
+            val commandName = command.value.trim().lowercase()
+            require(commandName.isNotEmpty()) {
+                "@Command value must not be blank: ${handler.javaClass.name}#${method.name}"
+            }
+            val aliases = command.aliases.map { it.trim() }.filter { it.isNotEmpty() && !it.equals(commandName, ignoreCase = true) }
+            val permission = method.getAnnotation(ApiPermission::class.java)?.value?.trim()?.takeIf { it.isNotEmpty() }
+            val playerOnly = method.isAnnotationPresent(PlayerOnly::class.java)
+            val consoleOnly = method.isAnnotationPresent(ConsoleOnly::class.java)
+            if (playerOnly && consoleOnly) {
+                throw IllegalArgumentException(
+                    "Cannot use both @PlayerOnly and @ConsoleOnly: ${handler.javaClass.name}#${method.name}"
+                )
+            }
+
+            method.isAccessible = true
+            val bound = MethodHandles.lookup().unreflect(method).bindTo(handler)
+
+            val wrappedCommand = object : Command {
+                override fun visibleTo(sender: PlayerSession?): Boolean {
+                    if (playerOnly) return sender != null
+                    if (consoleOnly) return sender == null
+                    val permissionNode = permission
+                    if (permissionNode != null) {
+                        val commandSender = RuntimeCommandSender.fromSession(sender)
+                        if (!permissions.has(commandSender, permissionNode)) {
+                            return false
+                        }
+                    }
+                    return true
+                }
+
+                override fun execute(context: CommandContext, sender: PlayerSession?, args: List<String>) {
+                    val commandSender = RuntimeCommandSender.fromSession(sender)
+                    val invocation = CommandInvocation(name = commandName, args = args, sender = commandSender)
+                    PluginSystem.withPluginOwner(this@RuntimeCommandRegistrar.owner) {
+                        val permissionNode = permission
+                        if (permissionNode != null && !permissions.has(commandSender, permissionNode)) {
+                            commandSender.sendMessage("No permission: $permissionNode")
+                            return@withPluginOwner
+                        }
+                        val executeContext = buildApiCommandContext(
+                            commandName = invocation.name,
+                            args = invocation.args,
+                            sender = invocation.sender,
+                            activeArgIndex = invocation.args.size,
+                            activeArgPrefix = ""
+                        )
+                        val built = resolveHandler(executeContext, invocation.name) ?: return@withPluginOwner
+                        if (built.strict && built.complete != null && args.isNotEmpty()) {
+                            val invalidArgIndex = args.indices.firstOrNull { argIndex ->
+                                val current = args[argIndex]
+                                val completion = resolveCompletions(
+                                    built = built,
+                                    commandSender = commandSender,
+                                    providedArgs = args,
+                                    activeArgIndex = argIndex,
+                                    activeArgPrefix = current
+                                )
+                                val suggestions = completion.first
+                                val appendMode = completion.second
+                                if (suggestions.isEmpty()) {
+                                    true
+                                } else if (appendMode) {
+                                    suggestions.any { suffix ->
+                                        current.endsWith(suffix, ignoreCase = true)
+                                    }.not()
+                                } else {
+                                    suggestions.any { suggestion ->
+                                        suggestion.equals(current, ignoreCase = true)
+                                    }.not()
+                                }
+                            }
+                            if (invalidArgIndex != null) {
+                                val rawInput = if (args.isEmpty()) {
+                                    commandName
+                                } else {
+                                    "$commandName ${args.joinToString(" ")}"
+                                }
+                                var errorStart = commandName.length
+                                if (args.isNotEmpty()) {
+                                    errorStart += 1 // space after command name
+                                    for (i in 0 until invalidArgIndex) {
+                                        errorStart += args[i].length + 1 // arg + separating space
+                                    }
+                                }
+                                context.sendSourceTranslationWithContext(
+                                    sender,
+                                    "command.unknown.command",
+                                    rawInput,
+                                    errorStart
+                                )
+                                return@withPluginOwner
+                            }
+                        }
+                        runCatching {
+                            built.execute?.invoke()
+                        }.onFailure { throwable ->
+                            logger.error(
+                                "Annotated command execution failed (owner={}, handler={}, method={}, command={})",
+                                this@RuntimeCommandRegistrar.owner,
+                                handler.javaClass.name,
+                                method.name,
+                                invocation.name,
+                                throwable
+                            )
+                            invocation.sender.sendMessage("Command failed: ${throwable.message ?: throwable.javaClass.simpleName}")
+                        }
+                    }
+                }
+
+                override fun complete(
+                    context: CommandContext,
+                    sender: PlayerSession?,
+                    providedArgs: List<String>,
+                    activeArgIndex: Int,
+                    activeArgPrefix: String
+                ): List<String> {
+                    val commandSender = RuntimeCommandSender.fromSession(sender)
+                    val completion = resolveCompletions(
+                        built = null,
+                        commandSender = commandSender,
+                        providedArgs = providedArgs,
+                        activeArgIndex = activeArgIndex,
+                        activeArgPrefix = activeArgPrefix
+                    )
+                    val suggestions = completion.first
+                    val appendMode = completion.second
+                    if (!appendMode) return suggestions
+                    return suggestions.map(CommandCompletionEncoding::encodeAppend)
+                }
+
+                private fun resolveCompletions(
+                    built: CommandHandler?,
+                    commandSender: CommandSender,
+                    providedArgs: List<String>,
+                    activeArgIndex: Int,
+                    activeArgPrefix: String
+                ): Pair<List<String>, Boolean> {
+                    val completionArgs = providedArgs.toMutableList()
+                    if (activeArgIndex >= 0) {
+                        while (completionArgs.size <= activeArgIndex) {
+                            completionArgs += ""
+                        }
+                        completionArgs[activeArgIndex] = activeArgPrefix
+                    }
+                    val invocation = CommandInvocation(name = commandName, args = completionArgs, sender = commandSender)
+                    val permissionNode = permission
+                    if (permissionNode != null && !permissions.has(commandSender, permissionNode)) {
+                        return emptyList<String>() to false
+                    }
+                    val apiContext = buildApiCommandContext(
+                        commandName = invocation.name,
+                        args = invocation.args,
+                        sender = invocation.sender,
+                        activeArgIndex = activeArgIndex,
+                        activeArgPrefix = activeArgPrefix
+                    )
+                    val resolved = built ?: resolveHandler(apiContext, invocation.name) ?: return emptyList<String>() to false
+                    val completions = resolved.complete?.invoke().orEmpty()
+
+                    val appendMode = apiContext.appendCompletionsToInput
+                    val normalized = if (appendMode) {
+                        completions.asSequence()
+                            .map(String::trim)
+                            .filter { it.isNotEmpty() }
+                            .distinct()
+                            .toList()
+                    } else {
+                        completions.asSequence()
+                            .filter { it.startsWith(activeArgPrefix, ignoreCase = true) }
+                            .distinct()
+                            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                            .toList()
+                    }
+                    return normalized to appendMode
+                }
+
+                private fun resolveHandler(apiContext: ApiCommandContext, command: String): CommandHandler? {
+                    return runCatching {
+                        PluginSystem.withPluginOwner(this@RuntimeCommandRegistrar.owner) {
+                            bound.invoke(apiContext) as CommandHandler
+                        }
+                    }.onFailure { throwable ->
+                        logger.error(
+                            "Annotated command handler failed (owner={}, handler={}, method={}, command={})",
+                            this@RuntimeCommandRegistrar.owner,
+                            handler.javaClass.name,
+                            method.name,
+                            command,
+                            throwable
+                        )
+                    }.getOrNull()
+                }
+            }
+            val wrappedAliases = aliases.map { it.lowercase() }.filter { it.isNotBlank() && it != commandName }
+            PlayerSessionManager.registerDynamicCommand(commandName, wrappedAliases, wrappedCommand)
+            specsByPrimaryName[commandName] = CommandSpec(
+                name = commandName,
+                aliases = wrappedAliases,
+                permission = permission,
+                executor = CommandExecutor { },
+                completer = null
+            )
+            aliasesByPrimaryName[commandName] = wrappedAliases
+            out += object : RegisteredCommand {
+                override val name: String = commandName
+
+                override fun unregister() {
+                    val removedAliases = aliasesByPrimaryName.remove(commandName).orEmpty()
+                    specsByPrimaryName.remove(commandName)
+                    PlayerSessionManager.unregisterDynamicCommand(commandName, removedAliases)
+                }
+            }
+        }
+        return out
     }
 
     override fun unregisterOwner(owner: String) {
@@ -3513,6 +4130,67 @@ private class RuntimeCommandRegistrar(
         for ((primary, aliases) in snapshot) {
             PlayerSessionManager.unregisterDynamicCommand(primary, aliases)
         }
+    }
+
+    private fun buildApiCommandContext(
+        commandName: String,
+        args: List<String>,
+        sender: CommandSender,
+        activeArgIndex: Int,
+        activeArgPrefix: String
+    ): ApiCommandContext {
+        val inputs = ArrayList<String>(args.size + 1)
+        inputs += commandName
+        if (args.isNotEmpty()) {
+            inputs += args
+        }
+        if (activeArgIndex >= 0) {
+            val inputIndex = activeArgIndex + 1
+            while (inputs.size <= inputIndex) {
+                inputs += ""
+            }
+            inputs[inputIndex] = activeArgPrefix
+        }
+        return ApiCommandContext(
+            name = commandName,
+            inputs = inputs,
+            sender = sender,
+            activeInputPrefix = activeArgPrefix,
+            onlinePlayerNamesProvider = {
+                PlayerSessionManager.players()
+                    .asSequence()
+                    .map { it.profile.username }
+                    .distinct()
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .toList()
+            },
+            worldKeysProvider = {
+                WorldManager.allWorlds()
+                    .asSequence()
+                    .map { it.key.substringAfter(':', it.key) }
+                    .distinct()
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .toList()
+            },
+            pluginIdsProvider = { PluginSystem.pluginCompletionCandidates() },
+            commandNamesProvider = { PlayerSessionManager.dynamicAndBuiltinCommandNames() },
+            itemKeysProvider = {
+                runtimeTypeRegistry.allItems()
+                    .asSequence()
+                    .map { it.key }
+                    .distinct()
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .toList()
+            },
+            blockKeysProvider = {
+                runtimeTypeRegistry.allBlocks()
+                    .asSequence()
+                    .map { it.key }
+                    .distinct()
+                    .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                    .toList()
+            }
+        )
     }
 }
 
@@ -3534,7 +4212,7 @@ private class StandardPermissionService : PermissionService {
         if (matching != null) {
             return matching.value
         }
-        val fallback = (sender as? PermissionAwareSender)?.baseHasPermission(node) ?: false
+        val fallback = (sender as? PermissionAwareSender)?.baseHasPermission(node) ?: sender.hasPermission(node)
         return if (fallback) PermissionResult.ALLOW else PermissionResult.UNSET
     }
 
@@ -3841,7 +4519,9 @@ private class SimpleTaskScheduler : TaskScheduler {
         return object : TaskScheduler {
             override fun runSync(task: () -> Unit) {
                 if (!isGenerationActive(owner, generation)) return
-                task()
+                PluginSystem.withPluginOwner(owner) {
+                    task()
+                }
             }
 
             override fun <T> supplyAsync(task: () -> T): CompletableFuture<T> {
@@ -3849,14 +4529,18 @@ private class SimpleTaskScheduler : TaskScheduler {
                     if (!isGenerationActive(owner, generation)) {
                         throw IllegalStateException("Task owner '$owner' is no longer active.")
                     }
-                    task()
+                    PluginSystem.withPluginOwner(owner) {
+                        task()
+                    }
                 }, ownerExecutor)
             }
 
             override fun runAsync(task: () -> Unit): ScheduledTask {
                 val wrapped = Runnable {
                     if (!isGenerationActive(owner, generation)) return@Runnable
-                    task()
+                    PluginSystem.withPluginOwner(owner) {
+                        task()
+                    }
                 }
                 val future = ownerExecutor.schedule(wrapped, 0L, TimeUnit.NANOSECONDS)
                 return ScheduledFutureTask(future)
@@ -3865,7 +4549,9 @@ private class SimpleTaskScheduler : TaskScheduler {
             override fun runAsyncLater(delay: Duration, task: () -> Unit): ScheduledTask {
                 val wrapped = Runnable {
                     if (!isGenerationActive(owner, generation)) return@Runnable
-                    task()
+                    PluginSystem.withPluginOwner(owner) {
+                        task()
+                    }
                 }
                 val future = ownerExecutor.schedule(wrapped, delay.toDelayNanos(), TimeUnit.NANOSECONDS)
                 return ScheduledFutureTask(future)
@@ -3875,7 +4561,9 @@ private class SimpleTaskScheduler : TaskScheduler {
                 val repeatingNanos = period.toPeriodNanos()
                 val wrapped = Runnable {
                     if (!isGenerationActive(owner, generation)) return@Runnable
-                    task()
+                    PluginSystem.withPluginOwner(owner) {
+                        task()
+                    }
                 }
                 val future = ownerExecutor.scheduleAtFixedRate(
                     wrapped,
@@ -4212,7 +4900,11 @@ private class SimpleTickScheduler : TickScheduler {
     private fun dispatch(entry: TickTaskEntry) {
         when (entry.mode) {
             ExecutionMode.GAME -> {
-                runCatching { entry.task.invoke() }
+                runCatching {
+                    PluginSystem.withPluginOwner(entry.owner) {
+                        entry.task.invoke()
+                    }
+                }
                     .onFailure { throwable -> logger.error("Tick task failed (owner={})", entry.owner, throwable) }
             }
 
@@ -4222,7 +4914,11 @@ private class SimpleTickScheduler : TickScheduler {
                 val chunkZ = entry.chunkZ ?: return
                 val world = WorldManager.world(worldKey) ?: return
                 world.submitOnChunkActor(ChunkPos(chunkX, chunkZ)) {
-                    runCatching { entry.task.invoke() }
+                    runCatching {
+                        PluginSystem.withPluginOwner(entry.owner) {
+                            entry.task.invoke()
+                        }
+                    }
                         .onFailure { throwable -> logger.error("Chunk tick task failed (owner={})", entry.owner, throwable) }
                 }
             }

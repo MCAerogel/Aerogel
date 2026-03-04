@@ -1,5 +1,6 @@
 package org.macaroon3145.api.event
 
+import org.macaroon3145.api.plugin.PluginRuntime
 import java.util.concurrent.ConcurrentHashMap
 
 interface Event
@@ -119,4 +120,35 @@ inline fun <reified E : Event> EventBus.listenNoCancel(
 
 inline fun <reified E : Event> EventBus.hasListeners(): Boolean {
     return hasListeners(E::class.java)
+}
+
+inline fun <reified E : Event> listen(
+    priority: EventPriority = EventPriority.NORMAL,
+    receiveCancelled: Boolean = false,
+    filter: EventFilter<E>? = null,
+    noinline handler: E.() -> Unit
+): EventSubscription {
+    val context = PluginRuntime.requireCurrentContext()
+    return context.events.listen(
+        owner = context.metadata.id,
+        eventType = E::class.java,
+        priority = priority,
+        receiveCancelled = receiveCancelled,
+        filter = filter,
+        handler = { event -> handler(event) }
+    )
+}
+
+inline fun <reified E : Event> listenNoCancel(
+    priority: EventPriority = EventPriority.NORMAL,
+    receiveCancelled: Boolean = false,
+    filter: EventFilter<E>? = null,
+    noinline handler: E.() -> Unit
+): EventSubscription {
+    return listen(
+        priority = priority,
+        receiveCancelled = receiveCancelled,
+        filter = filter,
+        handler = handler
+    )
 }

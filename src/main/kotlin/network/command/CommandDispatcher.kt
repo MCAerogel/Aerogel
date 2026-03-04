@@ -16,6 +16,13 @@ class CommandDispatcher(
 
     fun commandNames(): Set<String> = commands.keys
 
+    fun commandNames(sender: PlayerSession?): Set<String> {
+        return commands.entries.asSequence()
+            .filter { it.value.visibleTo(sender) }
+            .map { it.key }
+            .toCollection(linkedSetOf())
+    }
+
     fun register(name: String, command: Command) {
         commands[name.lowercase()] = command
     }
@@ -30,6 +37,25 @@ class CommandDispatcher(
         commands.remove(name.lowercase())
     }
 
+    fun complete(
+        context: CommandContext,
+        sender: PlayerSession?,
+        commandName: String,
+        providedArgs: List<String>,
+        activeArgIndex: Int,
+        activeArgPrefix: String
+    ): List<String> {
+        val command = commands[commandName.lowercase()] ?: return emptyList()
+        if (!command.visibleTo(sender)) return emptyList()
+        return command.complete(
+            context = context,
+            sender = sender,
+            providedArgs = providedArgs,
+            activeArgIndex = activeArgIndex,
+            activeArgPrefix = activeArgPrefix
+        )
+    }
+
     fun dispatch(context: CommandContext, sender: PlayerSession?, rawCommand: String) {
         val stripped = rawCommand.removePrefix("/").trim()
         if (stripped.isEmpty()) return
@@ -39,7 +65,7 @@ class CommandDispatcher(
         val name = parts[0].lowercase()
         val args = if (parts.size > 1) parts.subList(1, parts.size) else emptyList()
         val command = commands[name]
-        if (command == null) {
+        if (command == null || !command.visibleTo(sender)) {
             context.sendUnknownCommandWithContext(sender, stripped)
             return
         }

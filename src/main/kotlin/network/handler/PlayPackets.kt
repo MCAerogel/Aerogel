@@ -377,7 +377,10 @@ object PlayPackets {
         return packet.toByteArray()
     }
 
-    fun commandsPacket(includeOperatorCommands: Boolean): ByteArray {
+    fun commandsPacket(
+        includeOperatorCommands: Boolean,
+        dynamicCommands: Collection<String> = emptyList()
+    ): ByteArray {
         data class CmdNode(
             val flags: Int,
             val children: IntArray,
@@ -404,6 +407,7 @@ object PlayPackets {
         }
         fun brigadierIntegerPayloadNoBounds(): ByteArray = byteArrayOf(0)
         fun brigadierStringPayloadSingleWord(): ByteArray = byteArrayOf(0)
+        fun brigadierStringPayloadGreedyPhrase(): ByteArray = byteArrayOf(2)
         fun timePayload(minTicks: Int): ByteArray {
             val out = ByteArrayOutputStream()
             DataOutputStream(out).writeInt(minTicks)
@@ -627,6 +631,36 @@ object PlayPackets {
             addTimeSubtree()
             addPerfSubtree()
             addReloadSubtree()
+        }
+
+        val staticLiterals = hashSetOf(
+            "tp",
+            "teleport",
+            "gamemode",
+            "op",
+            "deop",
+            "stop",
+            "time",
+            "perf",
+            "reload"
+        )
+        val dynamicLiterals = dynamicCommands.asSequence()
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() && it !in staticLiterals }
+            .distinct()
+            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+            .toList()
+        for (literal in dynamicLiterals) {
+            val literalIndex = addLiteral(literal, executable = true)
+            val argsIndex = addArgument(
+                name = "args",
+                parserTypeId = COMMAND_ARGUMENT_TYPE_BRIGADIER_STRING_ID_1_21_11,
+                parserPayload = brigadierStringPayloadGreedyPhrase(),
+                executable = true,
+                suggestionType = "minecraft:ask_server"
+            )
+            setNode(literalIndex, nodes[literalIndex].copy(children = intArrayOf(argsIndex)))
+            rootChildren += literalIndex
         }
         setNode(rootIndex, nodes[rootIndex].copy(children = rootChildren.toIntArray()))
 

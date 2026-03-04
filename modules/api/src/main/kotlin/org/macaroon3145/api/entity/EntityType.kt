@@ -6,5 +6,7 @@ enum class EntityType {
     DROPPED_ITEM,
     SNOWBALL,
     EGG,
+    BLUE_EGG,
+    BROWN_EGG,
     ENDER_PEARL
 }

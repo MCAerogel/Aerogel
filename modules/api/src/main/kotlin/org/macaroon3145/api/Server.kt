@@ -2,6 +2,7 @@ package org.macaroon3145.api
 
 import org.macaroon3145.api.entity.Player
 import org.macaroon3145.api.entity.PlayerRegistry
+import org.macaroon3145.api.plugin.PluginRuntime
 import org.macaroon3145.api.scheduler.TaskScheduler
 import org.macaroon3145.api.scheduler.TickScheduler
 import org.macaroon3145.api.world.World
@@ -23,10 +24,12 @@ object Server {
     private var currentMspt: Double = 0.0
 
     val mainTickScheduler: TickScheduler
-        get() = checkNotNull(boundMainTickScheduler) { "Server is not initialized yet: mainTickScheduler is unavailable." }
+        get() = PluginRuntime.currentContextOrNull()?.tickScheduler
+            ?: checkNotNull(boundMainTickScheduler) { "Server is not initialized yet: mainTickScheduler is unavailable." }
 
     val taskScheduler: TaskScheduler
-        get() = checkNotNull(boundTaskScheduler) { "Server is not initialized yet: taskScheduler is unavailable." }
+        get() = PluginRuntime.currentContextOrNull()?.taskScheduler
+            ?: checkNotNull(boundTaskScheduler) { "Server is not initialized yet: taskScheduler is unavailable." }
 
     val tps: Double
         get() = currentTps
