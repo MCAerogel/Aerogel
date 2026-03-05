@@ -3,6 +3,7 @@ package org.macaroon3145
 import io.netty.channel.Channel
 import io.netty.channel.EventLoopGroup
 import org.macaroon3145.i18n.ServerI18n
+import org.macaroon3145.network.auth.MojangAuthService
 import org.macaroon3145.network.handler.PlayerSessionManager
 import org.macaroon3145.perf.GameLoop
 import org.macaroon3145.perf.PerformanceMonitor
@@ -81,6 +82,8 @@ object ServerLifecycle {
             runCatching { VanillaAnvilWorldSaver.saveAllDirtyWorlds() }
                 .onFailure { logger.warn("Synchronous world save failed during shutdown", it) }
             PlayerSessionManager.shutdown()
+            runCatching { MojangAuthService.shutdown() }
+                .onFailure { logger.warn("Failed to shutdown Mojang auth executor", it) }
             PluginSystem.shutdown()
             runCatching { serverChannel?.close()?.syncUninterruptibly() }
             val bossShutdown = runCatching {

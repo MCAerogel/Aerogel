@@ -757,9 +757,9 @@ object PluginSystem {
         val (itemId, amount) = when (hand) {
             Hand.MAIN_HAND -> {
                 val slot = session.selectedHotbarSlot.coerceIn(0, 8)
-                session.hotbarItemIds[slot] to session.hotbarItemCounts[slot]
+                session.hotbarStacks[slot].itemId to session.hotbarStacks[slot].count
             }
-            Hand.OFF_HAND -> session.offhandItemId to session.offhandItemCount
+            Hand.OFF_HAND -> session.offhandStack.itemId to session.offhandStack.count
         }
         if (itemId < 0 || amount <= 0) return null
         return Item(
@@ -1557,37 +1557,37 @@ private class RuntimeConnectedPlayer(
             return PlayerInventory(
                 selectedHotbarSlot = session.selectedHotbarSlot.coerceIn(0, 8),
                 hotbar = InventorySlotView(
-                    size = session.hotbarItemIds.size,
+                    size = session.hotbarStacks.size,
                     getter = { slot ->
                         val live = liveSession()
-                        inventoryStackOf(live.hotbarItemIds[slot], live.hotbarItemCounts[slot])
+                        inventoryStackOf(live.hotbarStacks[slot].itemId, live.hotbarStacks[slot].count)
                     },
                     setter = { slot, item ->
                         setHotbarItem(slot, item)
                     }
                 ),
                 main = InventorySlotView(
-                    size = session.mainInventoryItemIds.size,
+                    size = session.mainInventoryStacks.size,
                     getter = { index ->
                         val live = liveSession()
-                        inventoryStackOf(live.mainInventoryItemIds[index], live.mainInventoryItemCounts[index])
+                        inventoryStackOf(live.mainInventoryStacks[index].itemId, live.mainInventoryStacks[index].count)
                     },
                     setter = { slot, item ->
                         setMainItem(slot, item)
                     }
                 ),
                 armor = InventorySlotView(
-                    size = session.armorItemIds.size,
+                    size = session.armorStacks.size,
                     getter = { armor ->
                         val live = liveSession()
-                        inventoryStackOf(live.armorItemIds[armor], live.armorItemCounts[armor])
+                        inventoryStackOf(live.armorStacks[armor].itemId, live.armorStacks[armor].count)
                     },
                     setter = { armorIndex, item ->
                         val slot = ArmorSlot.fromArmorIndex(armorIndex) ?: return@InventorySlotView false
                         setArmorItem(slot, item)
                     }
                 ),
-                offhand = inventoryStackOf(session.offhandItemId, session.offhandItemCount)
+                offhand = inventoryStackOf(session.offhandStack.itemId, session.offhandStack.count)
             )
         }
 

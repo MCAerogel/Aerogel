@@ -97,4 +97,8 @@ object MojangAuthService {
         }
         return UUID.fromString(dashed)
     }
+
+    fun shutdown() {
+        executor.shutdownNow()
+    }
 }

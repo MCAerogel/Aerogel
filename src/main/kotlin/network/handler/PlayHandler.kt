@@ -378,10 +378,17 @@ class PlayHandler(
     private fun handlePickItemFromBlock(buf: ByteBuf) {
         if (buf.readableBytes() < 8) return
         val pos = readBlockPos(buf)
+        var includeData = false
         if (buf.readableBytes() > 0) {
-            buf.readBoolean() // includeData
+            includeData = buf.readBoolean()
         }
-        PlayerSessionManager.setSelectedBlockFromWorld(session.channelId, pos.x, pos.y, pos.z)
+        PlayerSessionManager.setSelectedBlockFromWorld(
+            channelId = session.channelId,
+            x = pos.x,
+            y = pos.y,
+            z = pos.z,
+            includeData = includeData
+        )
     }
 
     private fun handleSetCarriedItem(buf: ByteBuf) {

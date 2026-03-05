@@ -2,6 +2,8 @@ package org.macaroon3145.network.handler
 
 import io.netty.channel.ChannelHandlerContext
 import org.macaroon3145.config.ServerConfig
+import org.macaroon3145.network.codec.BlockEntityTypeRegistry
+import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.DroppedItemSnapshot
 import org.macaroon3145.world.World
@@ -258,7 +260,13 @@ object ChunkStreamingService {
                                         }
                                     val chunkWithPersistedHeightmaps =
                                         VanillaAnvilWorldSaver.applyPersistedHeightmapsIfPresent(world.key, coord, chunkWithPersistedLighting)
-                                    val chunkPacket = PlayPackets.mapChunkPacket(coord.x, coord.z, chunkWithPersistedHeightmaps)
+                                    val chunkBlockEntities = collectChunkBlockEntitiesForClient(world, coord)
+                                    val chunkPacket = PlayPackets.mapChunkPacket(
+                                        chunkX = coord.x,
+                                        chunkZ = coord.z,
+                                        generated = chunkWithPersistedHeightmaps,
+                                        blockEntities = chunkBlockEntities
+                                    )
                                     val deltaPackets = buildChunkDeltaPackets(changedBlocks, changedBlockEntities)
                                     val droppedItems = if (includeDroppedItems) world.droppedItemsInChunk(coord.x, coord.z) else emptyList()
 
@@ -456,4 +464,54 @@ object ChunkStreamingService {
         }
         return packets
     }
+
+    private fun collectChunkBlockEntitiesForClient(world: World, chunkPos: ChunkPos): List<PlayPackets.ChunkBlockEntityEntry> {
+        val chestTypeId = BlockEntityTypeRegistry.idOf("minecraft:chest") ?: return emptyList()
+        val trappedChestTypeId = BlockEntityTypeRegistry.idOf("minecraft:trapped_chest") ?: chestTypeId
+        val enderChestTypeId = BlockEntityTypeRegistry.idOf("minecraft:ender_chest")
+        val shulkerTypeId = BlockEntityTypeRegistry.idOf("minecraft:shulker_box")
+
+        val out = ArrayList<PlayPackets.ChunkBlockEntityEntry>()
+        val baseX = chunkPos.x shl 4
+        val baseZ = chunkPos.z shl 4
+        for (y in -64..319) {
+            for (localZ in 0 until 16) {
+                for (localX in 0 until 16) {
+                    val x = baseX + localX
+                    val z = baseZ + localZ
+                    val blockKey = BlockStateRegistry.parsedState(world.blockStateAt(x, y, z))?.blockKey ?: continue
+                    val typeId = when {
+                        blockKey == "minecraft:trapped_chest" -> trappedChestTypeId
+                        blockKey == "minecraft:ender_chest" -> enderChestTypeId ?: continue
+                        isChestLikeBlockKey(blockKey) -> chestTypeId
+                        isShulkerBoxBlockKey(blockKey) -> shulkerTypeId ?: continue
+                        else -> continue
+                    }
+                    val blockEntity = world.blockEntityAt(x, y, z)
+                    val payload = blockEntity?.nbtPayload ?: EMPTY_COMPOUND_NBT
+                    out.add(
+                        PlayPackets.ChunkBlockEntityEntry(
+                            x = x,
+                            y = y,
+                            z = z,
+                            typeId = typeId,
+                            nbtPayload = payload
+                        )
+                    )
+                }
+            }
+        }
+        return out
+    }
+
+    private fun isChestLikeBlockKey(blockKey: String): Boolean {
+        if (blockKey == "minecraft:chest") return true
+        return blockKey != "minecraft:ender_chest" && blockKey.endsWith("_chest")
+    }
+
+    private fun isShulkerBoxBlockKey(blockKey: String): Boolean {
+        return blockKey == "minecraft:shulker_box" || blockKey.endsWith("_shulker_box")
+    }
+
+    private val EMPTY_COMPOUND_NBT = byteArrayOf(10, 0)
 }

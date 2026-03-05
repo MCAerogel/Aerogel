@@ -31,6 +31,7 @@ import org.macaroon3145.network.handler.PluginPacketBridgeHandler
 import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.network.codec.BlockEntityTypeRegistry
 import org.macaroon3145.network.codec.ItemBlockStateRegistry
+import org.macaroon3145.network.codec.MenuRegistry
 import org.macaroon3145.network.codec.RegistryCodec
 import org.macaroon3145.network.command.EntitySelectorCompletions
 import org.macaroon3145.network.transcoder.MinecraftVarIntFrameDecoder
@@ -219,6 +220,7 @@ private fun warmupPickBlockLookups() {
                 { BlockStateRegistry.prewarm() },
                 { BlockEntityTypeRegistry.prewarm() },
                 { RegistryCodec.prewarm() },
+                { MenuRegistry.prewarm() },
                 { VanillaMiningRules.prewarm() },
                 { EntitySelectorCompletions.prewarm() },
                 { PlayPackets.prewarm() },
@@ -441,6 +443,7 @@ private fun runJLineConsoleLoop() {
         if (command.isEmpty()) continue
         PlayerSessionManager.submitConsoleCommand(command)
     }
+    ServerLifecycle.stopServer()
 }
 
 private fun runBufferedConsoleLoop() {
@@ -455,6 +458,7 @@ private fun runBufferedConsoleLoop() {
         if (command.isEmpty()) continue
         PlayerSessionManager.submitConsoleCommand(command)
     }
+    ServerLifecycle.stopServer()
 }
 
 private fun selectEventLoops(): EventLoopSelection {

@@ -13,6 +13,14 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlin.math.floor
 
 object PlayPackets {
+    data class ChunkBlockEntityEntry(
+        val x: Int,
+        val y: Int,
+        val z: Int,
+        val typeId: Int,
+        val nbtPayload: ByteArray
+    )
+
     data class EquipmentEntry(
         val slot: Int,
         val encodedItemStack: ByteArray
@@ -1139,13 +1147,7 @@ object PlayPackets {
     }
 
     fun encodeItemStack(itemId: Int, count: Int = 1): ByteArray {
-        val out = ByteArrayOutputStream(8)
-        val clampedCount = count.coerceAtLeast(1)
-        NetworkUtils.writeVarInt(out, clampedCount)
-        NetworkUtils.writeVarInt(out, itemId)
-        NetworkUtils.writeVarInt(out, 0) // added components
-        NetworkUtils.writeVarInt(out, 0) // removed components
-        return out.toByteArray()
+        return ItemStackCodec.encodeSimple(itemId, count)
     }
 
     fun itemEntityTypeId(): Int {
@@ -1361,7 +1363,12 @@ object PlayPackets {
         return packet.toByteArray()
     }
 
-    fun mapChunkPacket(chunkX: Int, chunkZ: Int, generated: GeneratedChunk): ByteArray {
+    fun mapChunkPacket(
+        chunkX: Int,
+        chunkZ: Int,
+        generated: GeneratedChunk,
+        blockEntities: List<ChunkBlockEntityEntry> = emptyList()
+    ): ByteArray {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
         val chunkData = if (generated.chunkData.isNotEmpty()) generated.chunkData else buildAirChunkData()
@@ -1382,7 +1389,14 @@ object PlayPackets {
         NetworkUtils.writeVarInt(packet, chunkData.size)
         out.write(chunkData)
         // block entities
-        NetworkUtils.writeVarInt(packet, 0)
+        NetworkUtils.writeVarInt(packet, blockEntities.size)
+        for (entry in blockEntities) {
+            val packedXZ = ((entry.x and 15) shl 4) or (entry.z and 15)
+            out.writeByte(packedXZ and 0xFF)
+            out.writeShort(entry.y)
+            NetworkUtils.writeVarInt(packet, entry.typeId.coerceAtLeast(0))
+            out.write(entry.nbtPayload)
+        }
         // skyLightMask
         NetworkUtils.writeVarInt(packet, generated.skyLightMask.size)
         for (value in generated.skyLightMask) out.writeLong(value)

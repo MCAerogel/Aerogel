@@ -9,11 +9,51 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.macaroon3145.network.codec.BlockStateRegistry
+import org.macaroon3145.network.handler.ItemStackState
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
 import kotlin.math.roundToInt
 
-data class VanillaDrop(val itemId: Int, val count: Int)
+data class VanillaDrop(
+    val stack: ItemStackState,
+    val blockEntityTypeId: Int = -1,
+    val blockEntityNbtPayload: ByteArray? = null,
+    val customPayload: ByteArray? = null
+) {
+    val itemId: Int get() = stack.itemId
+    val count: Int get() = stack.count
+
+    companion object {
+        fun from(
+            stack: ItemStackState,
+            blockEntityTypeId: Int = -1,
+            blockEntityNbtPayload: ByteArray? = null,
+            customPayload: ByteArray? = null
+        ): VanillaDrop {
+            return VanillaDrop(
+                stack = stack,
+                blockEntityTypeId = blockEntityTypeId,
+                blockEntityNbtPayload = blockEntityNbtPayload,
+                customPayload = customPayload
+            )
+        }
+
+        fun from(
+            itemId: Int,
+            count: Int,
+            blockEntityTypeId: Int = -1,
+            blockEntityNbtPayload: ByteArray? = null,
+            customPayload: ByteArray? = null
+        ): VanillaDrop {
+            return from(
+                stack = ItemStackState.of(itemId = itemId, count = count),
+                blockEntityTypeId = blockEntityTypeId,
+                blockEntityNbtPayload = blockEntityNbtPayload,
+                customPayload = customPayload
+            )
+        }
+    }
+}
 
 object VanillaMiningRules {
     private enum class ToolType {
@@ -171,12 +211,12 @@ object VanillaMiningRules {
         } else {
             fallbackSelfDrop(parsed.blockKey)
         }
-        return resolved.filter { it.itemId >= 0 && it.count > 0 }
+        return resolved.filter { it.stack.itemId >= 0 && it.stack.count > 0 }
     }
 
     private fun fallbackSelfDrop(blockKey: String): List<VanillaDrop> {
         val itemId = BlockStateRegistry.itemIdForBlock(blockKey) ?: itemIdsByKey[blockKey] ?: return emptyList()
-        return listOf(VanillaDrop(itemId, 1))
+        return listOf(VanillaDrop.from(itemId = itemId, count = 1))
     }
 
     private fun itemKey(itemId: Int): String? {
@@ -353,7 +393,11 @@ object VanillaMiningRules {
             "minecraft:item" -> {
                 val itemKey = entry["name"]?.jsonPrimitive?.content ?: return emptyList()
                 val itemId = itemIdsByKey[itemKey] ?: return emptyList()
-                val drops = applyFunctions(listOf(VanillaDrop(itemId, 1)), entry["functions"]?.jsonArray, context)
+                val drops = applyFunctions(
+                    listOf(VanillaDrop.from(itemId = itemId, count = 1)),
+                    entry["functions"]?.jsonArray,
+                    context
+                )
                 drops.filter { it.count > 0 }
             }
             "minecraft:alternatives" -> {
@@ -404,8 +448,12 @@ object VanillaMiningRules {
         val count = evaluateCount(function["count"]) ?: return drops
         val add = function["add"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: false
         return drops.mapNotNull { drop ->
-            val nextCount = if (add) drop.count + count else count
-            drop.takeIf { nextCount > 0 }?.copy(count = nextCount)
+            val nextCount = if (add) drop.stack.count + count else count
+            if (nextCount <= 0) {
+                null
+            } else {
+                drop.copy(stack = drop.stack.copy(count = nextCount))
+            }
         }
     }
 
@@ -414,10 +462,14 @@ object VanillaMiningRules {
         val min = limit["min"]?.jsonPrimitive?.content?.toIntOrNull()
         val max = limit["max"]?.jsonPrimitive?.content?.toIntOrNull()
         return drops.mapNotNull { drop ->
-            var count = drop.count
+            var count = drop.stack.count
             if (min != null) count = maxOf(count, min)
             if (max != null) count = minOf(count, max)
-            drop.takeIf { count > 0 }?.copy(count = count)
+            if (count <= 0) {
+                null
+            } else {
+                drop.copy(stack = drop.stack.copy(count = count))
+            }
         }
     }
 
