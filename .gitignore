@@ -42,6 +42,9 @@ bin/
 
 ### Runtime / External ###
 logs/
+/aerogel.properties
+/op.txt
+/eula.txt
 eula.txt
 versions/
 libraries/
