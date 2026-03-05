@@ -2,6 +2,7 @@ package org.macaroon3145.world.generators
 
 import org.macaroon3145.world.ChunkGenerationContext
 import org.macaroon3145.world.ChunkPos
+import org.macaroon3145.world.BlockPos
 import org.macaroon3145.world.GeneratedChunk
 import org.macaroon3145.world.HeightmapData
 import org.macaroon3145.world.BlockStateLookupWorldGenerator
@@ -72,6 +73,20 @@ object FoliaSharedMemoryWorldGenerator : WorldGenerator, BlockStateLookupWorldGe
     fun chunkState(worldKey: String, chunkX: Int, chunkZ: Int): ChunkState {
         return client.chunkState(worldKey, chunkX, chunkZ)
     }
+
+    fun invalidateChunkGeneratedAndLighting(worldKey: String, chunkX: Int, chunkZ: Int) {
+        client.invalidateChunkGeneratedAndLighting(worldKey, chunkX, chunkZ)
+    }
+
+    fun pushBlockUpdatesIfRevisionChanged(
+        worldKey: String,
+        chunkX: Int,
+        chunkZ: Int,
+        revision: Long,
+        changedBlocks: List<Pair<BlockPos, Int>>
+    ) {
+        client.pushBlockUpdatesIfRevisionChanged(worldKey, chunkX, chunkZ, revision, changedBlocks)
+    }
 }
 
 private object FoliaSharedProtocol {
@@ -114,6 +129,13 @@ private class FoliaSharedMemoryChunkClient {
         private const val BLOCK_INDIRECT_PALETTE_MAX_BITS = 8
         private const val BIOME_INDIRECT_PALETTE_MAX_BITS = 3
         private const val MAX_PREFETCHES_PER_RETAIN_UPDATE = 16
+        private const val AUTO_CACHE_HEAP_RATIO = 0.20
+        private const val ESTIMATED_CACHED_CHUNK_BYTES = 192 * 1024
+        private const val MIN_AUTO_CACHED_CHUNKS = 1024
+        private const val MAX_AUTO_CACHED_CHUNKS = 65_536
+        private const val RETAINED_CHUNK_HEADROOM = 512
+        private const val CACHE_LIMIT_RECALCULATION_INTERVAL = 256
+        private const val BLOCK_UPDATE_REQUESTS_FILE = "block-update-requests.tsv"
     }
 
     private val logger = LoggerFactory.getLogger(FoliaSharedMemoryChunkClient::class.java)
@@ -126,9 +148,13 @@ private class FoliaSharedMemoryChunkClient {
     private val slots = ArrayList<IpcSlot>()
     @Volatile private var slotBusy: AtomicIntegerArray? = null
     private val chunkCache = ConcurrentHashMap<ChunkCacheKey, ChunkCacheEntry>()
+    private val bridgeRequestWriteLocks = ConcurrentHashMap<String, Any>()
+    private val pushedBlockUpdateRevisionByChunk = ConcurrentHashMap<ChunkCacheKey, Long>()
     private val decodedChunkOrder = ConcurrentLinkedDeque<ChunkCacheKey>()
     private val retainedChunkKeys = ConcurrentHashMap.newKeySet<ChunkCacheKey>()
-    private val maxCachedChunks: Int = configuredBlockStateCacheSize()
+    private val configuredMaxCachedChunks = configuredBlockStateCacheOverride()
+    private val maxCachedChunks = AtomicInteger(configuredMaxCachedChunks ?: computeAutoCacheChunkLimit())
+    private val cacheLimitRecalculationCounter = AtomicInteger(0)
     private val decodeThreadId = AtomicInteger(1)
     private val snapshotDecodeExecutor = Executors.newFixedThreadPool(configuredSnapshotDecodeWorkers()) { runnable ->
         Thread(runnable, "aerogel-folia-snapshot-decode-${decodeThreadId.getAndIncrement()}").apply {
@@ -156,6 +182,7 @@ private class FoliaSharedMemoryChunkClient {
     )
 
     private class ChunkCacheEntry {
+        val generated = AtomicReference<GeneratedChunk?>()
         val snapshot = AtomicReference<ChunkStateSnapshot?>()
         val light = AtomicReference<ChunkLightSnapshot?>()
         val decodeTask = AtomicReference<CompletableFuture<ChunkStateSnapshot>?>()
@@ -246,6 +273,10 @@ private class FoliaSharedMemoryChunkClient {
     )
 
     fun requestChunk(context: ChunkGenerationContext): GeneratedChunk {
+        val cachedGenerated = cachedGeneratedChunk(context)
+        if (cachedGenerated != null) {
+            return cachedGenerated
+        }
         ensureMapped()
         val slotIndex = acquireSlotIndex()
         val slot = slots[slotIndex]
@@ -278,6 +309,7 @@ private class FoliaSharedMemoryChunkClient {
                             clearRequestResponseState(slot)
                             cacheDecodedChunk(
                                 context = context,
+                                generated = decoded.chunk,
                                 snapshot = decoded.snapshot,
                                 light = decodeChunkLightSnapshot(context.worldKey, decoded.chunk)
                             )
@@ -353,6 +385,7 @@ private class FoliaSharedMemoryChunkClient {
         for (chunk in chunks) {
             retainedChunkKeys.add(ChunkCacheKey(worldKey, chunk.x, chunk.z))
         }
+        maybeRefreshMaxCachedChunks(force = true)
         trimDecodedChunkCache()
     }
 
@@ -365,6 +398,7 @@ private class FoliaSharedMemoryChunkClient {
         val chunkKey = ChunkCacheKey(worldKey, chunkX, chunkZ)
         val bridgeRequested = requestBridgeChunkUnload(worldKey, chunkX, chunkZ)
         retainedChunkKeys.remove(chunkKey)
+        pushedBlockUpdateRevisionByChunk.remove(chunkKey)
         val removed = chunkCache.remove(chunkKey)
         return bridgeRequested || removed != null
     }
@@ -386,27 +420,92 @@ private class FoliaSharedMemoryChunkClient {
         return ChunkState.UNLOADED
     }
 
+    fun invalidateChunkGeneratedAndLighting(worldKey: String, chunkX: Int, chunkZ: Int) {
+        val chunkKey = ChunkCacheKey(worldKey, chunkX, chunkZ)
+        val entry = chunkCache[chunkKey] ?: return
+        entry.generated.set(null)
+        entry.light.set(null)
+    }
+
+    fun pushBlockUpdatesIfRevisionChanged(
+        worldKey: String,
+        chunkX: Int,
+        chunkZ: Int,
+        revision: Long,
+        changedBlocks: List<Pair<BlockPos, Int>>
+    ) {
+        if (revision <= 0L || changedBlocks.isEmpty()) return
+        val chunkKey = ChunkCacheKey(worldKey, chunkX, chunkZ)
+        val previous = pushedBlockUpdateRevisionByChunk[chunkKey]
+        if (previous != null && previous >= revision) return
+
+        val payload = buildString(changedBlocks.size * 40) {
+            val sanitizedWorldKey = worldKey.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+            for ((pos, stateId) in changedBlocks) {
+                append(sanitizedWorldKey)
+                append('\t')
+                append(pos.x)
+                append('\t')
+                append(pos.y)
+                append('\t')
+                append(pos.z)
+                append('\t')
+                append(stateId)
+                append('\n')
+            }
+        }
+        if (payload.isEmpty()) return
+        val written = appendBridgeRequestFile(BLOCK_UPDATE_REQUESTS_FILE, payload)
+        if (written) {
+            pushedBlockUpdateRevisionByChunk[chunkKey] = revision
+        }
+    }
+
     private fun requestBridgeChunkUnload(worldKey: String, chunkX: Int, chunkZ: Int): Boolean {
         val sanitizedWorldKey = worldKey.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
         val payload = "$sanitizedWorldKey\t$chunkX\t$chunkZ\n"
-        val requestPath = ipcDir.resolve("chunk-unload-requests.tsv")
-        return runCatching {
-            Files.createDirectories(ipcDir)
-            Files.writeString(
-                requestPath,
-                payload,
-                StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.APPEND
-            )
-            true
-        }.getOrElse { throwable ->
+        val written = appendBridgeRequestFile("chunk-unload-requests.tsv", payload)
+        if (!written) {
             logger.warn(
                 "Failed to request bridge chunk unload for {} {},{}",
                 worldKey,
                 chunkX,
-                chunkZ,
+                chunkZ
+            )
+        }
+        return written
+    }
+
+    private fun appendBridgeRequestFile(fileName: String, payload: String): Boolean {
+        val requestPath = ipcDir.resolve(fileName)
+        return runCatching {
+            Files.createDirectories(ipcDir)
+            val lockKey = requestPath.toAbsolutePath().normalize().toString()
+            val writeLock = bridgeRequestWriteLocks.computeIfAbsent(lockKey) { Any() }
+            synchronized(writeLock) {
+                FileChannel.open(
+                    requestPath,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE
+                ).use { channel ->
+                    channel.lock().use {
+                        channel.position(channel.size())
+                        val bytes = payload.toByteArray(StandardCharsets.UTF_8)
+                        var offset = 0
+                        while (offset < bytes.size) {
+                            val wrote = channel.write(java.nio.ByteBuffer.wrap(bytes, offset, bytes.size - offset))
+                            if (wrote <= 0) break
+                            offset += wrote
+                        }
+                    }
+                }
+            }
+            true
+        }.getOrElse { throwable ->
+            logger.warn(
+                "Failed to append bridge request file {}",
+                requestPath.toAbsolutePath(),
                 throwable
             )
             false
@@ -495,11 +594,31 @@ private class FoliaSharedMemoryChunkClient {
             ?: 30_000L
     }
 
-    private fun configuredBlockStateCacheSize(): Int {
+    private fun configuredBlockStateCacheOverride(): Int? {
         return System.getProperty("aerogel.chunk.blockstate-cache.max-chunks")
             ?.toIntOrNull()
             ?.coerceAtLeast(1)
-            ?: 4096
+    }
+
+    private fun maybeRefreshMaxCachedChunks(force: Boolean = false) {
+        if (configuredMaxCachedChunks != null) return
+        if (!force) {
+            val count = cacheLimitRecalculationCounter.incrementAndGet()
+            if (count % CACHE_LIMIT_RECALCULATION_INTERVAL != 0) return
+        }
+        maxCachedChunks.set(computeAutoCacheChunkLimit())
+    }
+
+    private fun computeAutoCacheChunkLimit(): Int {
+        val runtime = Runtime.getRuntime()
+        val heapMaxBytes = runtime.maxMemory().coerceAtLeast(64L * 1024L * 1024L)
+        val byHeap = ((heapMaxBytes.toDouble() * AUTO_CACHE_HEAP_RATIO) / ESTIMATED_CACHED_CHUNK_BYTES.toDouble())
+            .toInt()
+            .coerceAtLeast(1)
+        val cpuFloor = Runtime.getRuntime().availableProcessors().coerceAtLeast(1) * 64
+        val retainedFloor = retainedChunkKeys.size + RETAINED_CHUNK_HEADROOM
+        val floor = maxOf(MIN_AUTO_CACHED_CHUNKS, cpuFloor, retainedFloor).coerceAtMost(MAX_AUTO_CACHED_CHUNKS)
+        return byHeap.coerceIn(floor, MAX_AUTO_CACHED_CHUNKS)
     }
 
     private fun configuredSnapshotDecodeWorkers(): Int {
@@ -882,11 +1001,26 @@ private class FoliaSharedMemoryChunkClient {
 
     private fun cacheDecodedChunk(
         context: ChunkGenerationContext,
+        snapshot: ChunkStateSnapshot
+    ) {
+        val key = ChunkCacheKey(context.worldKey, context.chunkPos.x, context.chunkPos.z)
+        val entry = chunkCache.computeIfAbsent(key) { ChunkCacheEntry() }
+        val previous = entry.snapshot.getAndSet(snapshot)
+        if (previous == null) {
+            decodedChunkOrder.addLast(key)
+        }
+        trimDecodedChunkCache()
+    }
+
+    private fun cacheDecodedChunk(
+        context: ChunkGenerationContext,
+        generated: GeneratedChunk,
         snapshot: ChunkStateSnapshot,
         light: ChunkLightSnapshot? = null
     ) {
         val key = ChunkCacheKey(context.worldKey, context.chunkPos.x, context.chunkPos.z)
         val entry = chunkCache.computeIfAbsent(key) { ChunkCacheEntry() }
+        entry.generated.set(generated)
         val previous = entry.snapshot.getAndSet(snapshot)
         if (light != null) {
             entry.light.set(light)
@@ -897,9 +1031,16 @@ private class FoliaSharedMemoryChunkClient {
         trimDecodedChunkCache()
     }
 
+    private fun cachedGeneratedChunk(context: ChunkGenerationContext): GeneratedChunk? {
+        val key = ChunkCacheKey(context.worldKey, context.chunkPos.x, context.chunkPos.z)
+        return chunkCache[key]?.generated?.get()
+    }
+
     private fun trimDecodedChunkCache() {
+        maybeRefreshMaxCachedChunks()
+        val maxChunks = maxCachedChunks.get().coerceAtLeast(1)
         var attempts = 0
-        while (cachedSnapshotCount() > maxCachedChunks) {
+        while (cachedSnapshotCount() > maxChunks) {
             val oldest = decodedChunkOrder.pollFirst() ?: break
             if (retainedChunkKeys.contains(oldest)) {
                 decodedChunkOrder.addLast(oldest)
@@ -911,6 +1052,7 @@ private class FoliaSharedMemoryChunkClient {
             }
             attempts = 0
             val entry = chunkCache[oldest] ?: continue
+            entry.generated.set(null)
             entry.snapshot.set(null)
             entry.light.set(null)
             if (entry.decodeTask.get() == null && entry.loadTask.get() == null && !retainedChunkKeys.contains(oldest)) {

@@ -61,7 +61,16 @@ object ServerConfig {
     var defaultGameMode: Int = 1
         private set
 
+    // 0=peaceful, 1=easy, 2=normal, 3=hard
+    @Volatile
+    var difficulty: Int = 2
+        private set
+
     fun setGameMode(gameMode: Int) {
         defaultGameMode = gameMode.coerceIn(0, 3)
+    }
+
+    fun setDifficulty(difficulty: Int) {
+        this.difficulty = difficulty.coerceIn(0, 3)
     }
 }

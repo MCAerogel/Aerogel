@@ -1,0 +1,41 @@
+{
+  "version": "1.21.11",
+  "defaults": {
+    "attack_damage": 1.0,
+    "attack_speed": 4.0
+  },
+  "entries": {
+    "minecraft:wooden_sword": { "attack_damage": 4.0, "attack_speed": 1.6 },
+    "minecraft:stone_sword": { "attack_damage": 5.0, "attack_speed": 1.6 },
+    "minecraft:iron_sword": { "attack_damage": 6.0, "attack_speed": 1.6 },
+    "minecraft:golden_sword": { "attack_damage": 4.0, "attack_speed": 1.6 },
+    "minecraft:diamond_sword": { "attack_damage": 7.0, "attack_speed": 1.6 },
+    "minecraft:netherite_sword": { "attack_damage": 8.0, "attack_speed": 1.6 },
+    "minecraft:wooden_axe": { "attack_damage": 7.0, "attack_speed": 0.8 },
+    "minecraft:stone_axe": { "attack_damage": 9.0, "attack_speed": 0.8 },
+    "minecraft:iron_axe": { "attack_damage": 9.0, "attack_speed": 0.9 },
+    "minecraft:golden_axe": { "attack_damage": 7.0, "attack_speed": 1.0 },
+    "minecraft:diamond_axe": { "attack_damage": 9.0, "attack_speed": 1.0 },
+    "minecraft:netherite_axe": { "attack_damage": 10.0, "attack_speed": 1.0 },
+    "minecraft:wooden_pickaxe": { "attack_damage": 2.0, "attack_speed": 1.2 },
+    "minecraft:stone_pickaxe": { "attack_damage": 3.0, "attack_speed": 1.2 },
+    "minecraft:iron_pickaxe": { "attack_damage": 4.0, "attack_speed": 1.2 },
+    "minecraft:golden_pickaxe": { "attack_damage": 2.0, "attack_speed": 1.2 },
+    "minecraft:diamond_pickaxe": { "attack_damage": 5.0, "attack_speed": 1.2 },
+    "minecraft:netherite_pickaxe": { "attack_damage": 6.0, "attack_speed": 1.2 },
+    "minecraft:wooden_shovel": { "attack_damage": 2.5, "attack_speed": 1.0 },
+    "minecraft:stone_shovel": { "attack_damage": 3.5, "attack_speed": 1.0 },
+    "minecraft:iron_shovel": { "attack_damage": 4.5, "attack_speed": 1.0 },
+    "minecraft:golden_shovel": { "attack_damage": 2.5, "attack_speed": 1.0 },
+    "minecraft:diamond_shovel": { "attack_damage": 5.5, "attack_speed": 1.0 },
+    "minecraft:netherite_shovel": { "attack_damage": 6.5, "attack_speed": 1.0 },
+    "minecraft:wooden_hoe": { "attack_damage": 1.0, "attack_speed": 1.0 },
+    "minecraft:stone_hoe": { "attack_damage": 1.0, "attack_speed": 2.0 },
+    "minecraft:iron_hoe": { "attack_damage": 1.0, "attack_speed": 3.0 },
+    "minecraft:golden_hoe": { "attack_damage": 1.0, "attack_speed": 1.0 },
+    "minecraft:diamond_hoe": { "attack_damage": 1.0, "attack_speed": 4.0 },
+    "minecraft:netherite_hoe": { "attack_damage": 1.0, "attack_speed": 4.0 },
+    "minecraft:trident": { "attack_damage": 9.0, "attack_speed": 1.1 },
+    "minecraft:mace": { "attack_damage": 5.0, "attack_speed": 0.6 }
+  }
+}

@@ -3,6 +3,7 @@ package org.macaroon3145.world
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
+import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
 import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
@@ -19,6 +20,7 @@ import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
 import java.util.concurrent.locks.LockSupport
 
@@ -66,6 +68,7 @@ class World(
     private val entityProcessors = CopyOnWriteArrayList<ChunkEntityProcessor>()
     private val changedBlockStates = ConcurrentHashMap<BlockPos, Int>()
     private val changedBlocksByChunk = ConcurrentHashMap<ChunkPos, MutableSet<BlockPos>>()
+    private val changedBlockRevisionByChunk = ConcurrentHashMap<ChunkPos, AtomicLong>()
     private val changedBlockEntities = ConcurrentHashMap<BlockPos, BlockEntityData>()
     private val changedBlockEntitiesByChunk = ConcurrentHashMap<ChunkPos, MutableSet<BlockPos>>()
     private val dirtyTerrainChunksQueue = ConcurrentLinkedQueue<ChunkPos>()
@@ -309,6 +312,8 @@ class World(
             changedBlocksByChunk[chunkPos]?.remove(pos)
             changedBlockEntities.remove(pos)
             changedBlockEntitiesByChunk[chunkPos]?.remove(pos)
+            changedBlockRevisionByChunk.computeIfAbsent(chunkPos) { AtomicLong(0L) }.incrementAndGet()
+            FoliaSharedMemoryWorldGenerator.invalidateChunkGeneratedAndLighting(key, chunkPos.x, chunkPos.z)
             markTerrainChunkDirty(chunkPos)
             if (enqueueFluidUpdates) {
                 enqueueFluidUpdatesAround(x, y, z)
@@ -319,6 +324,8 @@ class World(
         changedBlocksByChunk
             .computeIfAbsent(chunkPos) { ConcurrentHashMap.newKeySet() }
             .add(pos)
+        changedBlockRevisionByChunk.computeIfAbsent(chunkPos) { AtomicLong(0L) }.incrementAndGet()
+        FoliaSharedMemoryWorldGenerator.invalidateChunkGeneratedAndLighting(key, chunkPos.x, chunkPos.z)
         markTerrainChunkDirty(chunkPos)
         if (enqueueFluidUpdates) {
             enqueueFluidUpdatesAround(x, y, z)
@@ -348,6 +355,10 @@ class World(
             result.add(pos to state)
         }
         return result
+    }
+
+    fun changedBlockRevision(chunkX: Int, chunkZ: Int): Long {
+        return changedBlockRevisionByChunk[ChunkPos(chunkX, chunkZ)]?.get() ?: 0L
     }
 
     fun blockEntityAt(x: Int, y: Int, z: Int): BlockEntityData? {

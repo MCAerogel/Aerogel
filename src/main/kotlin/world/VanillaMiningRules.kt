@@ -47,7 +47,9 @@ object VanillaMiningRules {
             ?: error("Missing item-id-map-1.21.11.json resource")
         val root = resource.bufferedReader().use { json.parseToJsonElement(it.readText()) }.jsonObject
         val entries = root["entries"]?.jsonObject ?: return@lazy emptyList()
-        val out = MutableList(entries.size) { "" }
+        val maxId = entries.values.maxOfOrNull { it.jsonPrimitive.intOrNull ?: -1 } ?: -1
+        if (maxId < 0) return@lazy emptyList()
+        val out = MutableList(maxId + 1) { "" }
         for ((itemKey, itemIdElement) in entries) {
             val itemId = itemIdElement.jsonPrimitive.intOrNull ?: continue
             if (itemId !in out.indices) continue
@@ -64,6 +66,8 @@ object VanillaMiningRules {
         out
     }
     private val resourceTextCache = ConcurrentHashMap<String, String?>()
+    private val jsonObjectCache = ConcurrentHashMap<String, JsonObject>()
+    private val missingJsonObjectPaths = ConcurrentHashMap.newKeySet<String>()
     private val blockTagCache = ConcurrentHashMap<String, Set<String>>()
     private val itemTagCache = ConcurrentHashMap<String, Set<String>>()
     private val lootTableCache = ConcurrentHashMap<String, JsonObject?>()
@@ -186,6 +190,10 @@ object VanillaMiningRules {
     }
 
     private fun canHarvestDropsNoCache(blockKey: String, heldItemId: Int): Boolean {
+        if (blockTag("mineable/pickaxe").contains(blockKey)) {
+            val toolType = classifyToolTypeCached(heldItemId) ?: return false
+            if (toolType != ToolType.PICKAXE) return false
+        }
         if (!requiresCorrectToolForDrops(blockKey)) return true
         val toolType = classifyToolTypeCached(heldItemId) ?: return false
         if (!toolMatchesMineableTag(blockKey, toolType)) return false
@@ -286,8 +294,18 @@ object VanillaMiningRules {
     }
 
     private fun readJsonObject(path: String): JsonObject? {
-        val text = readResourceText(path) ?: return null
-        return json.parseToJsonElement(text).jsonObject
+        jsonObjectCache[path]?.let { return it }
+        if (missingJsonObjectPaths.contains(path)) return null
+        val text = readResourceText(path) ?: run {
+            missingJsonObjectPaths.add(path)
+            return null
+        }
+        val parsed = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull() ?: run {
+            missingJsonObjectPaths.add(path)
+            return null
+        }
+        jsonObjectCache[path] = parsed
+        return parsed
     }
 
     private fun readResourceText(path: String): String? {
@@ -405,27 +423,62 @@ object VanillaMiningRules {
 
     private fun evaluateCount(element: JsonElement?): Int? {
         if (element == null) return null
-        val primitive = element.jsonPrimitive
-        if (primitive.isString.not() || primitive.content.toDoubleOrNull() != null) {
-            primitive.content.toDoubleOrNull()?.let { return it.roundToInt() }
-        }
+        evaluateNumberProvider(element)?.let { return it.roundToInt() }
         val obj = runCatching { element.jsonObject }.getOrNull() ?: return null
         return when (obj["type"]?.jsonPrimitive?.content) {
             "minecraft:uniform" -> {
-                val min = obj["min"]?.jsonPrimitive?.content?.toDoubleOrNull()?.roundToInt() ?: return null
-                val max = obj["max"]?.jsonPrimitive?.content?.toDoubleOrNull()?.roundToInt() ?: return null
-                ThreadLocalRandom.current().nextInt(min, max + 1)
+                val min = evaluateNumberProvider(obj["min"])?.roundToInt() ?: return null
+                val max = evaluateNumberProvider(obj["max"])?.roundToInt() ?: return null
+                val lower = minOf(min, max)
+                val upper = maxOf(min, max)
+                ThreadLocalRandom.current().nextInt(lower, upper + 1)
             }
             "minecraft:binomial" -> {
-                val n = obj["n"]?.jsonPrimitive?.content?.toDoubleOrNull()?.roundToInt() ?: return null
-                val p = obj["p"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return null
+                val n = evaluateNumberProvider(obj["n"])?.roundToInt() ?: return null
+                val p = evaluateNumberProvider(obj["p"]) ?: return null
                 var count = 0
                 repeat(n.coerceAtLeast(0)) {
                     if (ThreadLocalRandom.current().nextDouble() < p) count++
                 }
                 count
             }
+            "minecraft:constant", "minecraft:score", "minecraft:storage", "minecraft:enchantment_level" -> {
+                evaluateNumberProvider(obj["value"])?.roundToInt()
+            }
             else -> null
+        }
+    }
+
+    private fun evaluateNumberProvider(element: JsonElement?): Double? {
+        if (element == null) return null
+        val primitive = runCatching { element.jsonPrimitive }.getOrNull()
+        if (primitive != null) {
+            return primitive.content.toDoubleOrNull()
+        }
+        val obj = runCatching { element.jsonObject }.getOrNull() ?: return null
+        return when (obj["type"]?.jsonPrimitive?.content) {
+            null -> {
+                obj["value"]?.let { evaluateNumberProvider(it) }
+                    ?: obj["min"]?.let { evaluateNumberProvider(it) }
+            }
+            "minecraft:constant" -> evaluateNumberProvider(obj["value"])
+            "minecraft:uniform" -> {
+                val min = evaluateNumberProvider(obj["min"]) ?: return null
+                val max = evaluateNumberProvider(obj["max"]) ?: return null
+                val lower = minOf(min, max)
+                val upper = maxOf(min, max)
+                ThreadLocalRandom.current().nextDouble(lower, upper)
+            }
+            "minecraft:binomial" -> {
+                val n = evaluateNumberProvider(obj["n"])?.roundToInt() ?: return null
+                val p = evaluateNumberProvider(obj["p"]) ?: return null
+                var count = 0
+                repeat(n.coerceAtLeast(0)) {
+                    if (ThreadLocalRandom.current().nextDouble() < p) count++
+                }
+                count.toDouble()
+            }
+            else -> obj["value"]?.let { evaluateNumberProvider(it) }
         }
     }
 

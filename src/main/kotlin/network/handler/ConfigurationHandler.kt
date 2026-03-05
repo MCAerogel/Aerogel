@@ -71,6 +71,14 @@ class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChann
         ctx.writeAndFlush(PlayPackets.tickingStatePacket(tickRate = playerTickRate, isFrozen = false))
         ctx.writeAndFlush(PlayPackets.tickingStepPacket(tickSteps = 0))
         ctx.writeAndFlush(PlayPackets.gameStateGameModePacket(session.gameMode))
+        ctx.writeAndFlush(
+            PlayPackets.playerAbilitiesPacket(
+                invulnerable = session.gameMode == 1 || session.gameMode == 3,
+                flying = session.flying,
+                allowFlying = session.gameMode == 1 || session.gameMode == 3,
+                instantBuild = session.gameMode == 1
+            )
+        )
         ctx.writeAndFlush(PlayPackets.gameStateImmediateRespawnPacket(enabled = false))
         ctx.writeAndFlush(PlayPackets.setHealthPacket(session.health, session.food, session.saturation))
         ctx.writeAndFlush(PlayPackets.gameStateStartLoadingPacket())

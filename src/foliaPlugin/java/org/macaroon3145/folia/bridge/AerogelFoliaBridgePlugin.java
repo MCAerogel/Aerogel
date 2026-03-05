@@ -14,6 +14,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -22,10 +23,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.locks.LockSupport;
 import java.util.stream.LongStream;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ThreadedLevelLightEngine;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
@@ -54,6 +57,7 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
     private static final String NETHER_SEED_PROPERTY = "aerogel.folia.seed.the_nether";
     private static final String END_SEED_PROPERTY = "aerogel.folia.seed.the_end";
     private static final String WORLD_SPAWNS_FILE = "world-spawns.tsv";
+    private static final String BLOCK_UPDATE_REQUESTS_FILE = "block-update-requests.tsv";
     private static final long CHUNK_RETENTION_SWEEP_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1L);
     private static final long DEFAULT_CHUNK_KEEPALIVE_NANOS = TimeUnit.SECONDS.toNanos(30L);
 
@@ -61,6 +65,7 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
     private volatile boolean pollerRunning;
     private Thread pollerThread;
     private Path bridgeReadyMarker;
+    private Path ipcDir;
     private World overworld;
     private World nether;
     private World end;
@@ -102,6 +107,7 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
             resetMetrics(slotCount);
             Path runtimeDir = resolveRuntimeDir();
             this.bridge = SharedMemoryBridge.open(runtimeDir, slotCount);
+            this.ipcDir = runtimeDir.resolve("ipc");
             this.responseExecutor = Executors.newFixedThreadPool(configuredResponseWorkerCount(slotCount), runnable ->
                 new Thread(runnable, "aerogel-folia-bridge-response-" + this.responseWorkerId.getAndIncrement())
             );
@@ -172,12 +178,121 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
     private void pollLoop() {
         while (this.pollerRunning && !Thread.currentThread().isInterrupted()) {
             boolean claimed = pollRequests();
+            boolean appliedBlockUpdates = processBlockUpdateRequests();
             sweepRetainedChunksIfDue();
             logMetricsIfDue();
-            if (!claimed) {
+            if (!claimed && !appliedBlockUpdates) {
                 LockSupport.parkNanos(200_000L);
             }
         }
+    }
+
+    private boolean processBlockUpdateRequests() {
+        Path dir = this.ipcDir;
+        if (dir == null) return false;
+        Path requestPath = dir.resolve(BLOCK_UPDATE_REQUESTS_FILE);
+        if (!Files.isRegularFile(requestPath)) return false;
+        try {
+            if (Files.size(requestPath) <= 0L) return false;
+        } catch (IOException ignored) {
+            return false;
+        }
+
+        String payload = readAndTruncateRequestFile(requestPath);
+        if (payload == null || payload.isBlank()) return false;
+
+        Map<CachedChunkKey, List<BlockUpdateRequest>> updatesByChunk = new LinkedHashMap<>();
+        String[] lines = payload.split("\\R");
+        for (String line : lines) {
+            if (line == null || line.isBlank()) continue;
+            String[] parts = line.split("\\t");
+            if (parts.length < 5) continue;
+            String worldKey = parts[0];
+            int x;
+            int y;
+            int z;
+            int stateId;
+            try {
+                x = Integer.parseInt(parts[1]);
+                y = Integer.parseInt(parts[2]);
+                z = Integer.parseInt(parts[3]);
+                stateId = Integer.parseInt(parts[4]);
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            int chunkX = x >> 4;
+            int chunkZ = z >> 4;
+            CachedChunkKey key = new CachedChunkKey(worldKey, chunkX, chunkZ);
+            updatesByChunk.computeIfAbsent(key, ignored -> new ArrayList<>()).add(new BlockUpdateRequest(x, y, z, stateId));
+        }
+        if (updatesByChunk.isEmpty()) return false;
+
+        for (Map.Entry<CachedChunkKey, List<BlockUpdateRequest>> entry : updatesByChunk.entrySet()) {
+            CachedChunkKey key = entry.getKey();
+            World world = resolveWorld(key.worldKey());
+            if (world == null) continue;
+            List<BlockUpdateRequest> updates = entry.getValue();
+            Bukkit.getRegionScheduler().execute(this, world, key.chunkX(), key.chunkZ(), () -> applyBlockUpdates(world, key, updates));
+        }
+        return true;
+    }
+
+    private String readAndTruncateRequestFile(Path requestPath) {
+        try (
+            FileChannel channel = FileChannel.open(
+                requestPath,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE
+            )
+        ) {
+            long size = channel.size();
+            if (size <= 0L) return "";
+
+            channel.position(0L);
+            ByteArrayOutputStream out = new ByteArrayOutputStream((int) Math.min(size, 1_048_576L));
+            ByteBuffer buffer = ByteBuffer.allocate(8192);
+            while (true) {
+                int read = channel.read(buffer);
+                if (read <= 0) break;
+                buffer.flip();
+                byte[] chunk = new byte[buffer.remaining()];
+                buffer.get(chunk);
+                out.write(chunk);
+                buffer.clear();
+            }
+            channel.truncate(0L);
+            channel.position(0L);
+            return out.toString(StandardCharsets.UTF_8);
+        } catch (IOException ignored) {
+            return "";
+        }
+    }
+
+    private void applyBlockUpdates(World world, CachedChunkKey key, List<BlockUpdateRequest> updates) {
+        if (updates == null || updates.isEmpty()) return;
+        ServerLevel level = ((CraftWorld) world).getHandle();
+        try {
+            world.getChunkAt(key.chunkX(), key.chunkZ());
+        } catch (Throwable ignored) {
+        }
+
+        ThreadedLevelLightEngine threaded = null;
+        LevelLightEngine lightEngine = level.getChunkSource().getLightEngine();
+        if (lightEngine instanceof ThreadedLevelLightEngine casted) {
+            threaded = casted;
+        }
+
+        for (BlockUpdateRequest update : updates) {
+            BlockPos pos = new BlockPos(update.x(), update.y(), update.z());
+            BlockState state = Block.stateById(update.stateId());
+            level.setBlock(pos, state, 3);
+            if (threaded != null) {
+                threaded.checkBlock(pos);
+            }
+        }
+        scheduleLightEngineUpdate(level);
+        retainChunk(key.worldKey(), key.chunkX(), key.chunkZ());
     }
 
     private boolean pollRequests() {
@@ -767,6 +882,14 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
     ) {
     }
 
+    private record BlockUpdateRequest(
+        int x,
+        int y,
+        int z,
+        int stateId
+    ) {
+    }
+
     private static final class SharedMemoryBridge {
         private static final int REQUEST_MAGIC = 0x41525131; // ARQ1
         private static final int RESPONSE_MAGIC = 0x41525331; // ARS1
@@ -801,7 +924,6 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
             final MappedByteBuffer responseBuffer;
             final FileChannel requestChannel;
             final FileChannel responseChannel;
-            final Object lock = new Object();
 
             Slot(
                 MappedByteBuffer requestBuffer,
@@ -817,9 +939,11 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
         }
 
         private final List<Slot> slots;
+        private final AtomicLongArray activeRequestIdsBySlot;
 
         private SharedMemoryBridge(List<Slot> slots) {
             this.slots = slots;
+            this.activeRequestIdsBySlot = new AtomicLongArray(slots.size());
         }
 
         static SharedMemoryBridge open(Path runtimeDir, int slotCount) throws IOException {
@@ -865,94 +989,96 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
 
         ChunkRequest tryClaimRequest(int slotIndex) {
             Slot slot = this.slots.get(slotIndex);
-            synchronized (slot.lock) {
-                if (slot.requestBuffer.getInt(0) != REQUEST_MAGIC) {
-                    initializeHeaders(slot);
-                    return null;
-                }
-
-                int state = slot.requestBuffer.getInt(REQUEST_STATE_OFFSET);
-                if (state != REQUEST_STATE_READY) return null;
-
-                long requestId = slot.requestBuffer.getLong(REQUEST_ID_OFFSET);
-                int worldLen = slot.requestBuffer.getInt(REQUEST_WORLD_LEN_OFFSET);
-                if (worldLen < 0) worldLen = 0;
-                if (worldLen > REQUEST_WORLD_MAX_BYTES) worldLen = REQUEST_WORLD_MAX_BYTES;
-
-                byte[] worldBytes = new byte[worldLen];
-                readBytes(slot.requestBuffer, REQUEST_WORLD_OFFSET, worldBytes);
-                String worldKey = new String(worldBytes, StandardCharsets.UTF_8);
-                int chunkX = slot.requestBuffer.getInt(REQUEST_CHUNK_X_OFFSET);
-                int chunkZ = slot.requestBuffer.getInt(REQUEST_CHUNK_Z_OFFSET);
-
-                slot.requestBuffer.putInt(REQUEST_STATE_OFFSET, REQUEST_STATE_PROCESSING);
-                return new ChunkRequest(slotIndex, requestId, worldKey, chunkX, chunkZ);
+            if (slot.requestBuffer.getInt(0) != REQUEST_MAGIC) {
+                initializeHeaders(slot);
+                return null;
             }
+
+            int state = slot.requestBuffer.getInt(REQUEST_STATE_OFFSET);
+            if (state != REQUEST_STATE_READY) return null;
+
+            long requestId = slot.requestBuffer.getLong(REQUEST_ID_OFFSET);
+            int worldLen = slot.requestBuffer.getInt(REQUEST_WORLD_LEN_OFFSET);
+            if (worldLen < 0) worldLen = 0;
+            if (worldLen > REQUEST_WORLD_MAX_BYTES) worldLen = REQUEST_WORLD_MAX_BYTES;
+
+            byte[] worldBytes = new byte[worldLen];
+            readBytes(slot.requestBuffer, REQUEST_WORLD_OFFSET, worldBytes);
+            String worldKey = new String(worldBytes, StandardCharsets.UTF_8);
+            int chunkX = slot.requestBuffer.getInt(REQUEST_CHUNK_X_OFFSET);
+            int chunkZ = slot.requestBuffer.getInt(REQUEST_CHUNK_Z_OFFSET);
+
+            if (!this.activeRequestIdsBySlot.compareAndSet(slotIndex, 0L, requestId)) {
+                return null;
+            }
+            slot.requestBuffer.putInt(REQUEST_STATE_OFFSET, REQUEST_STATE_PROCESSING);
+            return new ChunkRequest(slotIndex, requestId, worldKey, chunkX, chunkZ);
         }
 
         void completeSuccess(ChunkRequest request, ChunkPayload payload) {
             Slot slot = this.slots.get(request.slotIndex());
-            synchronized (slot.lock) {
-                if (!isRequestActive(slot, request)) {
-                    return;
-                }
-                byte[] responseBytes;
-                try {
-                    responseBytes = encodePayload(payload);
-                } catch (IOException exception) {
-                    completeError(request, "Failed to encode chunk payload");
-                    return;
-                }
-
-                if (responseBytes.length > (RESPONSE_FILE_SIZE - RESPONSE_PAYLOAD_OFFSET)) {
-                    completeError(request, "Chunk payload too large: " + responseBytes.length);
-                    return;
-                }
-                // Drop right before writing response if request got cancelled while payload was being encoded.
-                if (!isRequestActive(slot, request)) {
-                    return;
-                }
-
-                writeResponse(slot, RESPONSE_STATE_SUCCESS, request.requestId(), responseBytes);
+            if (!tryClaimCompletion(request)) {
+                return;
             }
+            if (!isRequestActive(slot, request)) {
+                return;
+            }
+            byte[] responseBytes;
+            try {
+                responseBytes = encodePayload(payload);
+            } catch (IOException exception) {
+                writeErrorIfStillActive(slot, request, "Failed to encode chunk payload");
+                return;
+            }
+
+            if (responseBytes.length > (RESPONSE_FILE_SIZE - RESPONSE_PAYLOAD_OFFSET)) {
+                writeErrorIfStillActive(slot, request, "Chunk payload too large: " + responseBytes.length);
+                return;
+            }
+            // Drop right before writing response if request got cancelled while payload was being encoded.
+            if (!isRequestActive(slot, request)) {
+                return;
+            }
+
+            writeResponse(slot, RESPONSE_STATE_SUCCESS, request.requestId(), responseBytes);
         }
 
         void completeError(ChunkRequest request, String message) {
             Slot slot = this.slots.get(request.slotIndex());
-            synchronized (slot.lock) {
-                if (!isRequestActive(slot, request)) {
-                    return;
-                }
-                byte[] payload = message.getBytes(StandardCharsets.UTF_8);
-                if (payload.length > (RESPONSE_FILE_SIZE - RESPONSE_PAYLOAD_OFFSET)) {
-                    payload = "bridge_error".getBytes(StandardCharsets.UTF_8);
-                }
-                // Drop right before writing response if request is no longer active.
-                if (!isRequestActive(slot, request)) {
-                    return;
-                }
-                writeResponse(slot, RESPONSE_STATE_ERROR, request.requestId(), payload);
+            if (!tryClaimCompletion(request)) {
+                return;
             }
+            if (!isRequestActive(slot, request)) {
+                return;
+            }
+            byte[] payload = message.getBytes(StandardCharsets.UTF_8);
+            if (payload.length > (RESPONSE_FILE_SIZE - RESPONSE_PAYLOAD_OFFSET)) {
+                payload = "bridge_error".getBytes(StandardCharsets.UTF_8);
+            }
+            // Drop right before writing response if request is no longer active.
+            if (!isRequestActive(slot, request)) {
+                return;
+            }
+            writeResponse(slot, RESPONSE_STATE_ERROR, request.requestId(), payload);
         }
 
         boolean isRequestActive(ChunkRequest request) {
             Slot slot = this.slots.get(request.slotIndex());
-            synchronized (slot.lock) {
-                return isRequestActive(slot, request);
+            if (this.activeRequestIdsBySlot.get(request.slotIndex()) != request.requestId()) {
+                return false;
             }
+            return isRequestActive(slot, request);
         }
 
         void close() {
             for (Slot slot : this.slots) {
-                synchronized (slot.lock) {
-                    try {
-                        slot.requestChannel.close();
-                    } catch (IOException ignored) {
-                    }
-                    try {
-                        slot.responseChannel.close();
-                    } catch (IOException ignored) {
-                    }
+                try {
+                    slot.requestChannel.close();
+                } catch (IOException ignored) {
+                }
+                try {
+                    slot.responseChannel.close();
+                } catch (IOException ignored) {
                 }
             }
         }
@@ -1029,6 +1155,20 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
             slot.responseBuffer.putInt(RESPONSE_PAYLOAD_LEN_OFFSET, payload.length);
             writeBytes(slot.responseBuffer, RESPONSE_PAYLOAD_OFFSET, payload);
             slot.responseBuffer.putInt(RESPONSE_STATE_OFFSET, state);
+        }
+
+        private boolean tryClaimCompletion(ChunkRequest request) {
+            return this.activeRequestIdsBySlot.compareAndSet(request.slotIndex(), request.requestId(), 0L);
+        }
+
+        private void writeErrorIfStillActive(Slot slot, ChunkRequest request, String message) {
+            if (!isRequestActive(slot, request)) return;
+            byte[] payload = message.getBytes(StandardCharsets.UTF_8);
+            if (payload.length > (RESPONSE_FILE_SIZE - RESPONSE_PAYLOAD_OFFSET)) {
+                payload = "bridge_error".getBytes(StandardCharsets.UTF_8);
+            }
+            if (!isRequestActive(slot, request)) return;
+            writeResponse(slot, RESPONSE_STATE_ERROR, request.requestId(), payload);
         }
 
         private static boolean isRequestActive(Slot slot, ChunkRequest request) {

@@ -5,6 +5,7 @@ import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.DroppedItemSnapshot
 import org.macaroon3145.world.World
+import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
 import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 import org.slf4j.LoggerFactory
 import java.util.concurrent.CompletableFuture
@@ -221,8 +222,44 @@ object ChunkStreamingService {
                         packetPool.execute {
                             try {
                                 if (ctx.channel().isActive && shouldSend()) {
-                                    val chunkPacket = PlayPackets.mapChunkPacket(coord.x, coord.z, generated)
-                                    val deltaPackets = buildChunkDeltaPackets(world, coord)
+                                    val changedBlocks = world.changedBlocksInChunk(coord.x, coord.z)
+                                    val changedBlockEntities = world.changedBlockEntitiesInChunk(coord.x, coord.z)
+                                    val hasChangedBlocks = changedBlocks.isNotEmpty()
+                                    if (changedBlocks.isNotEmpty()) {
+                                        FoliaSharedMemoryWorldGenerator.pushBlockUpdatesIfRevisionChanged(
+                                            worldKey = world.key,
+                                            chunkX = coord.x,
+                                            chunkZ = coord.z,
+                                            revision = world.changedBlockRevision(coord.x, coord.z),
+                                            changedBlocks = changedBlocks
+                                        )
+                                        // Re-fetch after pushing updates so reconnect streams do not reuse stale pre-update light.
+                                        FoliaSharedMemoryWorldGenerator.invalidateChunkGeneratedAndLighting(world.key, coord.x, coord.z)
+                                    }
+                                    val baseChunk = if (hasChangedBlocks) {
+                                        runCatching { world.buildChunk(coord) }.getOrElse { generated }
+                                    } else {
+                                        generated
+                                    }
+                                    val chunkWithPersistedLighting =
+                                        if (hasChangedBlocks) {
+                                            val changedSectionYs = changedBlocks
+                                                .asSequence()
+                                                .map { (pos, _) -> pos.y shr 4 }
+                                                .toSet()
+                                            VanillaAnvilWorldSaver.applyPersistedLightingWithRuntimeSectionOverrides(
+                                                worldKey = world.key,
+                                                chunkPos = coord,
+                                                generated = baseChunk,
+                                                changedSectionYs = changedSectionYs
+                                            )
+                                        } else {
+                                            VanillaAnvilWorldSaver.applyPersistedLightingIfPresent(world.key, coord, baseChunk)
+                                        }
+                                    val chunkWithPersistedHeightmaps =
+                                        VanillaAnvilWorldSaver.applyPersistedHeightmapsIfPresent(world.key, coord, chunkWithPersistedLighting)
+                                    val chunkPacket = PlayPackets.mapChunkPacket(coord.x, coord.z, chunkWithPersistedHeightmaps)
+                                    val deltaPackets = buildChunkDeltaPackets(changedBlocks, changedBlockEntities)
                                     val droppedItems = if (includeDroppedItems) world.droppedItemsInChunk(coord.x, coord.z) else emptyList()
 
                                     ctx.write(chunkPacket)
@@ -396,9 +433,10 @@ object ChunkStreamingService {
         }, workerPool)
     }
 
-    private fun buildChunkDeltaPackets(world: World, chunkPos: ChunkPos): List<ByteArray> {
-        val changedBlocks = world.changedBlocksInChunk(chunkPos.x, chunkPos.z)
-        val changedBlockEntities = world.changedBlockEntitiesInChunk(chunkPos.x, chunkPos.z)
+    private fun buildChunkDeltaPackets(
+        changedBlocks: List<Pair<org.macaroon3145.world.BlockPos, Int>>,
+        changedBlockEntities: List<Pair<org.macaroon3145.world.BlockPos, World.BlockEntityData>>
+    ): List<ByteArray> {
         if (changedBlocks.isEmpty() && changedBlockEntities.isEmpty()) return emptyList()
 
         val packets = ArrayList<ByteArray>(changedBlocks.size + changedBlockEntities.size)

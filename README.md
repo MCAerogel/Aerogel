@@ -1,100 +1,63 @@
+<div align="center">
+
 # Aerogel
 
-[한국어 문서로 이동](README.ko.md)
+**Development-stage Minecraft server engine in Kotlin**
 
-**Aerogel is not finished.**  
-This is a **development-stage Minecraft server engine** (Kotlin, custom protocol/runtime path), not a production-ready Paper replacement yet.
+[![Stage](https://img.shields.io/badge/Stage-Active%20Development-ff9800?style=for-the-badge)](#development-notice)
+[![Java](https://img.shields.io/badge/Java-25-007396?style=for-the-badge&logo=openjdk&logoColor=white)](#quick-start)
+[![Kotlin](https://img.shields.io/badge/Kotlin-2.3.0-7f52ff?style=for-the-badge&logo=kotlin&logoColor=white)](#implemented-foundation)
+[![API](https://img.shields.io/badge/API-aerogel--api-2ea44f?style=for-the-badge)](#api-publishing)
 
-This repository is focused on engine development and contributor collaboration.
+[![README KO](https://img.shields.io/badge/README-%ED%95%9C%EA%B5%AD%EC%96%B4-0a66c2?style=for-the-badge)](README.ko.md)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865f2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/fBBgMXXv8P)
 
-- Progress target today: roughly **~30% of vanilla feature coverage**
-- Goal: correctness, performance, and architecture clarity
-- Status: active development, frequent behavioral changes
+</div>
 
 ---
 
-## Project Stage (Read First)
+| Quick Links | |
+|---|---|
+| Start here | [Quick Start](#quick-start) |
+| Plugin dev | [Plugin Development](#plugin-development) |
+| API package | [API Publishing](#api-publishing) |
+| Contribute | [Contribution Focus](#contribution-focus) |
 
-Use Aerogel now if you want to:
+## Project Snapshot
 
-- test an evolving engine, not a completed product
-- report edge cases and protocol/world-sync bugs early
-- shape architecture decisions before they are frozen
-- contribute code to core systems (network, world, storage, gameplay)
+> Aerogel is not production-ready yet. It is iteration-heavy and may introduce breaking behavior changes between commits.
 
-This project is in a contributor-first stage.
+- Focus: correctness, performance, plugin/runtime architecture
+- Stack: Kotlin + Netty + custom protocol/runtime path
+- Java requirement: 25
+- Vanilla parity: partial and expanding continuously
 
-## What Aerogel is building toward
+## Implemented Foundation
 
-- independent engine-level control (not just patching an existing server core)
-- high-performance packet and chunk pipeline
-- vanilla-compatible world/player persistence path
-- reproducible, testable runtime behavior for future scale
+| Area | Current State |
+|---|---|
+| Networking | Netty pipeline + protocol handling path |
+| World/Persistence | `level.dat` seed/time-weather metadata path |
+| Runtime | game loop + performance monitoring primitives |
+| Plugins | runtime, event bus, command integration |
+| Hot Reload | `plugins/*.jar` change-detection loop |
+| i18n | server resources for `en` and `ko` |
+| Bridge | Folia bridge artifact embedded in main jar |
 
-## Current reality (important)
+## Build Artifacts
 
-- not all vanilla mechanics are implemented
-- behavior can change between commits
-- compatibility assumptions can break during refactors
-- expect rapid iteration and breaking changes between commits
+- `build/libs/Aerogel.jar` - main server runtime
+- `build/libs/AerogelFoliaBridge.jar` - Folia bridge plugin
+- `:api` module - `org.macaroon3145:aerogel-api:1.0-SNAPSHOT`
 
-## If you want to help
-
-We are actively looking for contributors who can help with:
-
-- vanilla parity implementation
-- protocol correctness and client sync edge cases
-- persistence/format validation
-- performance profiling and regression tracking
-- toolchain, DX, docs, test harnesses
-
-Join Discord and talk directly with the team:
-
-**https://discord.gg/fBBgMXXv8P**
-
-## API Package (Maven)
-
-API module is published automatically to GitHub Packages on commits to `main`.
-
-- Group: `org.macaroon3145`
-- Artifact: `aerogel-api`
-- Version: `1.0-SNAPSHOT`
-
-Repository:
-
-```kotlin
-repositories {
-    maven("https://maven.pkg.github.com/MCAerogel/Aerogel")
-}
-```
-
-Dependency:
-
-```kotlin
-dependencies {
-    compileOnly("org.macaroon3145:aerogel-api:1.0-SNAPSHOT")
-}
-```
-
-## Quick Start (Dev)
-
-Requirements:
-
-- Java 25
-
-Build:
+## Quick Start
 
 ```bash
 ./gradlew build
-```
-
-Run:
-
-```bash
 ./gradlew runAerogelJar
 ```
 
-or
+Manual run:
 
 ```bash
 java --enable-native-access=ALL-UNNAMED \
@@ -103,11 +66,77 @@ java --enable-native-access=ALL-UNNAMED \
      -jar build/libs/Aerogel.jar
 ```
 
----
+Runtime paths:
+
+- `aerogel.properties`
+- `plugins/`
+- `world/`
+- `logs/`
+
+## Plugin Development
+
+Dependency setup:
+
+```kotlin
+repositories {
+    mavenCentral()
+    maven("https://maven.pkg.github.com/MCAerogel/Aerogel")
+}
+
+dependencies {
+    compileOnly("org.macaroon3145:aerogel-api:1.0-SNAPSHOT")
+}
+```
+
+Minimal plugin entry:
+
+```kotlin
+package com.example
+
+import org.macaroon3145.api.plugin.AerogelPlugin
+import org.macaroon3145.api.plugin.PluginContext
+
+class HelloPlugin : AerogelPlugin {
+    override fun onEnable(context: PluginContext) {
+        context.logger.info("Hello from HelloPlugin")
+    }
+}
+```
+
+`src/main/resources/aerogel-plugin.json`:
+
+```json
+{
+  "id": "hello-plugin",
+  "name": "Hello Plugin",
+  "version": "0.1.0",
+  "apiVersion": "1.0",
+  "mainClass": "com.example.HelloPlugin",
+  "dependencies": [],
+  "softDependencies": []
+}
+```
+
+## API Publishing
+
+API is published to GitHub Packages via Actions on `main` updates affecting `modules/api/**`.
+
+- Group: `org.macaroon3145`
+- Artifact: `aerogel-api`
+- Version: `1.0-SNAPSHOT`
+- Repository: `https://maven.pkg.github.com/MCAerogel/Aerogel`
+
+## Contribution Focus
+
+- vanilla parity and behavior validation
+- protocol correctness and sync edge cases
+- persistence/format validation and migrations
+- profiling and performance regressions
+- tests, tooling, and developer experience
+
+Community: `https://discord.gg/fBBgMXXv8P`
 
 ## Development Notice
 
-Aerogel is a development build.  
-Expect incomplete features, breaking changes, and rapid iteration.
+Aerogel is intentionally iteration-heavy while core architecture stabilizes.
 
-Use with caution. Contribute if you want to accelerate it.

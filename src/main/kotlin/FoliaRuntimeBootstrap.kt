@@ -176,7 +176,14 @@ private object FoliaRuntimeBootstrap {
         Files.newDirectoryStream(ipcDir).use { entries ->
             for (entry in entries) {
                 val name = entry.fileName.toString()
-                if (name == "bridge-ready" || name == "world-spawns.tsv" || name.startsWith("chunk-request-") || name.startsWith("chunk-response-")) {
+                if (
+                    name == "bridge-ready" ||
+                    name == "world-spawns.tsv" ||
+                    name == "chunk-unload-requests.tsv" ||
+                    name == "block-update-requests.tsv" ||
+                    name.startsWith("chunk-request-") ||
+                    name.startsWith("chunk-response-")
+                ) {
                     Files.deleteIfExists(entry)
                 }
             }

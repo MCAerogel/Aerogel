@@ -508,9 +508,8 @@ class PlayHandler(
                 // ignore
             }
         }
-        // Survival should only break on FINISHED_DIGGING.
-        // Creative still breaks immediately on START_DIGGING.
-        if (action == 0 || action == 2) {
+        // 0=START_DESTROY_BLOCK, 1=ABORT_DESTROY_BLOCK, 2=STOP_DESTROY_BLOCK
+        if (action == 0 || action == 1 || action == 2) {
             PlayerSessionManager.handleBlockDiggingAction(session.channelId, action, pos.x, pos.y, pos.z)
             PlayerSessionManager.acknowledgeBlockChangedSequence(session.channelId, sequence)
             return

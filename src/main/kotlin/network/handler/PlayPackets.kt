@@ -6,6 +6,10 @@ import org.macaroon3145.world.GeneratedChunk
 import org.macaroon3145.world.WorldManager
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.math.floor
 
 object PlayPackets {
@@ -51,6 +55,8 @@ object PlayPackets {
     private const val ACK_BLOCK_CHANGED_PACKET_ID = 0x04
     private const val BLOCK_ACTION_PACKET_ID = 0x07
     private const val BLOCK_CHANGE_PACKET_ID = 0x08
+    // 1.21.11 play/clientbound: with bundle delimiter at 0x00, block_destruction is 0x05.
+    private const val BLOCK_DESTRUCTION_PACKET_ID = 0x05
     // Protocol 774 (MC 1.21.11): WorldEventPacket
     private const val LEVEL_EVENT_PACKET_ID = 0x2D
     private const val KEEP_ALIVE_PACKET_ID = 0x2B
@@ -93,6 +99,9 @@ object PlayPackets {
     private const val HURT_ANIMATION_PACKET_ID = 0x29
     private const val SOUND_ENTITY_PACKET_ID = 0x72
     private const val SOUND_PACKET_ID = 0x73
+    private const val PLAYER_ABILITIES_PACKET_ID = 0x3E
+    private const val UPDATE_ATTRIBUTES_PACKET_ID = 0x81
+    private const val ATTRIBUTE_ID_MAP_RESOURCE = "/vanilla-attribute-id-map-1.21.11.json"
 
     private const val SPAWN_X = 0
     private const val SPAWN_Y = 65
@@ -118,7 +127,9 @@ object PlayPackets {
     private const val ENTITY_SHARED_FLAGS_METADATA_INDEX = 0
     private const val ENTITY_POSE_METADATA_INDEX = 6
     private const val LIVING_ENTITY_FLAGS_METADATA_INDEX = 8
+    private const val LIVING_ENTITY_HEALTH_METADATA_INDEX = 9
     private const val ENTITY_POSE_METADATA_TYPE_ID = 20 // entity_pose in 1.21.11
+    private const val FLOAT_METADATA_TYPE_ID = 3
     private const val ENTITY_FLAGS_SNEAKING = 0x02
     private const val ENTITY_FLAGS_SPRINTING = 0x08
     private const val ENTITY_FLAGS_SWIMMING = 0x10
@@ -127,6 +138,7 @@ object PlayPackets {
     private const val POSE_STANDING = 0
     private const val POSE_SWIMMING = 3
     private const val POSE_CROUCHING = 5
+    private const val POSE_DYING = 7
     private val cachedItemEntityTypeId: Int by lazy {
         RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:item")
             ?: FALLBACK_ITEM_ENTITY_TYPE_ID_1_21_11
@@ -151,6 +163,10 @@ object PlayPackets {
         RegistryCodec.entryIndex("minecraft:entity_type", "minecraft:pig")
             ?: FALLBACK_PIG_ENTITY_TYPE_ID_1_21_11
     }
+    private val cachedAttackSpeedAttributeId: Int? by lazy {
+        loadAttributeIdMap()["minecraft:attack_speed"]
+    }
+    private val json = Json { ignoreUnknownKeys = true }
 
     fun prewarm() {
         cachedItemEntityTypeId
@@ -159,6 +175,20 @@ object PlayPackets {
         cachedEggEntityTypeId
         cachedEnderPearlEntityTypeId
         cachedPigEntityTypeId
+        cachedAttackSpeedAttributeId
+    }
+
+    private fun loadAttributeIdMap(): Map<String, Int> {
+        return runCatching {
+            val stream = PlayPackets::class.java.getResourceAsStream(ATTRIBUTE_ID_MAP_RESOURCE) ?: return@runCatching emptyMap()
+            stream.bufferedReader().use { reader ->
+                val root = json.parseToJsonElement(reader.readText()).jsonObject
+                val entries = root["entries"]?.jsonObject ?: return@use emptyMap()
+                entries.mapNotNull { (key, value) ->
+                    value.jsonPrimitive.intOrNull?.let { key to it }
+                }.toMap()
+            }
+        }.getOrDefault(emptyMap())
     }
 
     fun loginPacket(entityId: Int, worldKey: String, gameMode: Int): ByteArray {
@@ -925,12 +955,36 @@ object PlayPackets {
         return packet.toByteArray()
     }
 
+    fun updateAttackSpeedAttributePacket(entityId: Int, attackSpeed: Double): ByteArray {
+        val attributeId = cachedAttackSpeedAttributeId ?: return ByteArray(0)
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, UPDATE_ATTRIBUTES_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, entityId)
+        NetworkUtils.writeVarInt(packet, 1) // one attribute snapshot
+        // Holder<Attribute> registry id encoding in play protocol.
+        NetworkUtils.writeVarInt(packet, attributeId)
+        out.writeDouble(attackSpeed)
+        NetworkUtils.writeVarInt(packet, 0) // no modifiers
+        return packet.toByteArray()
+    }
+
     fun blockChangePacket(x: Int, y: Int, z: Int, blockStateId: Int): ByteArray {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
         NetworkUtils.writeVarInt(packet, BLOCK_CHANGE_PACKET_ID)
         out.writeLong(packPosition(x, y, z))
         NetworkUtils.writeVarInt(packet, blockStateId)
+        return packet.toByteArray()
+    }
+
+    fun blockDestructionPacket(breakerEntityId: Int, x: Int, y: Int, z: Int, stage: Int): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, BLOCK_DESTRUCTION_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, breakerEntityId)
+        out.writeLong(packPosition(x, y, z))
+        out.writeByte(stage.coerceIn(-1, 9))
         return packet.toByteArray()
     }
 
@@ -1200,7 +1254,8 @@ object PlayPackets {
         sneaking: Boolean,
         sprinting: Boolean,
         swimming: Boolean,
-        usingItemHand: Int = -1
+        usingItemHand: Int = -1,
+        forcedPose: Int? = null
     ): ByteArray {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
@@ -1219,7 +1274,7 @@ object PlayPackets {
         // Pose must also be synchronized for crouching/swimming visuals on 1.21.x clients.
         out.writeByte(ENTITY_POSE_METADATA_INDEX)
         NetworkUtils.writeVarInt(packet, ENTITY_POSE_METADATA_TYPE_ID) // metadata type: entity_pose
-        val pose = when {
+        val pose = forcedPose ?: when {
             swimming -> POSE_SWIMMING
             sneaking -> POSE_CROUCHING
             else -> POSE_STANDING
@@ -1237,6 +1292,29 @@ object PlayPackets {
         }
         out.writeByte(livingFlags)
 
+        out.writeByte(0xFF) // metadata terminator
+        return packet.toByteArray()
+    }
+
+    fun playerDeathMetadataPacket(entityId: Int): ByteArray {
+        return playerSharedFlagsMetadataPacket(
+            entityId = entityId,
+            sneaking = false,
+            sprinting = false,
+            swimming = false,
+            usingItemHand = -1,
+            forcedPose = POSE_DYING
+        )
+    }
+
+    fun playerHealthMetadataPacket(entityId: Int, health: Float): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, ENTITY_METADATA_PACKET_ID)
+        NetworkUtils.writeVarInt(packet, entityId)
+        out.writeByte(LIVING_ENTITY_HEALTH_METADATA_INDEX)
+        NetworkUtils.writeVarInt(packet, FLOAT_METADATA_TYPE_ID) // metadata type: float
+        out.writeFloat(health.coerceAtLeast(0f))
         out.writeByte(0xFF) // metadata terminator
         return packet.toByteArray()
     }
@@ -1356,6 +1434,28 @@ object PlayPackets {
         NetworkUtils.writeVarInt(packet, GAME_STATE_CHANGE_PACKET_ID)
         out.writeByte(11)
         out.writeFloat(if (enabled) 1f else 0f)
+        return packet.toByteArray()
+    }
+
+    fun playerAbilitiesPacket(
+        invulnerable: Boolean,
+        flying: Boolean,
+        allowFlying: Boolean,
+        instantBuild: Boolean,
+        flyingSpeed: Float = 0.05f,
+        walkingSpeed: Float = 0.1f
+    ): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, PLAYER_ABILITIES_PACKET_ID)
+        var flags = 0
+        if (invulnerable) flags = flags or 0x01
+        if (flying) flags = flags or 0x02
+        if (allowFlying) flags = flags or 0x04
+        if (instantBuild) flags = flags or 0x08
+        out.writeByte(flags)
+        out.writeFloat(flyingSpeed)
+        out.writeFloat(walkingSpeed)
         return packet.toByteArray()
     }
 

@@ -144,6 +144,7 @@ fun main() {
         ?: 1
     val dashboardAutoStart = parseDashboardAutoStart(props)
     ServerConfig.setGameMode(parseGameMode(props.getProperty("default-gamemode")))
+    ServerConfig.setDifficulty(parseDifficulty(props.getProperty("difficulty")))
     ServerI18n.initialize()
     WorldManager.bootstrap(worldSeeds = worldSeeds, defaultWorld = defaultWorld)
     // Ensure a canonical level.dat exists from the first boot so generation seeds stay stable across restarts.
@@ -489,6 +490,17 @@ private fun parseGameMode(raw: String?): Int {
         "2", "adventure" -> 2
         "3", "spectator" -> 3
         else -> 1
+    }
+}
+
+private fun parseDifficulty(raw: String?): Int {
+    val normalized = raw?.trim()?.lowercase() ?: return 2
+    return when (normalized) {
+        "0", "peaceful" -> 0
+        "1", "easy" -> 1
+        "2", "normal" -> 2
+        "3", "hard" -> 3
+        else -> 2
     }
 }
 
