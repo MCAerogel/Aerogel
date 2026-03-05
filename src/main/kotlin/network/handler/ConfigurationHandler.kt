@@ -6,8 +6,8 @@ import io.netty.channel.SimpleChannelInboundHandler
 import org.macaroon3145.api.packet.ProtocolPhase
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.NetworkUtils
-import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
 import org.macaroon3145.world.WorldManager
+import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 
 class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChannelInboundHandler<ByteBuf>() {
     private var clientSettings: ClientSettings? = null
@@ -22,29 +22,27 @@ class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChann
     }
 
     private fun completeConfiguration(ctx: ChannelHandlerContext) {
-        val world = WorldManager.defaultWorld()
-        val spawn = FoliaSidecarSpawnPointProvider.spawnPointFor(world.key)
-            ?: world.spawnPointForPlayer(profile.uuid)
-        val spawnX = spawn.x
-        val spawnY = spawn.y
-        val spawnZ = spawn.z
+        val defaultWorld = WorldManager.defaultWorld()
+        val persisted = VanillaAnvilWorldSaver.loadPlayerData(profile.uuid)
         val skinPartsMask = clientSettings?.skinPartsMask ?: 0x7F
         val viewDistance = clientSettings?.viewDistance ?: 10
         val join = PlayerSessionManager.prepareJoin(
             ctx = ctx,
             profile = profile,
             locale = clientSettings?.locale ?: "en_us",
-            worldKey = world.key,
+            worldKey = defaultWorld.key,
             skinPartsMask = skinPartsMask,
             requestedViewDistance = viewDistance,
-            spawnX = spawnX,
-            spawnY = spawnY,
-            spawnZ = spawnZ
+            spawnX = Double.NaN,
+            spawnY = Double.NaN,
+            spawnZ = Double.NaN,
+            persistedPlayerData = persisted
         )
         val session = join.session
+        val sessionWorldKey = session.worldKey
         ProtocolPhaseTracker.update(ctx.channel(), ProtocolPhase.PLAY)
         ctx.pipeline().replace(this, "playHandler", PlayHandler(profile, session))
-        ctx.writeAndFlush(PlayPackets.loginPacket(session.entityId, world.key, session.gameMode))
+        ctx.writeAndFlush(PlayPackets.loginPacket(session.entityId, sessionWorldKey, session.gameMode))
         ctx.writeAndFlush(PlayPackets.serverBrandPacket("Aerogel"))
         ctx.writeAndFlush(PlayPackets.playerInfoPacket(profile, PlayerSessionManager.displayNameOrUsername(session), session.gameMode, session.pingMs))
         ctx.writeAndFlush(
@@ -56,16 +54,18 @@ class ConfigurationHandler(private val profile: ConnectionProfile) : SimpleChann
         ctx.writeAndFlush(PlayPackets.playerSkinPartsMetadataPacket(entityId = session.entityId, skinPartsMask = skinPartsMask))
         ctx.writeAndFlush(PlayPackets.updateViewDistancePacket(session.chunkRadius))
         ctx.writeAndFlush(PlayPackets.updateViewPositionPacket(session.centerChunkX, session.centerChunkZ))
-        ctx.writeAndFlush(PlayPackets.spawnPositionPacket(world.key, session.x, session.y, session.z))
+        ctx.writeAndFlush(PlayPackets.spawnPositionPacket(sessionWorldKey, session.x, session.y, session.z))
         ctx.writeAndFlush(
             PlayPackets.playerPositionPacket(
                 teleportId = 1,
                 x = session.x,
                 y = session.y,
-                z = session.z
+                z = session.z,
+                yaw = session.yaw,
+                pitch = session.pitch
             )
         )
-        val (worldAge, timeOfDay) = PlayerSessionManager.worldTimeSnapshot(world.key)
+        val (worldAge, timeOfDay) = PlayerSessionManager.worldTimeSnapshot(sessionWorldKey)
         ctx.writeAndFlush(PlayPackets.timeUpdatePacket(worldAge = worldAge, timeOfDay = timeOfDay, tickDayTime = true))
         val playerTickRate = (20.0 * ServerConfig.playerTimeScale).toFloat()
         ctx.writeAndFlush(PlayPackets.tickingStatePacket(tickRate = playerTickRate, isFrozen = false))

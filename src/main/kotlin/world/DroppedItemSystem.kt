@@ -483,6 +483,10 @@ class DroppedItemSystem(
 
             if (!shouldSimulate) {
                 if (spawnedIds.remove(entityId)) {
+                    if (!isLiveSnapshot(entityId, entity.uuid)) {
+                        chunkState.entities.remove(entityId, entity)
+                        continue
+                    }
                     snapshots[entityId] = entity.snapshot()
                 }
                 continue
@@ -499,6 +503,10 @@ class DroppedItemSystem(
                         result.removed.add(DroppedItemRemovedEvent(entityId, oldChunk))
                     }
                 } else if (oldPickupDelay != entity.pickupDelaySeconds) {
+                    if (!isLiveSnapshot(entityId, entity.uuid)) {
+                        chunkState.entities.remove(entityId, entity)
+                        continue
+                    }
                     snapshots[entityId] = entity.snapshot()
                 }
                 continue
@@ -545,6 +553,11 @@ class DroppedItemSystem(
                 dirtyChunksByLane[targetLane].add(newChunk)
             }
 
+            if (!isLiveSnapshot(entityId, entity.uuid)) {
+                chunkState.entities.remove(entityId, entity)
+                continue
+            }
+
             if (spawnedIds.remove(entityId)) {
                 val snapshot = entity.snapshot()
                 snapshots[entityId] = snapshot
@@ -566,6 +579,11 @@ class DroppedItemSystem(
         }
         chunkTimeRecorder?.invoke(chunkPos, System.nanoTime() - startedAtNanos)
         return result
+    }
+
+    private fun isLiveSnapshot(entityId: Int, expectedUuid: UUID): Boolean {
+        val snapshot = snapshots[entityId] ?: return false
+        return snapshot.uuid == expectedUuid
     }
 
     private fun collectLaneChunkPositions(

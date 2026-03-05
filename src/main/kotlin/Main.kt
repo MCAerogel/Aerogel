@@ -146,6 +146,8 @@ fun main() {
     ServerConfig.setGameMode(parseGameMode(props.getProperty("default-gamemode")))
     ServerI18n.initialize()
     WorldManager.bootstrap(worldSeeds = worldSeeds, defaultWorld = defaultWorld)
+    // Ensure a canonical level.dat exists from the first boot so generation seeds stay stable across restarts.
+    VanillaLevelDatSeedStore.save(worldSeeds)
     VanillaLevelDatSeedStore.loadTimeWeatherMetadata()?.let { metadata ->
         PlayerSessionManager.applyPersistedTimeWeather(metadata)
     }

@@ -49,6 +49,7 @@ object PlayPackets {
     private const val MOVE_ENTITY_POS_PACKET_ID = 0x33
     private const val MOVE_ENTITY_POS_ROT_PACKET_ID = 0x34
     private const val ACK_BLOCK_CHANGED_PACKET_ID = 0x04
+    private const val BLOCK_ACTION_PACKET_ID = 0x07
     private const val BLOCK_CHANGE_PACKET_ID = 0x08
     // Protocol 774 (MC 1.21.11): WorldEventPacket
     private const val LEVEL_EVENT_PACKET_ID = 0x2D
@@ -930,6 +931,17 @@ object PlayPackets {
         NetworkUtils.writeVarInt(packet, BLOCK_CHANGE_PACKET_ID)
         out.writeLong(packPosition(x, y, z))
         NetworkUtils.writeVarInt(packet, blockStateId)
+        return packet.toByteArray()
+    }
+
+    fun blockActionPacket(x: Int, y: Int, z: Int, actionId: Int, actionParam: Int, blockId: Int): ByteArray {
+        val packet = ByteArrayOutputStream()
+        val out = DataOutputStream(packet)
+        NetworkUtils.writeVarInt(packet, BLOCK_ACTION_PACKET_ID)
+        out.writeLong(packPosition(x, y, z))
+        out.writeByte(actionId.coerceIn(0, 255))
+        out.writeByte(actionParam.coerceIn(0, 255))
+        NetworkUtils.writeVarInt(packet, blockId.coerceAtLeast(0))
         return packet.toByteArray()
     }
 

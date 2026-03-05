@@ -2,6 +2,8 @@ package org.macaroon3145.world
 
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.codec.BlockStateRegistry
+import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
+import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -1643,10 +1645,27 @@ class World(
     }
 
     fun spawnPointForPlayer(_playerUuid: UUID): SpawnPoint {
+        FoliaSidecarSpawnPointProvider.spawnPointFor(key)?.let { sidecar ->
+            if (isSpawnPointValid(sidecar)) {
+                if (key == "minecraft:overworld") {
+                    VanillaLevelDatSeedStore.saveSpawnPoint(sidecar)
+                }
+                return sidecar
+            }
+        }
+        if (key == "minecraft:overworld") {
+            VanillaLevelDatSeedStore.loadSpawnPoint()?.let { fromLevelDat ->
+                if (isSpawnPointValid(fromLevelDat)) return fromLevelDat
+            }
+        }
         cachedSpawnPointRef.get()?.let { return it }
         val computed = findSharedSpawnNearOrigin()
         cachedSpawnPointRef.compareAndSet(null, computed)
-        return cachedSpawnPointRef.get() ?: computed
+        val resolved = cachedSpawnPointRef.get() ?: computed
+        if (key == "minecraft:overworld") {
+            VanillaLevelDatSeedStore.saveSpawnPoint(resolved)
+        }
+        return resolved
     }
 
     fun highestSpawnPointAt(blockX: Int = 0, blockZ: Int = 0): SpawnPoint {
@@ -1742,6 +1761,14 @@ class World(
         val feet = blockStateAt(blockX, feetY, blockZ)
         val head = blockStateAt(blockX, feetY + 1, blockZ)
         return isSolidSpawnSupport(below) && feet == AIR_STATE_ID && head == AIR_STATE_ID
+    }
+
+    private fun isSpawnPointValid(spawn: SpawnPoint): Boolean {
+        if (!spawn.x.isFinite() || !spawn.y.isFinite() || !spawn.z.isFinite()) return false
+        val blockX = kotlin.math.floor(spawn.x).toInt()
+        val feetY = spawn.y.toInt()
+        val blockZ = kotlin.math.floor(spawn.z).toInt()
+        return isSpawnClearAt(blockX, feetY, blockZ)
     }
 
     private fun heightmapBitsPerEntry(): Int {

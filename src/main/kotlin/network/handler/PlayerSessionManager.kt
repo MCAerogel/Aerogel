@@ -36,7 +36,6 @@ import org.macaroon3145.world.BlockPos
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.DroppedItemSnapshot
 import org.macaroon3145.world.FallingBlockSnapshot
-import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
 import org.macaroon3145.world.AnimalDamageCause
 import org.macaroon3145.world.AnimalKind
 import org.macaroon3145.world.AnimalRideControl
@@ -176,6 +175,9 @@ data class PlayerSession(
     @Volatile var openFurnaceX: Int,
     @Volatile var openFurnaceY: Int,
     @Volatile var openFurnaceZ: Int,
+    @Volatile var openChestX: Int,
+    @Volatile var openChestY: Int,
+    @Volatile var openChestZ: Int,
     @Volatile var nextContainerId: Int,
     @Volatile var cursorItemId: Int,
     @Volatile var cursorItemCount: Int,
@@ -269,6 +271,13 @@ private data class FurnaceKey(
     val z: Int
 )
 
+private data class ChestKey(
+    val worldKey: String,
+    val x: Int,
+    val y: Int,
+    val z: Int
+)
+
 private data class WorldChunkKey(
     val worldKey: String,
     val chunkPos: ChunkPos
@@ -299,6 +308,28 @@ private data class FurnaceState(
     var dirty: Boolean
 )
 
+private data class ChestState(
+    val itemIds: IntArray,
+    val itemCounts: IntArray
+)
+
+private data class EnderChestState(
+    val itemIds: IntArray,
+    val itemCounts: IntArray
+)
+
+private data class ChestContainerLayout(
+    val storageSlots: Int,
+    val primaryKey: ChestKey,
+    val secondaryKey: ChestKey?
+)
+
+private data class ChestContainerRanges(
+    val storage: IntRange,
+    val playerMain: IntRange,
+    val playerHotbar: IntRange
+)
+
 data class CommandSuggestionWindow(
     val start: Int,
     val length: Int,
@@ -311,6 +342,41 @@ private data class CommandCompletionResult(
 )
 
 object PlayerSessionManager {
+    data class PersistedChestState(
+        val worldKey: String,
+        val x: Int,
+        val y: Int,
+        val z: Int,
+        val itemIds: IntArray,
+        val itemCounts: IntArray
+    )
+
+    data class PersistedPlayerState(
+        val uuid: UUID,
+        val worldKey: String,
+        val x: Double,
+        val y: Double,
+        val z: Double,
+        val yaw: Float,
+        val pitch: Float,
+        val gameMode: Int,
+        val flying: Boolean,
+        val health: Float,
+        val food: Int,
+        val saturation: Float,
+        val foodExhaustion: Float,
+        val hotbarItemIds: IntArray,
+        val hotbarItemCounts: IntArray,
+        val mainInventoryItemIds: IntArray,
+        val mainInventoryItemCounts: IntArray,
+        val armorItemIds: IntArray,
+        val armorItemCounts: IntArray,
+        val offhandItemId: Int,
+        val offhandItemCount: Int,
+        val enderChestItemIds: IntArray,
+        val enderChestItemCounts: IntArray
+    )
+
     private data class TickSimulationContext(
         val sessionsByWorld: Map<String, List<PlayerSession>>,
         val activeChunksByWorld: Map<String, Set<ChunkPos>>
@@ -398,6 +464,123 @@ private data class PlayerItemTextMeta(
         isThundering = INITIAL_IS_THUNDERING
     )
     private val furnaceStates = ConcurrentHashMap<FurnaceKey, FurnaceState>()
+    private val chestStates = ConcurrentHashMap<ChestKey, ChestState>()
+    private val enderChestStates = ConcurrentHashMap<UUID, EnderChestState>()
+    private val dirtyChestChunksByWorld = ConcurrentHashMap<String, MutableSet<ChunkPos>>()
+
+    fun itemKeyForPersistence(itemId: Int): String? {
+        if (itemId < 0) return null
+        return itemKeyById.getOrNull(itemId)
+    }
+
+    fun itemIdForPersistence(itemKey: String): Int {
+        if (itemKey.isBlank()) return -1
+        val normalized = if (':' in itemKey) itemKey else "minecraft:$itemKey"
+        return itemIdByKey[normalized] ?: -1
+    }
+
+    fun chestPersistenceSnapshotForChunk(worldKey: String, chunkX: Int, chunkZ: Int): List<PersistedChestState> {
+        val out = ArrayList<PersistedChestState>()
+        for ((key, state) in chestStates) {
+            if (key.worldKey != worldKey) continue
+            if ((key.x shr 4) != chunkX || (key.z shr 4) != chunkZ) continue
+            out.add(
+                PersistedChestState(
+                    worldKey = worldKey,
+                    x = key.x,
+                    y = key.y,
+                    z = key.z,
+                    itemIds = state.itemIds.copyOf(),
+                    itemCounts = state.itemCounts.copyOf()
+                )
+            )
+        }
+        return out
+    }
+
+    fun replaceChestPersistenceForChunk(worldKey: String, chunkX: Int, chunkZ: Int, entries: List<PersistedChestState>) {
+        val iterator = chestStates.keys.iterator()
+        while (iterator.hasNext()) {
+            val key = iterator.next()
+            if (key.worldKey != worldKey) continue
+            if ((key.x shr 4) != chunkX || (key.z shr 4) != chunkZ) continue
+            iterator.remove()
+        }
+
+        for (entry in entries) {
+            val ids = IntArray(27) { -1 }
+            val counts = IntArray(27)
+            val limit = minOf(27, entry.itemIds.size, entry.itemCounts.size)
+            for (i in 0 until limit) {
+                val id = entry.itemIds[i]
+                val count = entry.itemCounts[i]
+                if (id < 0 || count <= 0) continue
+                ids[i] = id
+                counts[i] = count.coerceAtMost(MAX_HOTBAR_STACK_SIZE)
+            }
+            chestStates[ChestKey(worldKey, entry.x, entry.y, entry.z)] = ChestState(itemIds = ids, itemCounts = counts)
+        }
+    }
+
+    fun consumeDirtyChestChunksByWorld(): Map<String, Set<ChunkPos>> {
+        if (dirtyChestChunksByWorld.isEmpty()) return emptyMap()
+        val out = LinkedHashMap<String, Set<ChunkPos>>()
+        for ((worldKey, chunks) in dirtyChestChunksByWorld) {
+            val drained = HashSet<ChunkPos>()
+            val iterator = chunks.iterator()
+            while (iterator.hasNext()) {
+                val chunkPos = iterator.next()
+                iterator.remove()
+                drained.add(chunkPos)
+            }
+            if (drained.isNotEmpty()) {
+                out[worldKey] = drained
+            }
+        }
+        return out
+    }
+
+    fun playerPersistenceSnapshots(): List<PersistedPlayerState> {
+        val out = ArrayList<PersistedPlayerState>(sessions.size)
+        for (session in sessions.values) {
+            out.add(playerPersistenceSnapshot(session))
+        }
+        return out
+    }
+
+    fun playerPersistenceSnapshotByChannel(channelId: ChannelId): PersistedPlayerState? {
+        val session = sessions[channelId] ?: return null
+        return playerPersistenceSnapshot(session)
+    }
+
+    private fun playerPersistenceSnapshot(session: PlayerSession): PersistedPlayerState {
+        val ender = enderChestStates[session.profile.uuid]
+        return PersistedPlayerState(
+            uuid = session.profile.uuid,
+            worldKey = session.worldKey,
+            x = session.x,
+            y = session.y,
+            z = session.z,
+            yaw = session.yaw,
+            pitch = session.pitch,
+            gameMode = session.gameMode,
+            flying = session.flying,
+            health = session.health,
+            food = session.food,
+            saturation = session.saturation,
+            foodExhaustion = session.foodExhaustion,
+            hotbarItemIds = session.hotbarItemIds.copyOf(),
+            hotbarItemCounts = session.hotbarItemCounts.copyOf(),
+            mainInventoryItemIds = session.mainInventoryItemIds.copyOf(),
+            mainInventoryItemCounts = session.mainInventoryItemCounts.copyOf(),
+            armorItemIds = session.armorItemIds.copyOf(),
+            armorItemCounts = session.armorItemCounts.copyOf(),
+            offhandItemId = session.offhandItemId,
+            offhandItemCount = session.offhandItemCount,
+            enderChestItemIds = ender?.itemIds?.copyOf() ?: IntArray(27) { -1 },
+            enderChestItemCounts = ender?.itemCounts?.copyOf() ?: IntArray(27)
+        )
+    }
     private val activeFurnaceKeys = ConcurrentHashMap.newKeySet<FurnaceKey>()
     private val activeFurnaceKeysByWorld = ConcurrentHashMap<String, MutableSet<FurnaceKey>>()
     private val pendingFurnaceResyncKeys = ConcurrentLinkedQueue<FurnaceKey>()
@@ -729,6 +912,7 @@ private data class PlayerItemTextMeta(
         val entityId: Int,
         val collectorEntityId: Int,
         val pickupItemCount: Int,
+        val showTakeAnimation: Boolean,
         val x: Double,
         val y: Double,
         val z: Double
@@ -745,27 +929,42 @@ private data class PlayerItemTextMeta(
         requestedViewDistance: Int,
         spawnX: Double,
         spawnY: Double,
-        spawnZ: Double
+        spawnZ: Double,
+        persistedPlayerData: VanillaAnvilWorldSaver.PersistedPlayerData? = null
     ): JoinResult {
-        val spawnChunkX = ChunkStreamingService.chunkXFromBlockX(spawnX)
-        val spawnChunkZ = ChunkStreamingService.chunkZFromBlockZ(spawnZ)
+        val persisted = persistedPlayerData ?: VanillaAnvilWorldSaver.loadPlayerData(profile.uuid)
+        val fallbackWorld = WorldManager.world(worldKey) ?: WorldManager.defaultWorld()
+        val fallbackSpawn = if (spawnX.isFinite() && spawnY.isFinite() && spawnZ.isFinite()) {
+            Triple(spawnX, spawnY, spawnZ)
+        } else {
+            val resolved = fallbackWorld.spawnPointForPlayer(profile.uuid)
+            Triple(resolved.x, resolved.y, resolved.z)
+        }
+        val joinWorldKey = persisted?.worldKey?.takeIf { WorldManager.world(it) != null } ?: worldKey
+        val joinX = persisted?.x?.takeIf { it.isFinite() } ?: fallbackSpawn.first
+        val joinY = persisted?.y?.takeIf { it.isFinite() } ?: fallbackSpawn.second
+        val joinZ = persisted?.z?.takeIf { it.isFinite() } ?: fallbackSpawn.third
+        val joinYaw = persisted?.yaw ?: 0f
+        val joinPitch = persisted?.pitch ?: 0f
+        val spawnChunkX = ChunkStreamingService.chunkXFromBlockX(joinX)
+        val spawnChunkZ = ChunkStreamingService.chunkZFromBlockZ(joinZ)
         val effectiveRadius = effectiveChunkRadius(requestedViewDistance)
         val session = PlayerSession(
             channelId = ctx.channel().id(),
             profile = profile,
             locale = locale,
             displayName = null,
-            worldKey = worldKey,
+            worldKey = joinWorldKey,
             entityId = allocateEntityId(),
             skinPartsMask = skinPartsMask,
             pingMs = 0,
             pingMsExact = 0.0,
-            x = spawnX,
-            y = spawnY,
-            z = spawnZ,
-            clientEyeX = spawnX,
-            clientEyeY = spawnY,
-            clientEyeZ = spawnZ,
+            x = joinX,
+            y = joinY,
+            z = joinZ,
+            clientEyeX = joinX,
+            clientEyeY = joinY,
+            clientEyeZ = joinZ,
             velocityX = 0.0,
             velocityY = 0.0,
             velocityZ = 0.0,
@@ -773,16 +972,16 @@ private data class PlayerItemTextMeta(
             accelerationY = 0.0,
             accelerationZ = 0.0,
             lastHorizontalMovementSq = 0.0,
-            encodedX4096 = encodeRelativePosition4096(spawnX),
-            encodedY4096 = encodeRelativePosition4096(spawnY),
-            encodedZ4096 = encodeRelativePosition4096(spawnZ),
-            yaw = 0f,
-            pitch = 0f,
+            encodedX4096 = encodeRelativePosition4096(joinX),
+            encodedY4096 = encodeRelativePosition4096(joinY),
+            encodedZ4096 = encodeRelativePosition4096(joinZ),
+            yaw = joinYaw,
+            pitch = joinPitch,
             onGround = true,
-            health = MAX_PLAYER_HEALTH,
-            food = DEFAULT_PLAYER_FOOD,
-            saturation = DEFAULT_PLAYER_SATURATION,
-            foodExhaustion = 0f,
+            health = (persisted?.health ?: MAX_PLAYER_HEALTH).coerceIn(1f, MAX_PLAYER_HEALTH),
+            food = (persisted?.food ?: DEFAULT_PLAYER_FOOD).coerceIn(0, MAX_PLAYER_FOOD),
+            saturation = (persisted?.saturation ?: DEFAULT_PLAYER_SATURATION).coerceAtLeast(0f),
+            foodExhaustion = (persisted?.foodExhaustion ?: 0f).coerceAtLeast(0f),
             regenAccumulatorSeconds = 0.0,
             usingItemHand = -1,
             usingItemId = -1,
@@ -807,14 +1006,14 @@ private data class PlayerItemTextMeta(
             selectedBlockStateId = 0,
             selectedHotbarSlot = 0,
             pendingPickedBlockStateId = 0,
-            hotbarItemIds = IntArray(9) { -1 },
-            hotbarItemCounts = IntArray(9) { 0 },
-            mainInventoryItemIds = IntArray(27) { -1 },
-            mainInventoryItemCounts = IntArray(27) { 0 },
-            offhandItemId = -1,
-            offhandItemCount = 0,
-            armorItemIds = IntArray(4) { -1 },
-            armorItemCounts = IntArray(4) { 0 },
+            hotbarItemIds = persisted?.hotbarItemIds?.copyOf() ?: IntArray(9) { -1 },
+            hotbarItemCounts = persisted?.hotbarItemCounts?.copyOf() ?: IntArray(9),
+            mainInventoryItemIds = persisted?.mainInventoryItemIds?.copyOf() ?: IntArray(27) { -1 },
+            mainInventoryItemCounts = persisted?.mainInventoryItemCounts?.copyOf() ?: IntArray(27),
+            offhandItemId = persisted?.offhandItemId ?: -1,
+            offhandItemCount = persisted?.offhandItemCount ?: 0,
+            armorItemIds = persisted?.armorItemIds?.copyOf() ?: IntArray(4) { -1 },
+            armorItemCounts = persisted?.armorItemCounts?.copyOf() ?: IntArray(4),
             hotbarBlockStateIds = IntArray(9) { 0 },
             hotbarBlockEntityTypeIds = IntArray(9) { -1 },
             hotbarBlockEntityNbtPayloads = arrayOfNulls(9),
@@ -824,6 +1023,9 @@ private data class PlayerItemTextMeta(
             openFurnaceX = 0,
             openFurnaceY = 0,
             openFurnaceZ = 0,
+            openChestX = 0,
+            openChestY = 0,
+            openChestZ = 0,
             nextContainerId = 1,
             cursorItemId = -1,
             cursorItemCount = 0,
@@ -835,8 +1037,8 @@ private data class PlayerItemTextMeta(
             playerCraftItemCounts = IntArray(4) { 0 },
             tableCraftItemIds = IntArray(9) { -1 },
             tableCraftItemCounts = IntArray(9) { 0 },
-            gameMode = ServerConfig.defaultGameMode.coerceIn(0, 3),
-            flying = false,
+            gameMode = (persisted?.gameMode ?: ServerConfig.defaultGameMode).coerceIn(0, 3),
+            flying = persisted?.flying ?: false,
             requestedViewDistance = requestedViewDistance.coerceAtLeast(0),
             chunkRadius = effectiveRadius,
             centerChunkX = spawnChunkX,
@@ -858,25 +1060,31 @@ private data class PlayerItemTextMeta(
             pendingChunkTarget = AtomicReference(null),
             lastChunkMsptActionBarAtNanos = 0L,
             ridingAnimalEntityId = -1,
-            lastClientVehicleX = spawnX,
-            lastClientVehicleY = spawnY,
-            lastClientVehicleZ = spawnZ,
-            lastClientVehicleYaw = 0f,
-            lastClientVehiclePitch = 0f,
+            lastClientVehicleX = joinX,
+            lastClientVehicleY = joinY,
+            lastClientVehicleZ = joinZ,
+            lastClientVehicleYaw = joinYaw,
+            lastClientVehiclePitch = joinPitch,
             lastClientVehicleOnGround = true,
             lastClientVehiclePacketAtNanos = 0L,
             suppressNextMoveEvent = false,
-            suppressMoveEchoX = spawnX,
-            suppressMoveEchoY = spawnY,
-            suppressMoveEchoZ = spawnZ,
-            suppressMoveEchoYaw = 0f,
-            suppressMoveEchoPitch = 0f
+            suppressMoveEchoX = joinX,
+            suppressMoveEchoY = joinY,
+            suppressMoveEchoZ = joinZ,
+            suppressMoveEchoYaw = joinYaw,
+            suppressMoveEchoPitch = joinPitch
         )
+        if (persisted != null) {
+            enderChestStates[profile.uuid] = EnderChestState(
+                itemIds = persisted.enderChestItemIds.copyOf(),
+                itemCounts = persisted.enderChestItemCounts.copyOf()
+            )
+        }
         if (persistedOperatorUuids.contains(session.profile.uuid)) {
             operatorUuids.add(profile.uuid)
         }
 
-        val existing = sessions.values.filter { it.worldKey == worldKey && it.channelId != session.channelId }
+        val existing = sessions.values.filter { it.worldKey == joinWorldKey && it.channelId != session.channelId }
         sessions[session.channelId] = session
         contexts[session.channelId] = ctx
         animalSourceDirtyWorlds.add(session.worldKey)
@@ -3364,11 +3572,15 @@ private data class PlayerItemTextMeta(
         for (chunkPos in chunksInOrder) {
             for (pickup in pickupsByChunk[chunkPos].orEmpty()) {
                 droppedItemTextMetaByEntityId.remove(pickup.entityId)
-                val takePacket = PlayPackets.takeItemEntityPacket(
-                    collectedEntityId = pickup.entityId,
-                    collectorEntityId = pickup.collectorEntityId,
-                    pickupItemCount = pickup.pickupItemCount
-                )
+                val takePacket = if (pickup.showTakeAnimation && pickup.pickupItemCount > 0) {
+                    PlayPackets.takeItemEntityPacket(
+                        collectedEntityId = pickup.entityId,
+                        collectorEntityId = pickup.collectorEntityId,
+                        pickupItemCount = pickup.pickupItemCount
+                    )
+                } else {
+                    null
+                }
                 val removePacket = PlayPackets.removeEntitiesPacket(intArrayOf(pickup.entityId))
                 for (session in worldSessions) {
                     val isCollector = session.entityId == pickup.collectorEntityId
@@ -3379,7 +3591,7 @@ private data class PlayerItemTextMeta(
                     session.droppedItemTrackerStates.remove(pickup.entityId)
                     val ctx = contexts[session.channelId] ?: continue
                     if (!ctx.channel().isActive) continue
-                    if (isCollector || wasVisible || inLoadedChunk) {
+                    if (takePacket != null && (isCollector || wasVisible || inLoadedChunk)) {
                         enqueueDroppedItemPacket(outboundByContext, ctx, takePacket)
                     }
                     enqueueDroppedItemPacket(outboundByContext, ctx, removePacket)
@@ -6831,8 +7043,7 @@ private data class PlayerItemTextMeta(
 
     private fun respawnPlayer(session: PlayerSession) {
         val world = WorldManager.world(session.worldKey) ?: WorldManager.defaultWorld()
-        val spawn = FoliaSidecarSpawnPointProvider.spawnPointFor(world.key)
-            ?: world.spawnPointForPlayer(session.profile.uuid)
+        val spawn = world.spawnPointForPlayer(session.profile.uuid)
         val ctx = contexts[session.channelId]
         dismountPlayerFromAnimal(session)
         session.dead = false
@@ -7224,9 +7435,15 @@ private data class PlayerItemTextMeta(
             when (existing.openContainerType) {
                 CONTAINER_TYPE_CRAFTING_TABLE -> closeCraftingTable(existing)
                 CONTAINER_TYPE_FURNACE -> closeFurnace(existing)
+                CONTAINER_TYPE_CHEST, CONTAINER_TYPE_ENDER_CHEST -> closeChestLike(existing)
             }
         }
         val removed = sessions.remove(channelId) ?: return
+        runCatching {
+            VanillaAnvilWorldSaver.savePlayerData(playerPersistenceSnapshot(removed))
+        }.onFailure { throwable ->
+            logger.warn("Failed to persist player data on disconnect: uuid={}", removed.profile.uuid, throwable)
+        }
         contexts.remove(channelId)
         channelFlushStates.remove(channelId)
         itemTextMetaByPlayerUuid.remove(removed.profile.uuid)
@@ -8760,6 +8977,11 @@ private data class PlayerItemTextMeta(
             resyncContainerForSession(session, containerId)
             return
         }
+        if (clickType == CLICK_TYPE_CLONE) {
+            handleCreativeCloneClick(session, containerId, slot)
+            resyncContainerForSession(session, containerId)
+            return
+        }
         // Support vanilla pickup clicks only; other modes are safely ignored with a full resync.
         if (clickType != CLICK_TYPE_PICKUP) {
             resyncContainerForSession(session, containerId)
@@ -8778,12 +9000,23 @@ private data class PlayerItemTextMeta(
                 handleFurnacePickupClick(session, containerId, slot, button)
                 resyncContainerForSession(session, containerId)
             }
+            session.openContainerType == CONTAINER_TYPE_CHEST && session.openContainerId == containerId -> {
+                handleChestLikePickupClick(session, slot, button, enderChest = false)
+                resyncContainerForSession(session, containerId)
+            }
+            session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && session.openContainerId == containerId -> {
+                handleChestLikePickupClick(session, slot, button, enderChest = true)
+                resyncContainerForSession(session, containerId)
+            }
             else -> {
                 // stale container id from client
                 resyncContainerForSession(
                     session,
                     when (session.openContainerType) {
-                        CONTAINER_TYPE_CRAFTING_TABLE, CONTAINER_TYPE_FURNACE -> session.openContainerId
+                        CONTAINER_TYPE_CRAFTING_TABLE,
+                        CONTAINER_TYPE_FURNACE,
+                        CONTAINER_TYPE_CHEST,
+                        CONTAINER_TYPE_ENDER_CHEST -> session.openContainerId
                         else -> PLAYER_INVENTORY_CONTAINER_ID
                     }
                 )
@@ -8920,6 +9153,24 @@ private data class PlayerItemTextMeta(
                 session.selectedBlockStateId = if (session.hotbarItemCounts[hotbar] > 0) session.hotbarBlockStateIds[hotbar] else 0
                 broadcastHeldItemEquipment(session)
             }
+            return
+        }
+        if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+            val ranges = chestContainerRanges(session)
+            if (slot !in ranges.playerHotbar) return
+            val hotbar = slot - ranges.playerHotbar.first
+            if (hotbar == session.selectedHotbarSlot) {
+                session.selectedBlockStateId = if (session.hotbarItemCounts[hotbar] > 0) session.hotbarBlockStateIds[hotbar] else 0
+                broadcastHeldItemEquipment(session)
+            }
+            return
+        }
+        if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId && slot in ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE) {
+            val hotbar = slot - ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.first
+            if (hotbar == session.selectedHotbarSlot) {
+                session.selectedBlockStateId = if (session.hotbarItemCounts[hotbar] > 0) session.hotbarBlockStateIds[hotbar] else 0
+                broadcastHeldItemEquipment(session)
+            }
         }
     }
 
@@ -8951,6 +9202,23 @@ private data class PlayerItemTextMeta(
                     accessor.first.invoke()
                 }
             }
+        }
+        if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+            val ranges = chestContainerRanges(session)
+            if (slot in ranges.storage) {
+                return readOpenChestStorageSlot(session, slot - ranges.storage.first)
+            }
+            val accessor = inventorySlotAccessorForChest(session, slot) ?: return null
+            return accessor.first.invoke()
+        }
+        if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId) {
+            val enderChest = enderChestStateFor(session)
+            if (slot in ENDER_CHEST_STORAGE_SLOT_RANGE) {
+                val idx = slot - ENDER_CHEST_STORAGE_SLOT_RANGE.first
+                return enderChest.itemIds[idx] to enderChest.itemCounts[idx]
+            }
+            val accessor = inventorySlotAccessorForEnderChest(session, slot) ?: return null
+            return accessor.first.invoke()
         }
         return null
     }
@@ -9010,6 +9278,26 @@ private data class PlayerItemTextMeta(
             }
             return
         }
+        if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+            val ranges = chestContainerRanges(session)
+            if (slot in ranges.storage) {
+                writeOpenChestStorageSlot(session, slot - ranges.storage.first, itemId, count)
+                return
+            }
+            val accessor = inventorySlotAccessorForChest(session, slot) ?: return
+            accessor.second.invoke(itemId, count)
+            return
+        }
+        if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId) {
+            val enderChest = enderChestStateFor(session)
+            if (slot in ENDER_CHEST_STORAGE_SLOT_RANGE) {
+                writeEnderChestSlot(enderChest, slot - ENDER_CHEST_STORAGE_SLOT_RANGE.first, itemId, count)
+                return
+            }
+            val accessor = inventorySlotAccessorForEnderChest(session, slot) ?: return
+            accessor.second.invoke(itemId, count)
+            return
+        }
     }
 
     private fun inventorySlotAccessorForTable(
@@ -9040,10 +9328,42 @@ private data class PlayerItemTextMeta(
         return inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
     }
 
+    private fun inventorySlotAccessorForChest(
+        session: PlayerSession,
+        slot: Int
+    ): Pair<() -> Pair<Int, Int>, (Int, Int) -> Unit>? {
+        val ranges = chestContainerRanges(session)
+        val mapped = when (slot) {
+            in ranges.playerMain -> slot - ranges.playerMain.first
+            in ranges.playerHotbar -> 27 + (slot - ranges.playerHotbar.first)
+            else -> -1
+        }
+        if (mapped !in 0..35) return null
+        val inventorySlot = if (mapped < 27) inventorySlotForMainInventoryIndex(mapped) else 36 + (mapped - 27)
+        return inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
+    }
+
+    private fun inventorySlotAccessorForEnderChest(
+        session: PlayerSession,
+        slot: Int
+    ): Pair<() -> Pair<Int, Int>, (Int, Int) -> Unit>? {
+        val mapped = when (slot) {
+            in ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE -> slot - ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE.first
+            in ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE -> 27 + (slot - ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.first)
+            else -> -1
+        }
+        if (mapped !in 0..35) return null
+        val inventorySlot = if (mapped < 27) inventorySlotForMainInventoryIndex(mapped) else 36 + (mapped - 27)
+        return inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
+    }
+
     private fun isQuickCraftContainerValid(session: PlayerSession, containerId: Int): Boolean {
         if (containerId == PLAYER_INVENTORY_CONTAINER_ID) return true
         return when (session.openContainerType) {
-            CONTAINER_TYPE_CRAFTING_TABLE, CONTAINER_TYPE_FURNACE -> containerId == session.openContainerId
+            CONTAINER_TYPE_CRAFTING_TABLE,
+            CONTAINER_TYPE_FURNACE,
+            CONTAINER_TYPE_CHEST,
+            CONTAINER_TYPE_ENDER_CHEST -> containerId == session.openContainerId
             else -> false
         }
     }
@@ -9063,6 +9383,14 @@ private data class PlayerItemTextMeta(
                 FURNACE_RESULT_SLOT -> false
                 else -> inventorySlotAccessorForFurnace(session, slot) != null
             }
+        }
+        if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+            if (slot in chestContainerRanges(session).storage) return true
+            return inventorySlotAccessorForChest(session, slot) != null
+        }
+        if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId) {
+            if (slot in ENDER_CHEST_STORAGE_SLOT_RANGE) return true
+            return inventorySlotAccessorForEnderChest(session, slot) != null
         }
         return false
     }
@@ -9125,6 +9453,15 @@ private data class PlayerItemTextMeta(
         session.cursorItemCount = nextCursorCount
     }
 
+    private fun handleCreativeCloneClick(session: PlayerSession, containerId: Int, slot: Int) {
+        if (session.gameMode != GAME_MODE_CREATIVE) return
+        if (isResultSlot(containerId, session, slot)) return
+        val (itemId, count) = readContainerSlot(session, containerId, slot) ?: return
+        if (itemId < 0 || count <= 0) return
+        session.cursorItemId = itemId
+        session.cursorItemCount = itemMaxStackSize(itemId).coerceAtLeast(1)
+    }
+
     private fun pickupAllCandidateSlots(session: PlayerSession, containerId: Int): List<Int> {
         return if (containerId == PLAYER_INVENTORY_CONTAINER_ID) {
             buildList(40) {
@@ -9145,6 +9482,19 @@ private data class PlayerItemTextMeta(
                 addAll(TABLE_CRAFT_INPUT_SLOT_RANGE)
                 addAll(TABLE_PLAYER_MAIN_SLOT_RANGE)
                 addAll(TABLE_PLAYER_HOTBAR_SLOT_RANGE)
+            }
+        } else if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+            val ranges = chestContainerRanges(session)
+            buildList(ranges.storage.count() + 36) {
+                addAll(ranges.storage)
+                addAll(ranges.playerMain)
+                addAll(ranges.playerHotbar)
+            }
+        } else if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId) {
+            buildList(63) {
+                addAll(ENDER_CHEST_STORAGE_SLOT_RANGE)
+                addAll(ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE)
+                addAll(ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE)
             }
         } else {
             emptyList()
@@ -9169,6 +9519,10 @@ private data class PlayerItemTextMeta(
             else -> {
                 if (session.openContainerType == CONTAINER_TYPE_FURNACE && containerId == session.openContainerId) {
                     quickMoveWithinFurnace(session, containerId, slot)
+                } else if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+                    quickMoveWithinChestLike(session, containerId, slot, enderChest = false)
+                } else if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId) {
+                    quickMoveWithinChestLike(session, containerId, slot, enderChest = true)
                 } else if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE && containerId == session.openContainerId) {
                     quickMoveWithinCraftingTable(session, containerId, slot)
                 } else {
@@ -9394,6 +9748,22 @@ private data class PlayerItemTextMeta(
         if (!moved) return
     }
 
+    private fun quickMoveWithinChestLike(session: PlayerSession, containerId: Int, slot: Int, enderChest: Boolean) {
+        val ranges = if (enderChest) {
+            ChestContainerRanges(ENDER_CHEST_STORAGE_SLOT_RANGE, ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE, ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE)
+        } else {
+            chestContainerRanges(session)
+        }
+        val storageRange = ranges.storage
+        val playerMainRange = ranges.playerMain
+        val playerHotbarRange = ranges.playerHotbar
+        if (slot !in storageRange && slot !in playerMainRange && slot !in playerHotbarRange) {
+            quickMoveSingleStack(session, containerId, slot)
+            return
+        }
+        quickMoveSingleStack(session, containerId, slot)
+    }
+
     private fun quickMoveAllMatchingFromSlot(
         session: PlayerSession,
         containerId: Int,
@@ -9493,6 +9863,23 @@ private data class PlayerItemTextMeta(
                 else -> emptyList()
             }
         }
+        if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+            val ranges = chestContainerRanges(session)
+            return when (slot) {
+                in ranges.playerMain -> ranges.playerMain.toList()
+                in ranges.playerHotbar -> ranges.playerHotbar.toList()
+                in ranges.storage -> ranges.storage.toList()
+                else -> emptyList()
+            }
+        }
+        if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId) {
+            return when (slot) {
+                in ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE -> ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE.toList()
+                in ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE -> ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.toList()
+                in ENDER_CHEST_STORAGE_SLOT_RANGE -> ENDER_CHEST_STORAGE_SLOT_RANGE.toList()
+                else -> emptyList()
+            }
+        }
         return when (slot) {
             in TABLE_PLAYER_MAIN_SLOT_RANGE -> TABLE_PLAYER_MAIN_SLOT_RANGE.toList()
             in TABLE_PLAYER_HOTBAR_SLOT_RANGE -> TABLE_PLAYER_HOTBAR_SLOT_RANGE.toList()
@@ -9528,6 +9915,23 @@ private data class PlayerItemTextMeta(
                     FURNACE_PLAYER_MAIN_SLOT_RANGE.toList() + FURNACE_PLAYER_HOTBAR_SLOT_RANGE.toList()
                 in FURNACE_PLAYER_MAIN_SLOT_RANGE -> FURNACE_PLAYER_HOTBAR_SLOT_RANGE.toList()
                 in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> FURNACE_PLAYER_MAIN_SLOT_RANGE.toList()
+                else -> emptyList()
+            }
+        }
+        if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+            val ranges = chestContainerRanges(session)
+            return when (slot) {
+                in ranges.storage -> ranges.playerMain.toList() + ranges.playerHotbar.toList()
+                in ranges.playerMain -> ranges.storage.toList()
+                in ranges.playerHotbar -> ranges.storage.toList()
+                else -> emptyList()
+            }
+        }
+        if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId) {
+            return when (slot) {
+                in ENDER_CHEST_STORAGE_SLOT_RANGE -> ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE.toList() + ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.toList()
+                in ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE -> ENDER_CHEST_STORAGE_SLOT_RANGE.toList()
+                in ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE -> ENDER_CHEST_STORAGE_SLOT_RANGE.toList()
                 else -> emptyList()
             }
         }
@@ -9673,6 +10077,12 @@ private data class PlayerItemTextMeta(
     }
 
     private fun hotbarIndexForContainerSlot(session: PlayerSession, containerId: Int, slot: Int): Int? {
+        if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
+            val hotbarRange = chestContainerRanges(session).playerHotbar
+            if (slot in hotbarRange) {
+                return slot - hotbarRange.first
+            }
+        }
         return when {
             containerId == PLAYER_INVENTORY_CONTAINER_ID && slot in 36..44 -> slot - 36
             session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE &&
@@ -9681,6 +10091,9 @@ private data class PlayerItemTextMeta(
             session.openContainerType == CONTAINER_TYPE_FURNACE &&
                 containerId == session.openContainerId &&
                 slot in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> slot - FURNACE_PLAYER_HOTBAR_SLOT_RANGE.first
+            session.openContainerType == CONTAINER_TYPE_ENDER_CHEST &&
+                containerId == session.openContainerId &&
+                slot in ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE -> slot - ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.first
             else -> null
         }
     }
@@ -9750,6 +10163,7 @@ private data class PlayerItemTextMeta(
         when (session.openContainerType) {
             CONTAINER_TYPE_CRAFTING_TABLE -> closeCraftingTable(session)
             CONTAINER_TYPE_FURNACE -> closeFurnace(session)
+            CONTAINER_TYPE_CHEST, CONTAINER_TYPE_ENDER_CHEST -> closeChestLike(session)
         }
     }
 
@@ -9844,13 +10258,52 @@ private data class PlayerItemTextMeta(
         onContainerSlotMutated(session, containerId, slot)
     }
 
+    private fun handleChestLikePickupClick(session: PlayerSession, slot: Int, button: Int, enderChest: Boolean) {
+        if (button !in 0..1) return
+        val rightClick = button == 1
+        val storageRange = if (enderChest) ENDER_CHEST_STORAGE_SLOT_RANGE else chestContainerRanges(session).storage
+        if (slot in storageRange) {
+            if (enderChest) {
+                val chest = enderChestStateFor(session)
+                val index = slot - storageRange.first
+                pickupSwap(
+                    readSlot = { chest.itemIds[index] to chest.itemCounts[index] },
+                    writeSlot = { id, count -> writeEnderChestSlot(chest, index, id, count) },
+                    session = session,
+                    rightClick = rightClick
+                )
+            } else {
+                val index = slot - storageRange.first
+                if (readOpenChestStorageSlot(session, index) == null) return
+                pickupSwap(
+                    readSlot = { readOpenChestStorageSlot(session, index) ?: (-1 to 0) },
+                    writeSlot = { id, count -> writeOpenChestStorageSlot(session, index, id, count) },
+                    session = session,
+                    rightClick = rightClick
+                )
+            }
+            return
+        }
+        pickupInventorySlot(
+            session = session,
+            slot = slot,
+            rightClick = rightClick,
+            includeOffhand = false,
+            chestContainer = !enderChest,
+            enderChestContainer = enderChest
+        )
+        onContainerSlotMutated(session, session.openContainerId, slot)
+    }
+
     private fun pickupInventorySlot(
         session: PlayerSession,
         slot: Int,
         rightClick: Boolean,
         includeOffhand: Boolean,
         tableContainer: Boolean = false,
-        furnaceContainer: Boolean = false
+        furnaceContainer: Boolean = false,
+        chestContainer: Boolean = false,
+        enderChestContainer: Boolean = false
     ) {
         val read: (() -> Pair<Int, Int>)?
         val write: ((Int, Int) -> Unit)?
@@ -9873,6 +10326,37 @@ private data class PlayerItemTextMeta(
             val mapped = when (slot) {
                 in FURNACE_PLAYER_MAIN_SLOT_RANGE -> slot - FURNACE_PLAYER_MAIN_SLOT_RANGE.first
                 in FURNACE_PLAYER_HOTBAR_SLOT_RANGE -> 27 + (slot - FURNACE_PLAYER_HOTBAR_SLOT_RANGE.first)
+                else -> -1
+            }
+            if (mapped in 0..35) {
+                val inventorySlot = if (mapped < 27) inventorySlotForMainInventoryIndex(mapped) else 36 + (mapped - 27)
+                val pair = inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
+                read = pair?.first
+                write = pair?.second
+            } else {
+                read = null
+                write = null
+            }
+        } else if (chestContainer) {
+            val ranges = chestContainerRanges(session)
+            val mapped = when (slot) {
+                in ranges.playerMain -> slot - ranges.playerMain.first
+                in ranges.playerHotbar -> 27 + (slot - ranges.playerHotbar.first)
+                else -> -1
+            }
+            if (mapped in 0..35) {
+                val inventorySlot = if (mapped < 27) inventorySlotForMainInventoryIndex(mapped) else 36 + (mapped - 27)
+                val pair = inventorySlotAccessor(session, inventorySlot, includeOffhand = false)
+                read = pair?.first
+                write = pair?.second
+            } else {
+                read = null
+                write = null
+            }
+        } else if (enderChestContainer) {
+            val mapped = when (slot) {
+                in ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE -> slot - ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE.first
+                in ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE -> 27 + (slot - ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.first)
                 else -> -1
             }
             if (mapped in 0..35) {
@@ -10240,6 +10724,19 @@ private data class PlayerItemTextMeta(
                         }
                         ctx.flush()
                     }
+                    CONTAINER_TYPE_CHEST -> {
+                        resyncOpenChestViewers(session.worldKey, session.openChestX, session.openChestY, session.openChestZ)
+                    }
+                    CONTAINER_TYPE_ENDER_CHEST -> {
+                        ctx.writeAndFlush(
+                            PlayPackets.containerSetContentPacket(
+                                containerId = session.openContainerId,
+                                stateId = stateId,
+                                encodedItems = encodeEnderChestContainerItems(session),
+                                encodedCarried = encodeCursorStack(session)
+                            )
+                        )
+                    }
                 }
             }
         }
@@ -10251,6 +10748,34 @@ private data class PlayerItemTextMeta(
             if (session.openContainerType != CONTAINER_TYPE_FURNACE) continue
             if (session.openFurnaceX != key.x || session.openFurnaceY != key.y || session.openFurnaceZ != key.z) continue
             resyncContainerForSession(session, session.openContainerId)
+        }
+    }
+
+    private fun resyncOpenChestViewers(worldKey: String, x: Int, y: Int, z: Int) {
+        val world = WorldManager.world(worldKey) ?: return
+        val anchor = containerAnchorFor(world, CONTAINER_TYPE_CHEST, x, y, z)
+        for (viewer in sessions.values) {
+            if (viewer.worldKey != worldKey) continue
+            if (viewer.openContainerType != CONTAINER_TYPE_CHEST) continue
+            val viewerAnchor = containerAnchorFor(
+                world,
+                CONTAINER_TYPE_CHEST,
+                viewer.openChestX,
+                viewer.openChestY,
+                viewer.openChestZ
+            )
+            if (viewerAnchor != anchor) continue
+            val ctx = contexts[viewer.channelId] ?: continue
+            if (!ctx.channel().isActive) continue
+            val stateId = nextInventoryStateId(viewer)
+            ctx.writeAndFlush(
+                PlayPackets.containerSetContentPacket(
+                    containerId = viewer.openContainerId,
+                    stateId = stateId,
+                    encodedItems = encodeChestContainerItems(viewer),
+                    encodedCarried = encodeCursorStack(viewer)
+                )
+            )
         }
     }
 
@@ -10372,6 +10897,42 @@ private data class PlayerItemTextMeta(
         return out
     }
 
+    private fun encodeChestContainerItems(session: PlayerSession): List<ByteArray> {
+        val layout = openChestLayout(session)
+        val storageSlots = layout?.storageSlots ?: 27
+        val out = ArrayList<ByteArray>(storageSlots + 36)
+        for (i in 0 until storageSlots) {
+            val stack = readOpenChestStorageSlot(session, i)
+            val id = stack?.first ?: -1
+            val count = stack?.second ?: 0
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        for (main in 0 until 27) {
+            out.add(encodedMainSlot(session, main))
+        }
+        for (hotbar in 0 until 9) {
+            out.add(encodedHotbarSlot(session, hotbar))
+        }
+        return out
+    }
+
+    private fun encodeEnderChestContainerItems(session: PlayerSession): List<ByteArray> {
+        val enderChest = enderChestStateFor(session)
+        val out = ArrayList<ByteArray>(63)
+        for (i in 0 until 27) {
+            val id = enderChest.itemIds[i]
+            val count = enderChest.itemCounts[i]
+            out.add(if (id >= 0 && count > 0) encodedItemStack(id, count) else emptyItemStack())
+        }
+        for (main in 0 until 27) {
+            out.add(encodedMainSlot(session, main))
+        }
+        for (hotbar in 0 until 9) {
+            out.add(encodedHotbarSlot(session, hotbar))
+        }
+        return out
+    }
+
     private fun encodeCursorStack(session: PlayerSession): ByteArray {
         return if (session.cursorItemId >= 0 && session.cursorItemCount > 0) {
             encodedItemStack(session.cursorItemId, session.cursorItemCount)
@@ -10394,6 +10955,14 @@ private data class PlayerItemTextMeta(
     private fun secondsToMinecraftTicksInt(seconds: Double): Int {
         if (!seconds.isFinite() || seconds <= 0.0) return 0
         return (seconds * MINECRAFT_TICKS_PER_SECOND).toInt().coerceAtLeast(0).coerceAtMost(Short.MAX_VALUE.toInt())
+    }
+
+    private fun closeOpenContainer(session: PlayerSession) {
+        when (session.openContainerType) {
+            CONTAINER_TYPE_CRAFTING_TABLE -> closeCraftingTable(session)
+            CONTAINER_TYPE_FURNACE -> closeFurnace(session)
+            CONTAINER_TYPE_CHEST, CONTAINER_TYPE_ENDER_CHEST -> closeChestLike(session)
+        }
     }
 
     private fun closeCraftingTable(session: PlayerSession) {
@@ -10448,12 +11017,47 @@ private data class PlayerItemTextMeta(
         }
     }
 
-    private fun openCraftingTable(session: PlayerSession) {
-        if (session.openContainerType == CONTAINER_TYPE_FURNACE) {
-            closeFurnace(session)
-        } else if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE) {
-            closeCraftingTable(session)
+    private fun closeChestLike(session: PlayerSession) {
+        resetQuickCraftDrag(session)
+        val closingType = session.openContainerType
+        val closingWorldKey = session.worldKey
+        val closingX = session.openChestX
+        val closingY = session.openChestY
+        val closingZ = session.openChestZ
+        val viewersBeforeClose = if (closingType == CONTAINER_TYPE_CHEST || closingType == CONTAINER_TYPE_ENDER_CHEST) {
+            countChestViewersAt(closingWorldKey, closingX, closingY, closingZ)
+        } else {
+            0
         }
+        val closingContainerId = session.openContainerId
+        session.openContainerType = CONTAINER_TYPE_PLAYER_INVENTORY
+        session.openContainerId = PLAYER_INVENTORY_CONTAINER_ID
+        session.openChestX = 0
+        session.openChestY = 0
+        session.openChestZ = 0
+        val ctx = contexts[session.channelId]
+        if (ctx != null && ctx.channel().isActive) {
+            val stateId = nextInventoryStateId(session)
+            ctx.write(PlayPackets.containerClosePacket(closingContainerId))
+            ctx.writeAndFlush(
+                PlayPackets.containerSetContentPacket(
+                    containerId = PLAYER_INVENTORY_CONTAINER_ID,
+                    stateId = stateId,
+                    encodedItems = encodePlayerInventoryContainerItems(session),
+                    encodedCarried = encodeCursorStack(session)
+                )
+            )
+        }
+        if ((closingType == CONTAINER_TYPE_CHEST || closingType == CONTAINER_TYPE_ENDER_CHEST) && closingY in -64..319) {
+            broadcastChestLidEvent(closingWorldKey, closingX, closingY, closingZ)
+            if (viewersBeforeClose == 1) {
+                broadcastChestOpenCloseSound(closingWorldKey, closingX, closingY, closingZ, opening = false, closingType)
+            }
+        }
+    }
+
+    private fun openCraftingTable(session: PlayerSession) {
+        closeOpenContainer(session)
         val ctx = contexts[session.channelId] ?: return
         if (!ctx.channel().isActive) return
         val containerId = session.nextContainerId
@@ -10479,11 +11083,7 @@ private data class PlayerItemTextMeta(
     }
 
     private fun openFurnace(session: PlayerSession, x: Int, y: Int, z: Int) {
-        if (session.openContainerType == CONTAINER_TYPE_CRAFTING_TABLE) {
-            closeCraftingTable(session)
-        } else if (session.openContainerType == CONTAINER_TYPE_FURNACE) {
-            closeFurnace(session)
-        }
+        closeOpenContainer(session)
         val ctx = contexts[session.channelId] ?: return
         if (!ctx.channel().isActive) return
         val containerId = session.nextContainerId
@@ -10523,6 +11123,79 @@ private data class PlayerItemTextMeta(
         ctx.flush()
     }
 
+    private fun openChest(session: PlayerSession, x: Int, y: Int, z: Int) {
+        closeOpenContainer(session)
+        val viewersBeforeOpen = countChestViewersAt(session.worldKey, x, y, z)
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        val containerId = session.nextContainerId
+        session.nextContainerId = (session.nextContainerId + 1).coerceAtMost(Int.MAX_VALUE)
+        session.openContainerId = containerId
+        session.openContainerType = CONTAINER_TYPE_CHEST
+        session.openChestX = x
+        session.openChestY = y
+        session.openChestZ = z
+        val menuTypeId = if ((openChestLayout(session)?.storageSlots ?: 27) > 27) {
+            generic9x6MenuTypeId
+        } else {
+            generic9x3MenuTypeId
+        }
+        val stateId = nextInventoryStateId(session)
+        ctx.write(
+            PlayPackets.openScreenPacket(
+                containerId = containerId,
+                menuTypeId = menuTypeId,
+                title = PlayPackets.ChatComponent.Translate("container.chest")
+            )
+        )
+        ctx.writeAndFlush(
+            PlayPackets.containerSetContentPacket(
+                containerId = containerId,
+                stateId = stateId,
+                encodedItems = encodeChestContainerItems(session),
+                encodedCarried = encodeCursorStack(session)
+            )
+        )
+        broadcastChestLidEvent(session.worldKey, x, y, z)
+        if (viewersBeforeOpen == 0) {
+            broadcastChestOpenCloseSound(session.worldKey, x, y, z, opening = true, openedContainerType = CONTAINER_TYPE_CHEST)
+        }
+    }
+
+    private fun openEnderChest(session: PlayerSession, x: Int, y: Int, z: Int) {
+        closeOpenContainer(session)
+        val viewersBeforeOpen = countChestViewersAt(session.worldKey, x, y, z)
+        val ctx = contexts[session.channelId] ?: return
+        if (!ctx.channel().isActive) return
+        val containerId = session.nextContainerId
+        session.nextContainerId = (session.nextContainerId + 1).coerceAtMost(Int.MAX_VALUE)
+        session.openContainerId = containerId
+        session.openContainerType = CONTAINER_TYPE_ENDER_CHEST
+        session.openChestX = x
+        session.openChestY = y
+        session.openChestZ = z
+        val stateId = nextInventoryStateId(session)
+        ctx.write(
+            PlayPackets.openScreenPacket(
+                containerId = containerId,
+                menuTypeId = generic9x3MenuTypeId,
+                title = PlayPackets.ChatComponent.Translate("container.enderchest")
+            )
+        )
+        ctx.writeAndFlush(
+            PlayPackets.containerSetContentPacket(
+                containerId = containerId,
+                stateId = stateId,
+                encodedItems = encodeEnderChestContainerItems(session),
+                encodedCarried = encodeCursorStack(session)
+            )
+        )
+        broadcastChestLidEvent(session.worldKey, x, y, z)
+        if (viewersBeforeOpen == 0) {
+            broadcastChestOpenCloseSound(session.worldKey, x, y, z, opening = true, openedContainerType = CONTAINER_TYPE_ENDER_CHEST)
+        }
+    }
+
     private fun isCraftingTableState(stateId: Int): Boolean {
         if (stateId <= 0) return false
         val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
@@ -10533,6 +11206,18 @@ private data class PlayerItemTextMeta(
         if (stateId <= 0) return false
         val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
         return parsed.blockKey == "minecraft:furnace"
+    }
+
+    private fun isChestState(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        return parsed.blockKey == "minecraft:chest" || parsed.blockKey == "minecraft:trapped_chest"
+    }
+
+    private fun isEnderChestState(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
+        return parsed.blockKey == "minecraft:ender_chest"
     }
 
     private fun createDetachedFurnaceState(): FurnaceState {
@@ -10551,6 +11236,20 @@ private data class PlayerItemTextMeta(
         )
     }
 
+    private fun createDetachedChestState(): ChestState {
+        return ChestState(
+            itemIds = IntArray(27) { -1 },
+            itemCounts = IntArray(27) { 0 }
+        )
+    }
+
+    private fun createDetachedEnderChestState(): EnderChestState {
+        return EnderChestState(
+            itemIds = IntArray(27) { -1 },
+            itemCounts = IntArray(27) { 0 }
+        )
+    }
+
     private fun openFurnaceState(session: PlayerSession): FurnaceState? {
         if (session.openContainerType != CONTAINER_TYPE_FURNACE) return null
         val key = FurnaceKey(
@@ -10565,6 +11264,395 @@ private data class PlayerItemTextMeta(
     private fun furnaceStateAt(worldKey: String, x: Int, y: Int, z: Int): FurnaceState {
         val key = FurnaceKey(worldKey, x, y, z)
         return furnaceStates.computeIfAbsent(key) { createDetachedFurnaceState() }
+    }
+
+    private fun openChestState(session: PlayerSession): ChestState? {
+        if (session.openContainerType != CONTAINER_TYPE_CHEST) return null
+        val key = ChestKey(
+            worldKey = session.worldKey,
+            x = session.openChestX,
+            y = session.openChestY,
+            z = session.openChestZ
+        )
+        return chestStates.computeIfAbsent(key) { createDetachedChestState() }
+    }
+
+    private fun chestStateAt(worldKey: String, x: Int, y: Int, z: Int): ChestState {
+        val key = ChestKey(worldKey, x, y, z)
+        return chestStates.computeIfAbsent(key) { createDetachedChestState() }
+    }
+
+    private fun openChestLayout(session: PlayerSession): ChestContainerLayout? {
+        if (session.openContainerType != CONTAINER_TYPE_CHEST) return null
+        val world = WorldManager.world(session.worldKey) ?: return null
+        val anchor = containerAnchorFor(
+            world = world,
+            containerType = CONTAINER_TYPE_CHEST,
+            x = session.openChestX,
+            y = session.openChestY,
+            z = session.openChestZ
+        )
+        val primaryKey = ChestKey(session.worldKey, anchor.x, anchor.y, anchor.z)
+        val anchorStateId = world.blockStateAt(anchor.x, anchor.y, anchor.z)
+        val partner = doubleChestPartnerPos(world, anchor.x, anchor.y, anchor.z, anchorStateId)
+        return if (partner != null) {
+            ChestContainerLayout(
+                storageSlots = 54,
+                primaryKey = primaryKey,
+                secondaryKey = ChestKey(session.worldKey, partner.x, partner.y, partner.z)
+            )
+        } else {
+            ChestContainerLayout(
+                storageSlots = 27,
+                primaryKey = primaryKey,
+                secondaryKey = null
+            )
+        }
+    }
+
+    private fun chestContainerRanges(session: PlayerSession): ChestContainerRanges {
+        val storageSlots = openChestLayout(session)?.storageSlots ?: 27
+        val storageStart = 0
+        val playerMainStart = storageStart + storageSlots
+        val playerHotbarStart = playerMainStart + 27
+        return ChestContainerRanges(
+            storage = storageStart..(playerMainStart - 1),
+            playerMain = playerMainStart..(playerHotbarStart - 1),
+            playerHotbar = playerHotbarStart..(playerHotbarStart + 8)
+        )
+    }
+
+    private fun readOpenChestStorageSlot(session: PlayerSession, slotIndex: Int): Pair<Int, Int>? {
+        val layout = openChestLayout(session) ?: return null
+        if (slotIndex !in 0 until layout.storageSlots) return null
+        return if (slotIndex < 27) {
+            val chest = chestStates.computeIfAbsent(layout.primaryKey) { createDetachedChestState() }
+            chest.itemIds[slotIndex] to chest.itemCounts[slotIndex]
+        } else {
+            val secondaryKey = layout.secondaryKey ?: return null
+            val chest = chestStates.computeIfAbsent(secondaryKey) { createDetachedChestState() }
+            val index = slotIndex - 27
+            chest.itemIds[index] to chest.itemCounts[index]
+        }
+    }
+
+    private fun writeOpenChestStorageSlot(session: PlayerSession, slotIndex: Int, itemId: Int, count: Int): Boolean {
+        val layout = openChestLayout(session) ?: return false
+        if (slotIndex !in 0 until layout.storageSlots) return false
+        if (slotIndex < 27) {
+            val chest = chestStates.computeIfAbsent(layout.primaryKey) { createDetachedChestState() }
+            if (writeChestSlot(chest, slotIndex, itemId, count)) {
+                markChestChunkDirty(layout.primaryKey.worldKey, layout.primaryKey.x, layout.primaryKey.z)
+            }
+            return true
+        }
+        val secondaryKey = layout.secondaryKey ?: return false
+        val chest = chestStates.computeIfAbsent(secondaryKey) { createDetachedChestState() }
+        if (writeChestSlot(chest, slotIndex - 27, itemId, count)) {
+            markChestChunkDirty(secondaryKey.worldKey, secondaryKey.x, secondaryKey.z)
+        }
+        return true
+    }
+
+    private fun enderChestStateFor(session: PlayerSession): EnderChestState {
+        return enderChestStates.computeIfAbsent(session.profile.uuid) { createDetachedEnderChestState() }
+    }
+
+    private fun writeChestSlot(chest: ChestState, slot: Int, itemId: Int, count: Int): Boolean {
+        if (slot !in 0..26) return false
+        val nextId: Int
+        val nextCount: Int
+        if (itemId >= 0 && count > 0) {
+            nextId = itemId
+            nextCount = count.coerceAtMost(MAX_HOTBAR_STACK_SIZE)
+        } else {
+            nextId = -1
+            nextCount = 0
+        }
+        if (chest.itemIds[slot] == nextId && chest.itemCounts[slot] == nextCount) {
+            return false
+        }
+        chest.itemIds[slot] = nextId
+        chest.itemCounts[slot] = nextCount
+        return true
+    }
+
+    private fun appendChestDrops(out: MutableList<org.macaroon3145.world.VanillaDrop>, chest: ChestState) {
+        for (i in chest.itemIds.indices) {
+            val itemId = chest.itemIds[i]
+            val count = chest.itemCounts[i]
+            if (itemId >= 0 && count > 0) {
+                out.add(org.macaroon3145.world.VanillaDrop(itemId, count))
+            }
+        }
+    }
+
+    private fun copyChestState(source: ChestState): ChestState {
+        return ChestState(
+            itemIds = source.itemIds.copyOf(),
+            itemCounts = source.itemCounts.copyOf()
+        )
+    }
+
+    private fun chestHasAnyItems(chest: ChestState): Boolean {
+        for (i in chest.itemIds.indices) {
+            if (chest.itemIds[i] >= 0 && chest.itemCounts[i] > 0) return true
+        }
+        return false
+    }
+
+    private fun normalizeChestStateOrderAfterMerge(
+        worldKey: String,
+        placedX: Int,
+        placedY: Int,
+        placedZ: Int,
+        existingX: Int,
+        existingY: Int,
+        existingZ: Int
+    ) {
+        val world = WorldManager.world(worldKey) ?: return
+        val primary = containerAnchorFor(world, CONTAINER_TYPE_CHEST, placedX, placedY, placedZ)
+        val secondaryPos =
+            if (primary.x == placedX && primary.y == placedY && primary.z == placedZ) {
+                BlockPos(existingX, existingY, existingZ)
+            } else {
+                BlockPos(placedX, placedY, placedZ)
+            }
+        val primaryKey = ChestKey(worldKey, primary.x, primary.y, primary.z)
+        val secondaryKey = ChestKey(worldKey, secondaryPos.x, secondaryPos.y, secondaryPos.z)
+        val primaryState = chestStates.computeIfAbsent(primaryKey) { createDetachedChestState() }
+        val secondaryState = chestStates.computeIfAbsent(secondaryKey) { createDetachedChestState() }
+        if (chestHasAnyItems(primaryState)) return
+        if (!chestHasAnyItems(secondaryState)) return
+        chestStates[primaryKey] = copyChestState(secondaryState)
+        chestStates[secondaryKey] = copyChestState(primaryState)
+    }
+
+    private fun writeEnderChestSlot(enderChest: EnderChestState, slot: Int, itemId: Int, count: Int) {
+        if (slot !in 0..26) return
+        if (itemId >= 0 && count > 0) {
+            enderChest.itemIds[slot] = itemId
+            enderChest.itemCounts[slot] = count.coerceAtMost(MAX_HOTBAR_STACK_SIZE)
+        } else {
+            enderChest.itemIds[slot] = -1
+            enderChest.itemCounts[slot] = 0
+        }
+    }
+
+    private fun markChestChunkDirty(worldKey: String, x: Int, z: Int) {
+        dirtyChestChunksByWorld
+            .computeIfAbsent(worldKey) { ConcurrentHashMap.newKeySet() }
+            .add(ChunkPos(x shr 4, z shr 4))
+    }
+
+    private fun broadcastChestLidEvent(worldKey: String, x: Int, y: Int, z: Int) {
+        val world = WorldManager.world(worldKey) ?: return
+        val positions = chestLidBroadcastPositions(world, x, y, z)
+        if (positions.isEmpty()) return
+        for ((px, py, pz) in positions) {
+            val packet = chestLidPacketAt(world, worldKey, px, py, pz) ?: continue
+            val chunk = ChunkPos(px shr 4, pz shr 4)
+            for ((id, other) in sessions) {
+                if (other.worldKey != worldKey) continue
+                if (!other.loadedChunks.contains(chunk)) continue
+                val ctx = contexts[id] ?: continue
+                if (!ctx.channel().isActive) continue
+                ctx.write(packet)
+                ctx.flush()
+            }
+        }
+    }
+
+    private fun countChestViewersAt(worldKey: String, x: Int, y: Int, z: Int): Int {
+        val world = WorldManager.world(worldKey) ?: return 0
+        val queryStateId = world.blockStateAt(x, y, z)
+        val queryContainerType = when (BlockStateRegistry.parsedState(queryStateId)?.blockKey) {
+            "minecraft:ender_chest" -> CONTAINER_TYPE_ENDER_CHEST
+            "minecraft:chest", "minecraft:trapped_chest" -> CONTAINER_TYPE_CHEST
+            else -> CONTAINER_TYPE_CHEST
+        }
+        val queryAnchor = containerAnchorFor(world, queryContainerType, x, y, z)
+        return sessions.values.count { viewer ->
+            (viewer.openContainerType == CONTAINER_TYPE_CHEST || viewer.openContainerType == CONTAINER_TYPE_ENDER_CHEST) &&
+                viewer.worldKey == worldKey &&
+                viewer.openContainerType == queryContainerType &&
+                containerAnchorFor(world, viewer.openContainerType, viewer.openChestX, viewer.openChestY, viewer.openChestZ) == queryAnchor
+        }
+    }
+
+    private fun broadcastChestOpenCloseSound(
+        worldKey: String,
+        x: Int,
+        y: Int,
+        z: Int,
+        opening: Boolean,
+        openedContainerType: Int
+    ) {
+        val world = WorldManager.world(worldKey) ?: return
+        val blockKeyFromWorld = BlockStateRegistry.parsedState(world.blockStateAt(x, y, z))?.blockKey
+        val key = when {
+            blockKeyFromWorld == "minecraft:ender_chest" || openedContainerType == CONTAINER_TYPE_ENDER_CHEST ->
+                if (opening) "minecraft:block.ender_chest.open" else "minecraft:block.ender_chest.close"
+            blockKeyFromWorld == "minecraft:chest" || blockKeyFromWorld == "minecraft:trapped_chest" || openedContainerType == CONTAINER_TYPE_CHEST ->
+                if (opening) "minecraft:block.chest.open" else "minecraft:block.chest.close"
+            else -> null
+        } ?: return
+        val (soundX, soundY, soundZ) = chestSoundPosition(world, x, y, z, openedContainerType)
+        val packet = PlayPackets.soundPacketByKey(
+            soundKey = key,
+            soundSourceId = BLOCKS_SOUND_SOURCE_ID,
+            x = soundX,
+            y = soundY,
+            z = soundZ,
+            volume = 0.5f,
+            pitch = ThreadLocalRandom.current().nextFloat() * 0.1f + 0.9f,
+            seed = ThreadLocalRandom.current().nextLong()
+        )
+        val chunk = ChunkPos(x shr 4, z shr 4)
+        for ((id, other) in sessions) {
+            if (other.worldKey != worldKey) continue
+            if (!other.loadedChunks.contains(chunk)) continue
+            val ctx = contexts[id] ?: continue
+            if (!ctx.channel().isActive) continue
+            ctx.write(packet)
+            ctx.flush()
+        }
+    }
+
+    private fun chestSoundPosition(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        openedContainerType: Int
+    ): Triple<Double, Double, Double> {
+        if (openedContainerType != CONTAINER_TYPE_CHEST) {
+            return Triple(x + 0.5, y + 0.5, z + 0.5)
+        }
+        val stateId = world.blockStateAt(x, y, z)
+        val partner = doubleChestPartnerPos(world, x, y, z, stateId) ?: return Triple(x + 0.5, y + 0.5, z + 0.5)
+        val centerX = (x + partner.x) * 0.5 + 0.5
+        val centerZ = (z + partner.z) * 0.5 + 0.5
+        return Triple(centerX, y + 0.5, centerZ)
+    }
+
+    private fun resendChestLidEventsForChunkToSession(
+        session: PlayerSession,
+        ctx: ChannelHandlerContext,
+        world: org.macaroon3145.world.World,
+        chunkPos: ChunkPos
+    ) {
+        val seen = HashSet<Triple<Int, Int, Int>>()
+        for (viewer in sessions.values) {
+            if (viewer.worldKey != session.worldKey) continue
+            if (viewer.openContainerType != CONTAINER_TYPE_CHEST && viewer.openContainerType != CONTAINER_TYPE_ENDER_CHEST) continue
+            val positions = chestLidBroadcastPositions(world, viewer.openChestX, viewer.openChestY, viewer.openChestZ)
+            for ((px, py, pz) in positions) {
+                if ((px shr 4) != chunkPos.x || (pz shr 4) != chunkPos.z) continue
+                val key = Triple(px, py, pz)
+                if (!seen.add(key)) continue
+                val packet = chestLidPacketAt(world, session.worldKey, px, py, pz) ?: continue
+                ctx.write(packet)
+            }
+        }
+        if (seen.isNotEmpty()) {
+            ctx.flush()
+        }
+    }
+
+    private fun chestLidPacketAt(
+        world: org.macaroon3145.world.World,
+        worldKey: String,
+        x: Int,
+        y: Int,
+        z: Int
+    ): ByteArray? {
+        val stateId = world.blockStateAt(x, y, z)
+        val blockKey = BlockStateRegistry.parsedState(stateId)?.blockKey ?: return null
+        if (blockKey != "minecraft:chest" && blockKey != "minecraft:trapped_chest" && blockKey != "minecraft:ender_chest") {
+            return null
+        }
+        val blockId = itemIdByKey[blockKey] ?: return null
+        val viewers = countChestViewersAt(worldKey, x, y, z).coerceIn(0, 255)
+        return PlayPackets.blockActionPacket(
+            x = x,
+            y = y,
+            z = z,
+            actionId = 1,
+            actionParam = viewers,
+            blockId = blockId
+        )
+    }
+
+    private fun chestLidBroadcastPositions(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int
+    ): List<Triple<Int, Int, Int>> {
+        val stateId = world.blockStateAt(x, y, z)
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return emptyList()
+        if (parsed.blockKey == "minecraft:ender_chest") {
+            return listOf(Triple(x, y, z))
+        }
+        if (parsed.blockKey != "minecraft:chest" && parsed.blockKey != "minecraft:trapped_chest") {
+            return emptyList()
+        }
+        val partner = doubleChestPartnerPos(world, x, y, z, stateId)
+        return if (partner != null) {
+            listOf(Triple(x, y, z), Triple(partner.x, partner.y, partner.z))
+        } else {
+            listOf(Triple(x, y, z))
+        }
+    }
+
+    private fun containerAnchorFor(
+        world: org.macaroon3145.world.World,
+        containerType: Int,
+        x: Int,
+        y: Int,
+        z: Int
+    ): BlockPos {
+        if (containerType != CONTAINER_TYPE_CHEST) return BlockPos(x, y, z)
+        val stateId = world.blockStateAt(x, y, z)
+        val partner = doubleChestPartnerPos(world, x, y, z, stateId) ?: return BlockPos(x, y, z)
+        return if (x < partner.x || (x == partner.x && z <= partner.z)) {
+            BlockPos(x, y, z)
+        } else {
+            partner
+        }
+    }
+
+    private fun doubleChestPartnerPos(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int
+    ): BlockPos? {
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
+        if (parsed.blockKey != "minecraft:chest" && parsed.blockKey != "minecraft:trapped_chest") return null
+        val type = parsed.properties["type"] ?: return null
+        if (type == "single") return null
+        val facing = parsed.properties["facing"] ?: return null
+        val (forwardX, forwardZ) = horizontalFacingOffset(facing) ?: return null
+        val leftX = forwardZ
+        val leftZ = -forwardX
+        val rightX = -forwardZ
+        val rightZ = forwardX
+        val (dx, dz, expectedPartnerType) = when (type) {
+            "left" -> Triple(rightX, rightZ, "right")
+            "right" -> Triple(leftX, leftZ, "left")
+            else -> return null
+        }
+        val px = x + dx
+        val pz = z + dz
+        val partnerStateId = world.blockStateAt(px, y, pz)
+        val partnerParsed = BlockStateRegistry.parsedState(partnerStateId) ?: return null
+        if (partnerParsed.blockKey != parsed.blockKey) return null
+        if (partnerParsed.properties["facing"] != facing) return null
+        if (partnerParsed.properties["type"] != expectedPartnerType) return null
+        return BlockPos(px, y, pz)
     }
 
     private fun writeFurnaceSlot(furnace: FurnaceState, slot: Int, itemId: Int, count: Int) {
@@ -10630,6 +11718,14 @@ private data class PlayerItemTextMeta(
         val clickedStateId = world.blockStateAt(clickedX, clickedY, clickedZ)
         if (!session.sneaking && isFurnaceState(clickedStateId) && isChunkLoadedForSession(session, clickedX, clickedZ)) {
             openFurnace(session, clickedX, clickedY, clickedZ)
+            return
+        }
+        if (!session.sneaking && isChestState(clickedStateId) && isChunkLoadedForSession(session, clickedX, clickedZ)) {
+            openChest(session, clickedX, clickedY, clickedZ)
+            return
+        }
+        if (!session.sneaking && isEnderChestState(clickedStateId) && isChunkLoadedForSession(session, clickedX, clickedZ)) {
+            openEnderChest(session, clickedX, clickedY, clickedZ)
             return
         }
         if (!session.sneaking && isCraftingTableState(clickedStateId) && isChunkLoadedForSession(session, clickedX, clickedZ)) {
@@ -10769,7 +11865,7 @@ private data class PlayerItemTextMeta(
             }
             return
         }
-        val blockStateId = normalizePrimaryPlacementStateId(resolvePlacementState(
+        var blockStateId = normalizePrimaryPlacementStateId(resolvePlacementState(
             baseStateId = baseStateId,
             faceId = faceId,
             cursorX = cursorX,
@@ -10777,9 +11873,27 @@ private data class PlayerItemTextMeta(
             cursorZ = cursorZ,
             playerYaw = session.yaw
         ))
+        var chestMergeUpdate: LinkedBlockStateUpdate? = null
+        val chestMergePlacement = chestMergePlacementFor(
+            world = world,
+            x = x,
+            y = y,
+            z = z,
+            stateId = blockStateId,
+            clickedX = clickedX,
+            clickedY = clickedY,
+            clickedZ = clickedZ,
+            faceId = faceId,
+            sneaking = session.sneaking
+        )
+        if (chestMergePlacement != null) {
+            blockStateId = chestMergePlacement.placedStateId
+            chestMergeUpdate = chestMergePlacement.neighborUpdate
+        }
         val pairedPlacement = pairedPlacementFor(world, x, y, z, blockStateId)
         val targetStateBeforeEvent = targetStateAtPlacement
         var pairedStateBeforeEvent: Int? = null
+        var chestMergeStateBeforeEvent: Int? = null
         val logPlacementDebug = shouldLogPlacementDebug(blockStateId)
         if (logPlacementDebug) {
             logger.info(
@@ -10812,6 +11926,9 @@ private data class PlayerItemTextMeta(
                 return
             }
         }
+        if (chestMergeUpdate != null) {
+            chestMergeStateBeforeEvent = world.blockStateAt(chestMergeUpdate.x, chestMergeUpdate.y, chestMergeUpdate.z)
+        }
         if (!org.macaroon3145.plugin.PluginSystem.beforeBlockPlace(
                 session = session,
                 x = x,
@@ -10828,8 +11945,10 @@ private data class PlayerItemTextMeta(
         }
         val targetStateAfterEvent = world.blockStateAt(x, y, z)
         val pairedStateAfterEvent = pairedPlacement?.let { world.blockStateAt(it.x, it.y, it.z) }
+        val chestMergeStateAfterEvent = chestMergeUpdate?.let { world.blockStateAt(it.x, it.y, it.z) }
         val changedByPlugin = targetStateAfterEvent != targetStateBeforeEvent ||
-            (pairedPlacement != null && pairedStateAfterEvent != pairedStateBeforeEvent)
+            (pairedPlacement != null && pairedStateAfterEvent != pairedStateBeforeEvent) ||
+            (chestMergeUpdate != null && chestMergeStateAfterEvent != chestMergeStateBeforeEvent)
         if (changedByPlugin) {
             if (session.gameMode != GAME_MODE_CREATIVE) {
                 consumePlacedItem(session, hand)
@@ -10854,6 +11973,25 @@ private data class PlayerItemTextMeta(
                 z = pairedPlacement.z,
                 stateId = pairedPlacement.stateId,
                 reason = BlockChangeReason.PLAYER_PLACE
+            )
+        }
+        if (chestMergeUpdate != null) {
+            setBlockAndBroadcast(
+                session = session,
+                x = chestMergeUpdate.x,
+                y = chestMergeUpdate.y,
+                z = chestMergeUpdate.z,
+                stateId = chestMergeUpdate.stateId,
+                reason = BlockChangeReason.PLAYER_PLACE
+            )
+            normalizeChestStateOrderAfterMerge(
+                worldKey = session.worldKey,
+                placedX = x,
+                placedY = y,
+                placedZ = z,
+                existingX = chestMergeUpdate.x,
+                existingY = chestMergeUpdate.y,
+                existingZ = chestMergeUpdate.z
             )
         }
         if (logPlacementDebug) {
@@ -12463,6 +13601,17 @@ private data class PlayerItemTextMeta(
                     vz = removedSnapshot.vz,
                     pickupDelaySeconds = 0.0
                 )
+                removed.add(
+                    DroppedItemPickupResult(
+                        entityId = removedSnapshot.entityId,
+                        collectorEntityId = collector.entityId,
+                        pickupItemCount = 0,
+                        showTakeAnimation = false,
+                        x = removedSnapshot.x,
+                        y = removedSnapshot.y,
+                        z = removedSnapshot.z
+                    )
+                )
                 continue
             }
 
@@ -12471,6 +13620,7 @@ private data class PlayerItemTextMeta(
                     entityId = removedSnapshot.entityId,
                     collectorEntityId = collector.entityId,
                     pickupItemCount = removedSnapshot.itemCount,
+                    showTakeAnimation = true,
                     x = removedSnapshot.x,
                     y = removedSnapshot.y,
                     z = removedSnapshot.z
@@ -14425,8 +15575,9 @@ private data class PlayerItemTextMeta(
             resyncBlockToPlayer(session, x, y, z, oldStateId)
             return
         }
-        val furnaceInventoryDrops = maybeDropAndClearFurnaceInventory(world, x, y, z, oldStateId, stateId)
+        val containerInventoryDrops = maybeDropAndClearContainerInventory(world, x, y, z, oldStateId, stateId)
         world.setBlockState(x, y, z, stateId)
+        val chestNeighborNormalizeUpdate = normalizeRemainingDoubleChestAfterBreak(world, x, y, z, oldStateId, stateId)
         if (stateId != 0 && stateId != oldStateId) {
             world.requestDroppedItemUnstuckAtBlock(x, y, z)
         }
@@ -14440,9 +15591,9 @@ private data class PlayerItemTextMeta(
         } else {
             world.setBlockEntity(x, y, z, null)
         }
-        if (furnaceInventoryDrops.isNotEmpty()) {
-            // Spawn after block state change so dropped items don't get pushed upward out of the still-solid furnace.
-            spawnBrokenBlockDropsInWorld(world, x, y, z, furnaceInventoryDrops)
+        if (containerInventoryDrops.isNotEmpty()) {
+            // Spawn after block state change so dropped items don't get pushed upward out of the still-solid block.
+            spawnBrokenBlockDropsInWorld(world, x, y, z, containerInventoryDrops)
         }
         val chunk = ChunkPos(x shr 4, z shr 4)
         val packet = PlayPackets.blockChangePacket(x, y, z, stateId)
@@ -14483,6 +15634,22 @@ private data class PlayerItemTextMeta(
                 ctx.flush()
             }
         }
+        if (chestNeighborNormalizeUpdate != null) {
+            broadcastBlockChangeToLoadedPlayers(
+                worldKey = session.worldKey,
+                chunkPos = ChunkPos(chestNeighborNormalizeUpdate.x shr 4, chestNeighborNormalizeUpdate.z shr 4),
+                x = chestNeighborNormalizeUpdate.x,
+                y = chestNeighborNormalizeUpdate.y,
+                z = chestNeighborNormalizeUpdate.z,
+                stateId = chestNeighborNormalizeUpdate.stateId
+            )
+            broadcastChestLidEvent(
+                worldKey = session.worldKey,
+                x = chestNeighborNormalizeUpdate.x,
+                y = chestNeighborNormalizeUpdate.y,
+                z = chestNeighborNormalizeUpdate.z
+            )
+        }
         triggerFallingBlocksNear(session, world, x, y, z)
     }
 
@@ -14510,16 +15677,17 @@ private data class PlayerItemTextMeta(
         ) {
             return false
         }
-        val furnaceInventoryDrops = maybeDropAndClearFurnaceInventory(world, x, y, z, oldStateId, stateId)
+        val containerInventoryDrops = maybeDropAndClearContainerInventory(world, x, y, z, oldStateId, stateId)
         world.setBlockState(x, y, z, stateId)
+        val chestNeighborNormalizeUpdate = normalizeRemainingDoubleChestAfterBreak(world, x, y, z, oldStateId, stateId)
         if (stateId != 0 && stateId != oldStateId) {
             world.requestDroppedItemUnstuckAtBlock(x, y, z)
         }
         // Plugin-driven setType/setState does not carry block entity payload,
         // so clear existing block entity data to keep state consistent.
         world.setBlockEntity(x, y, z, null)
-        if (furnaceInventoryDrops.isNotEmpty()) {
-            spawnBrokenBlockDropsInWorld(world, x, y, z, furnaceInventoryDrops)
+        if (containerInventoryDrops.isNotEmpty()) {
+            spawnBrokenBlockDropsInWorld(world, x, y, z, containerInventoryDrops)
         }
         val chunk = ChunkPos(x shr 4, z shr 4)
         val packet = PlayPackets.blockChangePacket(x, y, z, stateId)
@@ -14534,10 +15702,26 @@ private data class PlayerItemTextMeta(
                 ctx.flush()
             }
         }
+        if (chestNeighborNormalizeUpdate != null) {
+            broadcastBlockChangeToLoadedPlayers(
+                worldKey = worldKey,
+                chunkPos = ChunkPos(chestNeighborNormalizeUpdate.x shr 4, chestNeighborNormalizeUpdate.z shr 4),
+                x = chestNeighborNormalizeUpdate.x,
+                y = chestNeighborNormalizeUpdate.y,
+                z = chestNeighborNormalizeUpdate.z,
+                stateId = chestNeighborNormalizeUpdate.stateId
+            )
+            broadcastChestLidEvent(
+                worldKey = worldKey,
+                x = chestNeighborNormalizeUpdate.x,
+                y = chestNeighborNormalizeUpdate.y,
+                z = chestNeighborNormalizeUpdate.z
+            )
+        }
         return true
     }
 
-    private fun maybeDropAndClearFurnaceInventory(
+    private fun maybeDropAndClearContainerInventory(
         world: org.macaroon3145.world.World,
         x: Int,
         y: Int,
@@ -14546,39 +15730,107 @@ private data class PlayerItemTextMeta(
         newStateId: Int
     ): List<org.macaroon3145.world.VanillaDrop> {
         if (oldStateId == newStateId) return emptyList()
-        if (!isFurnaceState(oldStateId)) return emptyList()
-        if (isFurnaceState(newStateId)) return emptyList()
+        val drops = ArrayList<org.macaroon3145.world.VanillaDrop>(8)
 
-        val key = FurnaceKey(world.key, x, y, z)
-        val removed = furnaceStates.remove(key) ?: return emptyList()
-        activeFurnaceKeys.remove(key)
-        activeFurnaceKeysByWorld[key.worldKey]?.let { set ->
-            set.remove(key)
-            if (set.isEmpty()) {
-                activeFurnaceKeysByWorld.remove(key.worldKey, set)
-            }
-        }
-        val drops = run {
-            ArrayList<org.macaroon3145.world.VanillaDrop>(3).apply {
+        if (isFurnaceState(oldStateId) && !isFurnaceState(newStateId)) {
+            val key = FurnaceKey(world.key, x, y, z)
+            val removed = furnaceStates.remove(key)
+            if (removed != null) {
+                activeFurnaceKeys.remove(key)
+                activeFurnaceKeysByWorld[key.worldKey]?.let { set ->
+                    set.remove(key)
+                    if (set.isEmpty()) {
+                        activeFurnaceKeysByWorld.remove(key.worldKey, set)
+                    }
+                }
                 if (removed.inputItemId >= 0 && removed.inputCount > 0) {
-                    add(org.macaroon3145.world.VanillaDrop(removed.inputItemId, removed.inputCount))
+                    drops.add(org.macaroon3145.world.VanillaDrop(removed.inputItemId, removed.inputCount))
                 }
                 if (removed.fuelItemId >= 0 && removed.fuelCount > 0) {
-                    add(org.macaroon3145.world.VanillaDrop(removed.fuelItemId, removed.fuelCount))
+                    drops.add(org.macaroon3145.world.VanillaDrop(removed.fuelItemId, removed.fuelCount))
                 }
                 if (removed.resultItemId >= 0 && removed.resultCount > 0) {
-                    add(org.macaroon3145.world.VanillaDrop(removed.resultItemId, removed.resultCount))
+                    drops.add(org.macaroon3145.world.VanillaDrop(removed.resultItemId, removed.resultCount))
+                }
+            }
+            for (viewer in sessions.values) {
+                if (viewer.worldKey != world.key) continue
+                if (viewer.openContainerType != CONTAINER_TYPE_FURNACE) continue
+                if (viewer.openFurnaceX != x || viewer.openFurnaceY != y || viewer.openFurnaceZ != z) continue
+                closeFurnace(viewer)
+            }
+        }
+
+        if (isChestState(oldStateId) && !isChestState(newStateId)) {
+            val partnerPos = doubleChestPartnerPos(world, x, y, z, oldStateId)
+            if (partnerPos != null) {
+                val brokenPos = BlockPos(x, y, z)
+                val anchor = if (x < partnerPos.x || (x == partnerPos.x && z <= partnerPos.z)) {
+                    brokenPos
+                } else {
+                    partnerPos
+                }
+                val secondary = if (anchor == brokenPos) partnerPos else brokenPos
+                val primaryKey = ChestKey(world.key, anchor.x, anchor.y, anchor.z)
+                val secondaryKey = ChestKey(world.key, secondary.x, secondary.y, secondary.z)
+                val survivingKey = ChestKey(world.key, partnerPos.x, partnerPos.y, partnerPos.z)
+
+                val primaryState = chestStates.remove(primaryKey) ?: createDetachedChestState()
+                val secondaryState = chestStates.remove(secondaryKey) ?: createDetachedChestState()
+                appendChestDrops(drops, secondaryState)
+                chestStates[survivingKey] = copyChestState(primaryState)
+
+                for (viewer in sessions.values) {
+                    if (viewer.worldKey != world.key) continue
+                    if (viewer.openContainerType != CONTAINER_TYPE_CHEST) continue
+                    val openPos = BlockPos(viewer.openChestX, viewer.openChestY, viewer.openChestZ)
+                    if (openPos != brokenPos && openPos != partnerPos) continue
+                    closeChestLike(viewer)
+                }
+            } else {
+                val key = ChestKey(world.key, x, y, z)
+                val removed = chestStates.remove(key)
+                if (removed != null) {
+                    appendChestDrops(drops, removed)
+                }
+                for (viewer in sessions.values) {
+                    if (viewer.worldKey != world.key) continue
+                    if (viewer.openContainerType != CONTAINER_TYPE_CHEST) continue
+                    if (viewer.openChestX != x || viewer.openChestY != y || viewer.openChestZ != z) continue
+                    closeChestLike(viewer)
                 }
             }
         }
 
-        for (viewer in sessions.values) {
-            if (viewer.worldKey != world.key) continue
-            if (viewer.openContainerType != CONTAINER_TYPE_FURNACE) continue
-            if (viewer.openFurnaceX != x || viewer.openFurnaceY != y || viewer.openFurnaceZ != z) continue
-            closeFurnace(viewer)
-        }
         return drops
+    }
+
+    private fun normalizeRemainingDoubleChestAfterBreak(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        oldStateId: Int,
+        newStateId: Int
+    ): LinkedBlockStateUpdate? {
+        if (!isChestState(oldStateId) || isChestState(newStateId)) return null
+        val partnerPos = doubleChestPartnerPos(world, x, y, z, oldStateId) ?: return null
+        val partnerStateId = world.blockStateAt(partnerPos.x, partnerPos.y, partnerPos.z)
+        val partnerParsed = BlockStateRegistry.parsedState(partnerStateId) ?: return null
+        if (partnerParsed.blockKey != "minecraft:chest" && partnerParsed.blockKey != "minecraft:trapped_chest") return null
+        if (partnerParsed.properties["type"] == "single") return null
+        val partnerProps = HashMap(partnerParsed.properties)
+        partnerProps["type"] = "single"
+        val singleStateId = BlockStateRegistry.stateId(partnerParsed.blockKey, partnerProps) ?: return null
+        if (singleStateId == partnerStateId) return null
+        world.setBlockState(partnerPos.x, partnerPos.y, partnerPos.z, singleStateId)
+        world.requestDroppedItemUnstuckAtBlock(partnerPos.x, partnerPos.y, partnerPos.z)
+        return LinkedBlockStateUpdate(
+            x = partnerPos.x,
+            y = partnerPos.y,
+            z = partnerPos.z,
+            stateId = singleStateId
+        )
     }
 
     private fun triggerFallingBlocksNear(session: PlayerSession, world: org.macaroon3145.world.World, x: Int, y: Int, z: Int) {
@@ -15543,6 +16795,18 @@ private data class PlayerItemTextMeta(
         val stateId: Int
     )
 
+    private data class LinkedBlockStateUpdate(
+        val x: Int,
+        val y: Int,
+        val z: Int,
+        val stateId: Int
+    )
+
+    private data class ChestMergePlacement(
+        val placedStateId: Int,
+        val neighborUpdate: LinkedBlockStateUpdate
+    )
+
     private fun pairedPlacementFor(
         world: org.macaroon3145.world.World,
         x: Int,
@@ -15570,6 +16834,173 @@ private data class PlayerItemTextMeta(
         }
 
         return null
+    }
+
+    private fun chestMergePlacementFor(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        stateId: Int,
+        clickedX: Int,
+        clickedY: Int,
+        clickedZ: Int,
+        faceId: Int,
+        sneaking: Boolean
+    ): ChestMergePlacement? {
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return null
+        if (parsed.blockKey != "minecraft:chest" && parsed.blockKey != "minecraft:trapped_chest") return null
+        if (parsed.properties["type"] != "single") return null
+        val facing = parsed.properties["facing"] ?: return null
+
+        if (sneaking) {
+            if (faceId !in 2..5) return null
+            if (clickedX == x && clickedY == y && clickedZ == z) return null
+            if (clickedY != y) return null
+            val clickedStateId = world.blockStateAt(clickedX, clickedY, clickedZ)
+            val clickedParsed = BlockStateRegistry.parsedState(clickedStateId) ?: return null
+            if (clickedParsed.blockKey != parsed.blockKey) return null
+            if (clickedParsed.properties["type"] != "single") return null
+
+            val requiredFacing = clickedParsed.properties["facing"] ?: return null
+            val (forwardX, forwardZ) = horizontalFacingOffset(requiredFacing) ?: return null
+            val leftX = forwardZ
+            val leftZ = -forwardX
+            val rightX = -forwardZ
+            val rightZ = forwardX
+            val relX = x - clickedX
+            val relZ = z - clickedZ
+
+            val (selfType, neighborType) = when {
+                relX == leftX && relZ == leftZ -> "left" to "right"
+                relX == rightX && relZ == rightZ -> "right" to "left"
+                else -> return null
+            }
+
+            val selfProps = HashMap(parsed.properties)
+            selfProps["facing"] = requiredFacing
+            selfProps["type"] = selfType
+            val placedStateId = BlockStateRegistry.stateId(parsed.blockKey, selfProps) ?: return null
+
+            val neighborProps = HashMap(clickedParsed.properties)
+            neighborProps["facing"] = requiredFacing
+            neighborProps["type"] = neighborType
+            val neighborStateId = BlockStateRegistry.stateId(parsed.blockKey, neighborProps) ?: return null
+
+            return ChestMergePlacement(
+                placedStateId = placedStateId,
+                neighborUpdate = LinkedBlockStateUpdate(
+                    x = clickedX,
+                    y = clickedY,
+                    z = clickedZ,
+                    stateId = neighborStateId
+                )
+            )
+        }
+
+        val (forwardX, forwardZ) = horizontalFacingOffset(facing) ?: return null
+        val leftX = forwardZ
+        val leftZ = -forwardX
+        val rightX = -forwardZ
+        val rightZ = forwardX
+
+        data class ChestMergeCandidate(
+            val neighborX: Int,
+            val neighborY: Int,
+            val neighborZ: Int,
+            val selfType: String,
+            val neighborType: String,
+            val neighborFacing: String,
+            val neighborParsed: BlockStateRegistry.ParsedState
+        )
+
+        fun candidateAt(dx: Int, dz: Int, selfType: String, neighborType: String): ChestMergeCandidate? {
+            val nx = x + dx
+            val nz = z + dz
+            val neighborStateId = world.blockStateAt(nx, y, nz)
+            val neighborParsed = BlockStateRegistry.parsedState(neighborStateId) ?: return null
+            if (neighborParsed.blockKey != parsed.blockKey) return null
+            if (neighborParsed.properties["type"] != "single") return null
+            val neighborFacing = neighborParsed.properties["facing"] ?: return null
+            return ChestMergeCandidate(
+                neighborX = nx,
+                neighborY = y,
+                neighborZ = nz,
+                selfType = selfType,
+                neighborType = neighborType,
+                neighborFacing = neighborFacing,
+                neighborParsed = neighborParsed
+            )
+        }
+
+        val candidates = ArrayList<ChestMergeCandidate>(2)
+        candidateAt(leftX, leftZ, selfType = "right", neighborType = "left")?.let { candidates.add(it) }
+        candidateAt(rightX, rightZ, selfType = "left", neighborType = "right")?.let { candidates.add(it) }
+        if (candidates.isEmpty()) return null
+
+        val clickedCandidate = candidates.firstOrNull {
+            canSneakingChestMerge(
+                x = x,
+                y = y,
+                z = z,
+                clickedX = clickedX,
+                clickedY = clickedY,
+                clickedZ = clickedZ,
+                faceId = faceId,
+                candidateX = it.neighborX,
+                candidateY = it.neighborY,
+                candidateZ = it.neighborZ
+            )
+        }
+
+        val requiredFacing = clickedCandidate?.neighborFacing ?: facing
+        val matchingFacingCandidates = candidates.filter { it.neighborFacing == requiredFacing }
+        if (matchingFacingCandidates.size != 1) return null
+        val candidate = matchingFacingCandidates.first()
+
+        val selfProps = HashMap(parsed.properties)
+        selfProps["facing"] = requiredFacing
+        selfProps["type"] = candidate.selfType
+        val placedStateId = BlockStateRegistry.stateId(parsed.blockKey, selfProps) ?: return null
+
+        val neighborProps = HashMap(candidate.neighborParsed.properties)
+        neighborProps["facing"] = requiredFacing
+        neighborProps["type"] = candidate.neighborType
+        val neighborStateId = BlockStateRegistry.stateId(parsed.blockKey, neighborProps) ?: return null
+
+        return ChestMergePlacement(
+            placedStateId = placedStateId,
+            neighborUpdate = LinkedBlockStateUpdate(
+                x = candidate.neighborX,
+                y = candidate.neighborY,
+                z = candidate.neighborZ,
+                stateId = neighborStateId
+            )
+        )
+    }
+
+    private fun canSneakingChestMerge(
+        x: Int,
+        y: Int,
+        z: Int,
+        clickedX: Int,
+        clickedY: Int,
+        clickedZ: Int,
+        faceId: Int,
+        candidateX: Int,
+        candidateY: Int,
+        candidateZ: Int
+    ): Boolean {
+        if (faceId !in 2..5) return false
+        if (clickedX != candidateX || clickedY != candidateY || clickedZ != candidateZ) return false
+        val (dx, dz) = when (faceId) {
+            2 -> 0 to -1
+            3 -> 0 to 1
+            4 -> -1 to 0
+            5 -> 1 to 0
+            else -> return false
+        }
+        return clickedX + dx == x && clickedY == y && clickedZ + dz == z
     }
 
     private fun breakDependentBlocks(
@@ -16310,6 +17741,7 @@ private data class PlayerItemTextMeta(
     private const val MAX_CLIENT_VEHICLE_POSE_DELTA_SQ = 64.0
     // Vanilla TemptGoal target condition range.
     private const val PIG_TEMPT_RANGE_BLOCKS = 10.0
+    private const val BLOCKS_SOUND_SOURCE_ID = 4
     private const val NEUTRAL_SOUND_SOURCE_ID = 6
     private const val PLAYERS_SOUND_SOURCE_ID = 7
     private const val CHORUS_FRUIT_TELEPORT_SOUND_KEY = "minecraft:item.chorus_fruit.teleport"
@@ -16346,13 +17778,22 @@ private data class PlayerItemTextMeta(
     private const val CONTAINER_TYPE_PLAYER_INVENTORY = 0
     private const val CONTAINER_TYPE_CRAFTING_TABLE = 1
     private const val CONTAINER_TYPE_FURNACE = 2
+    private const val CONTAINER_TYPE_CHEST = 3
+    private const val CONTAINER_TYPE_ENDER_CHEST = 4
     private const val CRAFTING_TABLE_MENU_TYPE_ID = 12
     private val furnaceMenuTypeId: Int by lazy {
         RegistryCodec.entryIndex("minecraft:menu", "minecraft:furnace") ?: 14
     }
+    private val generic9x3MenuTypeId: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:menu", "minecraft:generic_9x3") ?: 2
+    }
+    private val generic9x6MenuTypeId: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:menu", "minecraft:generic_9x6") ?: 5
+    }
     private const val CLICK_TYPE_PICKUP = 0
     private const val CLICK_TYPE_QUICK_MOVE = 1
     private const val CLICK_TYPE_SWAP = 2
+    private const val CLICK_TYPE_CLONE = 3
     private const val CLICK_TYPE_QUICK_CRAFT = 5
     private const val CLICK_TYPE_PICKUP_ALL = 6
     private const val OFFHAND_SWAP_BUTTON = 40
@@ -16369,6 +17810,12 @@ private data class PlayerItemTextMeta(
     private val FURNACE_PLAYER_MAIN_SLOT_RANGE = 3..29
     private val FURNACE_PLAYER_HOTBAR_SLOT_RANGE = 30..38
     private val FURNACE_RESULT_QUICK_MOVE_TARGET_SLOTS: IntArray = (38 downTo 3).toList().toIntArray()
+    private val CHEST_STORAGE_SLOT_RANGE = 0..26
+    private val CHEST_PLAYER_MAIN_SLOT_RANGE = 27..53
+    private val CHEST_PLAYER_HOTBAR_SLOT_RANGE = 54..62
+    private val ENDER_CHEST_STORAGE_SLOT_RANGE = 0..26
+    private val ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE = 27..53
+    private val ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE = 54..62
     private const val DEFAULT_FURNACE_COOK_SECONDS = 10.0
     private const val MIN_FURNACE_COOK_SECONDS = 0.05
     private val PLAYER_CRAFT_RESULT_QUICK_MOVE_TARGET_SLOTS: IntArray =
@@ -16845,6 +18292,7 @@ private data class PlayerItemTextMeta(
                     sendFallingBlocksForChunk(session, ctx, world.fallingBlocksInChunk(chunkPos.x, chunkPos.z))
                     sendThrownItemsForChunk(session, ctx, world.thrownItemsInChunk(chunkPos.x, chunkPos.z))
                     sendAnimalsForChunk(session, ctx, world.animalsInChunk(chunkPos.x, chunkPos.z))
+                    resendChestLidEventsForChunkToSession(session, ctx, world, chunkPos)
                 },
                 workerLimit = chunkStreamBatchWorkers()
             ).whenComplete { sentCount, error ->
