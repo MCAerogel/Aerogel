@@ -29,7 +29,6 @@ dependencies {
     implementation("org.jline:jline:3.26.3")
     implementation("com.formdev:flatlaf:3.4.1")
     implementation("org.slf4j:slf4j-api:2.0.16")
-    implementation("net.kyori:adventure-api:4.26.1")
     implementation("org.recast4j:recast:1.5.11")
     implementation("org.recast4j:detour:1.5.11")
     implementation("org.ow2.asm:asm:9.7.1")
