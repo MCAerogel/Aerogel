@@ -72,7 +72,7 @@ Dependency:
 
 ```kotlin
 dependencies {
-    implementation("org.macaroon3145:aerogel-api:1.0-SNAPSHOT")
+    compileOnly("org.macaroon3145:aerogel-api:1.0-SNAPSHOT")
 }
 ```
 
