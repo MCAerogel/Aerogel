@@ -52,6 +52,30 @@ Join Discord and talk directly with the team:
 
 **https://discord.gg/fBBgMXXv8P**
 
+## API Package (Maven)
+
+API module is published automatically to GitHub Packages on commits to `main`.
+
+- Group: `org.macaroon3145`
+- Artifact: `aerogel-api`
+- Version: `1.0-SNAPSHOT`
+
+Repository:
+
+```kotlin
+repositories {
+    maven("https://maven.pkg.github.com/MCAerogel/Aerogel")
+}
+```
+
+Dependency:
+
+```kotlin
+dependencies {
+    implementation("org.macaroon3145:aerogel-api:1.0-SNAPSHOT")
+}
+```
+
 ## Quick Start (Dev)
 
 Requirements:
@@ -87,4 +111,3 @@ Aerogel is a development build.
 Expect incomplete features, breaking changes, and rapid iteration.
 
 Use with caution. Contribute if you want to accelerate it.
-

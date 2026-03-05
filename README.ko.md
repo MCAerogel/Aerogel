@@ -52,6 +52,30 @@ Discord에서 직접 소통해주세요:
 
 **https://discord.gg/fBBgMXXv8P**
 
+## API 패키지 (Maven)
+
+`main` 브랜치 커밋 기준으로 API 모듈이 GitHub Packages에 자동 배포됩니다.
+
+- Group: `org.macaroon3145`
+- Artifact: `aerogel-api`
+- Version: `1.0-SNAPSHOT`
+
+레포지토리:
+
+```kotlin
+repositories {
+    maven("https://maven.pkg.github.com/MCAerogel/Aerogel")
+}
+```
+
+의존성:
+
+```kotlin
+dependencies {
+    implementation("org.macaroon3145:aerogel-api:1.0-SNAPSHOT")
+}
+```
+
 ## 개발용 실행
 
 요구사항:
@@ -87,4 +111,3 @@ Aerogel는 개발 빌드입니다.
 미구현 기능, 브레이킹 체인지, 빠른 반복 개발을 전제로 합니다.
 
 주의해서 사용하고, 가능하면 기여로 함께 완성해 주세요.
-
