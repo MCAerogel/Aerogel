@@ -5,13 +5,18 @@ import io.netty.channel.EventLoopGroup
 import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.handler.PlayerSessionManager
 import org.macaroon3145.perf.GameLoop
+import org.macaroon3145.perf.PerformanceMonitor
 import org.macaroon3145.plugin.PluginSystem
+import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
+import org.slf4j.LoggerFactory
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
 object ServerLifecycle {
+    private val logger = LoggerFactory.getLogger(ServerLifecycle::class.java)
     private val stopping = AtomicBoolean(false)
+    private val runtimeRestarting = AtomicBoolean(false)
 
     @Volatile
     private var serverChannel: Channel? = null
@@ -54,9 +59,27 @@ object ServerLifecycle {
         runShutdownSequence(showSpinner = false)
     }
 
+    fun restartAerogelRuntime(): Boolean {
+        if (!runtimeRestarting.compareAndSet(false, true)) {
+            return false
+        }
+        return try {
+            GameLoop.stop()
+            PerformanceMonitor.start()
+            GameLoop.start()
+            true
+        } finally {
+            runtimeRestarting.set(false)
+        }
+    }
+
     private fun runShutdownSequence(showSpinner: Boolean) {
         val shutdownBody = {
             GameLoop.stop()
+            runCatching { VanillaAnvilWorldSaver.flushAsyncAutosave() }
+                .onFailure { logger.warn("Failed while waiting for pending autosave tasks during shutdown", it) }
+            runCatching { VanillaAnvilWorldSaver.saveAllDirtyWorlds() }
+                .onFailure { logger.warn("Synchronous world save failed during shutdown", it) }
             PlayerSessionManager.shutdown()
             PluginSystem.shutdown()
             runCatching { serverChannel?.close()?.syncUninterruptibly() }

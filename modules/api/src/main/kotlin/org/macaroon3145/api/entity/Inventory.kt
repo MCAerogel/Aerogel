@@ -10,6 +10,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import org.macaroon3145.api.plugin.PluginRuntime
 import org.macaroon3145.api.type.ItemType
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -56,6 +57,58 @@ data class Item(
     var name: String? = null,
     var lore: List<String> = emptyList()
 ) {
+    data class ModelData(
+        val floats: List<Float> = emptyList(),
+        val flags: List<Boolean> = emptyList(),
+        val strings: List<String> = emptyList(),
+        val colors: List<Int> = emptyList()
+    ) {
+        fun isEmpty(): Boolean {
+            return floats.isEmpty() && flags.isEmpty() && strings.isEmpty() && colors.isEmpty()
+        }
+
+        fun normalized(): ModelData {
+            return ModelData(
+                floats = floats.toList(),
+                flags = flags.toList(),
+                strings = strings.map { it.trim() },
+                colors = colors.toList()
+            )
+        }
+
+        operator fun plus(other: ModelData): ModelData {
+            return ModelData(
+                floats = this.floats + other.floats,
+                flags = this.flags + other.flags,
+                strings = this.strings + other.strings,
+                colors = this.colors + other.colors
+            ).normalized()
+        }
+
+        operator fun plus(other: String): ModelData {
+            return this + ModelData(strings = listOf(other))
+        }
+
+        operator fun plus(other: Int): ModelData {
+            return this + ModelData(floats = listOf(other.toFloat()))
+        }
+
+        operator fun plus(other: Float): ModelData {
+            return this + ModelData(floats = listOf(other))
+        }
+
+        operator fun plus(other: Boolean): ModelData {
+            return this + ModelData(flags = listOf(other))
+        }
+    }
+
+    val maxAmount: Int
+        get() {
+            if (id < 0) return DEFAULT_MAX_STACK_SIZE
+            val context = PluginRuntime.currentContextOrNull() ?: return DEFAULT_MAX_STACK_SIZE
+            return context.types.itemMaxAmountById(id).coerceAtLeast(1)
+        }
+
     data class Translation(
         val key: String,
         val args: List<String> = emptyList()
@@ -63,6 +116,13 @@ data class Item(
 
     private var translatedName: Translation? = null
     private var translatedLore: List<Translation> = emptyList()
+    private var modelDataInternal: ModelData = ModelData()
+
+    var modelData: ModelData
+        get() = modelDataInternal.normalized()
+        set(value) {
+            modelDataInternal = value.normalized()
+        }
 
     @JvmOverloads
     constructor(
@@ -158,6 +218,83 @@ data class Item(
         return this
     }
 
+    fun setModelData(value: Int): Item {
+        modelData = ModelData(floats = listOf(value.toFloat()))
+        return this
+    }
+
+    fun setModelData(value: Float): Item {
+        modelData = ModelData(floats = listOf(value))
+        return this
+    }
+
+    fun setModelData(value: Boolean): Item {
+        modelData = ModelData(flags = listOf(value))
+        return this
+    }
+
+    fun setModelData(value: String): Item {
+        modelData = ModelData(strings = listOf(value))
+        return this
+    }
+
+    fun setModelData(
+        floats: List<Float> = emptyList(),
+        flags: List<Boolean> = emptyList(),
+        strings: List<String> = emptyList(),
+        colors: List<Int> = emptyList()
+    ): Item {
+        modelData = ModelData(
+            floats = floats.toList(),
+            flags = flags.toList(),
+            strings = strings.map { it.trim() },
+            colors = colors.toList()
+        )
+        return this
+    }
+
+    fun addModelData(data: ModelData): Item {
+        modelData = modelData + data
+        return this
+    }
+
+    fun addModelData(value: Int): Item {
+        return addModelData(ModelData(floats = listOf(value.toFloat())))
+    }
+
+    fun addModelData(value: Float): Item {
+        return addModelData(ModelData(floats = listOf(value)))
+    }
+
+    fun addModelData(value: Boolean): Item {
+        return addModelData(ModelData(flags = listOf(value)))
+    }
+
+    fun addModelData(value: String): Item {
+        return addModelData(ModelData(strings = listOf(value)))
+    }
+
+    fun addModelData(
+        floats: List<Float> = emptyList(),
+        flags: List<Boolean> = emptyList(),
+        strings: List<String> = emptyList(),
+        colors: List<Int> = emptyList()
+    ): Item {
+        return addModelData(
+            ModelData(
+                floats = floats,
+                flags = flags,
+                strings = strings,
+                colors = colors
+            )
+        )
+    }
+
+    fun resetModelData(): Item {
+        modelData = ModelData()
+        return this
+    }
+
     fun clone(): Item {
         val cloned = Item(
             id = id,
@@ -168,6 +305,7 @@ data class Item(
         )
         cloned.translatedName = translatedName?.let { it.copy(args = it.args.toList()) }
         cloned.translatedLore = translatedLore.map { it.copy(args = it.args.toList()) }
+        cloned.modelData = modelData
         return cloned
     }
 
@@ -208,6 +346,7 @@ data class Item(
     }
 
     companion object {
+        private const val DEFAULT_MAX_STACK_SIZE = 64
         private val compactJson = Json { ignoreUnknownKeys = true }
         private val prettyJson = Json { prettyPrint = true; ignoreUnknownKeys = true }
         private const val ITEM_BINARY_MAGIC = 0x41475249 // 'AGRI'
@@ -316,12 +455,24 @@ class InventorySlotView(
     }
 }
 
+data class InventoryAddResult(
+    val requested: Int,
+    val inserted: Int,
+    val dropped: Int,
+    val discarded: Int,
+    val remaining: Int
+) {
+    val success: Boolean
+        get() = remaining <= 0
+}
+
 data class PlayerInventory(
     val selectedHotbarSlot: Int,
     val hotbar: MutableList<Item?>,
     val main: MutableList<Item?>,
     val armor: MutableList<Item?>,
-    val offhand: Item?
+    val offhand: Item?,
+    private val addItemDelegate: ((Item, Boolean) -> InventoryAddResult)? = null
 ) {
     var hand: Item?
         get() {
@@ -352,6 +503,112 @@ data class PlayerInventory(
     fun selectedHotbarItem(): Item? {
         return hand
     }
+
+    fun addItem(
+        item: Item,
+        overflowDrop: Boolean = true
+    ): InventoryAddResult {
+        val requested = item.amount.coerceAtLeast(0)
+        if (item.id < 0 || requested <= 0) {
+            return InventoryAddResult(
+                requested = requested,
+                inserted = 0,
+                dropped = 0,
+                discarded = 0,
+                remaining = requested
+            )
+        }
+        val delegate = addItemDelegate
+        if (delegate != null) {
+            return delegate(item.clone(), overflowDrop)
+        }
+        return addItemFallback(item, overflowDrop)
+    }
+
+    private fun addItemFallback(
+        item: Item,
+        overflowDrop: Boolean
+    ): InventoryAddResult {
+        val requested = item.amount.coerceAtLeast(0)
+        if (item.id < 0 || requested <= 0) {
+            return InventoryAddResult(requested, inserted = 0, dropped = 0, discarded = 0, remaining = requested)
+        }
+        val model = item.clone()
+        val maxStack = model.maxAmount.coerceAtLeast(1)
+        var remaining = requested
+        fun cloneWithAmount(source: Item, amount: Int): Item {
+            val cloned = source.clone()
+            return cloned.copy(amount = amount).also {
+                it.modelData = cloned.modelData
+                val translatedName = cloned.translatedName()
+                if (translatedName != null) {
+                    it.trName(translatedName.key, *translatedName.args.toTypedArray())
+                }
+                val translatedLore = cloned.translatedLore()
+                if (translatedLore.isNotEmpty()) {
+                    it.trLore(translatedLore)
+                }
+            }
+        }
+
+        fun canMerge(existing: Item?): Boolean {
+            if (existing == null || existing.id != model.id || existing.amount <= 0) return false
+            return existing.name == model.name &&
+                existing.lore == model.lore &&
+                existing.translatedName() == model.translatedName() &&
+                existing.translatedLore() == model.translatedLore() &&
+                existing.modelData == model.modelData
+        }
+
+        for (index in hotbar.indices) {
+            if (remaining <= 0) break
+            val existing = hotbar[index]
+            if (!canMerge(existing)) continue
+            val current = existing ?: continue
+            val free = maxStack - current.amount
+            if (free <= 0) continue
+            val added = minOf(free, remaining)
+            hotbar[index] = cloneWithAmount(current, current.amount + added)
+            remaining -= added
+        }
+        for (index in hotbar.indices) {
+            if (remaining <= 0) break
+            if (hotbar[index] != null) continue
+            val added = minOf(maxStack, remaining)
+            hotbar[index] = cloneWithAmount(model, added)
+            remaining -= added
+        }
+        for (index in main.indices) {
+            if (remaining <= 0) break
+            val existing = main[index]
+            if (!canMerge(existing)) continue
+            val current = existing ?: continue
+            val free = maxStack - current.amount
+            if (free <= 0) continue
+            val added = minOf(free, remaining)
+            main[index] = cloneWithAmount(current, current.amount + added)
+            remaining -= added
+        }
+        for (index in main.indices) {
+            if (remaining <= 0) break
+            if (main[index] != null) continue
+            val added = minOf(maxStack, remaining)
+            main[index] = cloneWithAmount(model, added)
+            remaining -= added
+        }
+
+        val inserted = requested - remaining
+        val dropped = if (remaining > 0 && overflowDrop) remaining else 0
+        val discarded = if (remaining > 0 && !overflowDrop) remaining else 0
+        return InventoryAddResult(
+            requested = requested,
+            inserted = inserted,
+            dropped = dropped,
+            discarded = discarded,
+            remaining = 0
+        )
+    }
+
 }
 
 typealias PlayerInventorySnapshot = PlayerInventory

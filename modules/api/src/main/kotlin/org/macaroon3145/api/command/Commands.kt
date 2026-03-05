@@ -131,7 +131,7 @@ data class FunctionalCommandSpec(
     val permission: String? = null,
     val playerOnly: Boolean = false,
     val consoleOnly: Boolean = false,
-    val handler: (CommandContext) -> CommandHandler
+    val handler: (CommandContext) -> CommandHandler?
 )
 
 data class CommandSpec(
@@ -168,7 +168,7 @@ fun command(
     permission: String? = null,
     playerOnly: Boolean = false,
     consoleOnly: Boolean = false,
-    handler: CommandContext.() -> CommandHandler
+    handler: CommandContext.() -> CommandHandler?
 ): RegisteredCommand {
     require(playerOnly.not() || consoleOnly.not()) {
         "Cannot enable both playerOnly and consoleOnly for '$name'."

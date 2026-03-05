@@ -367,6 +367,14 @@ class World(
         return changedBlocksByChunk.isNotEmpty() || changedBlockEntitiesByChunk.isNotEmpty()
     }
 
+    fun changedChunkPositionsSnapshot(): Set<ChunkPos> {
+        if (changedBlocksByChunk.isEmpty() && changedBlockEntitiesByChunk.isEmpty()) return emptySet()
+        val out = HashSet<ChunkPos>(changedBlocksByChunk.size + changedBlockEntitiesByChunk.size)
+        out.addAll(changedBlocksByChunk.keys)
+        out.addAll(changedBlockEntitiesByChunk.keys)
+        return out
+    }
+
     fun consumeDirtyTerrainChunks(): Set<ChunkPos> {
         if (dirtyTerrainChunksQueue.isEmpty()) return emptySet()
         val out = HashSet<ChunkPos>()

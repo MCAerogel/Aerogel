@@ -51,18 +51,24 @@ import org.macaroon3145.world.ThrownItemKind
 import org.macaroon3145.world.ThrownItemSnapshot
 import org.macaroon3145.world.VanillaMiningRules
 import org.macaroon3145.world.WorldManager
+import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
+import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
 import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
 import java.util.ArrayList
 import java.util.HashSet
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
+import java.io.InputStreamReader
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Locale
+import java.util.Properties
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
@@ -248,6 +254,14 @@ private data class WorldTimeState(
     var broadcastAccumulatorSeconds: Double
 )
 
+private data class WorldWeatherState(
+    var clearWeatherTime: Int,
+    var rainTime: Int,
+    var thunderTime: Int,
+    var isRaining: Boolean,
+    var isThundering: Boolean
+)
+
 private data class FurnaceKey(
     val worldKey: String,
     val x: Int,
@@ -375,6 +389,14 @@ private data class PlayerItemTextMeta(
     private val animalRideControlsActiveWorlds = ConcurrentHashMap.newKeySet<String>()
     private val attackCooldownActiveChannelIds = ConcurrentHashMap.newKeySet<ChannelId>()
     private val worldTimes = ConcurrentHashMap<String, WorldTimeState>()
+    @Volatile
+    private var worldWeatherState = WorldWeatherState(
+        clearWeatherTime = INITIAL_CLEAR_WEATHER_TIME,
+        rainTime = INITIAL_RAIN_TIME,
+        thunderTime = INITIAL_THUNDER_TIME,
+        isRaining = INITIAL_IS_RAINING,
+        isThundering = INITIAL_IS_THUNDERING
+    )
     private val furnaceStates = ConcurrentHashMap<FurnaceKey, FurnaceState>()
     private val activeFurnaceKeys = ConcurrentHashMap.newKeySet<FurnaceKey>()
     private val activeFurnaceKeysByWorld = ConcurrentHashMap<String, MutableSet<FurnaceKey>>()
@@ -408,6 +430,7 @@ private data class PlayerItemTextMeta(
             priority = Thread.NORM_PRIORITY - 1
         }
     }
+    private val runtimeRestartInProgress = AtomicBoolean(false)
     @Volatile
     private var nextChunkMsptActionBarSweepAtNanos: Long = 0L
     private val operatorFilePath: Path = Path.of("op.txt")
@@ -500,6 +523,28 @@ private data class PlayerItemTextMeta(
             PlayerSessionManager.addWorldTimeAndBroadcast(worldKey, deltaTicks)
         override fun showDashboard(): Boolean = ServerDashboard.showOrFocus()
         override fun stopServer(): Boolean = ServerLifecycle.stopServer()
+        override fun saveWorldsAsync(onComplete: ((Boolean) -> Unit)?): Boolean =
+            VanillaAnvilWorldSaver.saveAllDirtyWorldsAsync(onComplete)
+        override fun restartServer(onComplete: ((Boolean) -> Unit)?): Boolean {
+            if (!runtimeRestartInProgress.compareAndSet(false, true)) {
+                return false
+            }
+            val ok = runCatching {
+                reloadServerConfigFromDiskForRuntimeRestart()
+                VanillaAnvilWorldSaver.saveAllDirtyWorlds()
+                val restarted = ServerLifecycle.restartAerogelRuntime()
+                if (restarted) {
+                    resyncAllOnlinePlayersAfterRuntimeRestart()
+                }
+                restarted
+            }.getOrElse { throwable ->
+                logger.error("Failed to restart Aerogel runtime", throwable)
+                false
+            }
+            runtimeRestartInProgress.set(false)
+            onComplete?.invoke(ok)
+            return true
+        }
         override fun reloadAllPlugins(): Int = org.macaroon3145.plugin.PluginSystem.reloadAll()
         override fun reloadPlugin(pluginId: String): Boolean = org.macaroon3145.plugin.PluginSystem.reloadPlugin(pluginId)
         override fun pluginIds(): List<String> = org.macaroon3145.plugin.PluginSystem.pluginIds()
@@ -2602,6 +2647,54 @@ private data class PlayerItemTextMeta(
 
     fun addWorldTimeTicks(worldKey: String, deltaTicks: Long): Boolean {
         return addWorldTimeAndBroadcast(worldKey, deltaTicks) != null
+    }
+
+    fun applyPersistedTimeWeather(metadata: VanillaLevelDatSeedStore.TimeWeatherMetadata) {
+        val worlds = WorldManager.allWorlds()
+        if (worlds.isNotEmpty()) {
+            for (world in worlds) {
+                val state = worldTimes.computeIfAbsent(world.key) {
+                    WorldTimeState(
+                        worldAgeTicks = INITIAL_WORLD_TIME_TICKS,
+                        timeOfDayTicks = INITIAL_WORLD_TIME_TICKS,
+                        broadcastAccumulatorSeconds = 0.0
+                    )
+                }
+                run {
+                    state.worldAgeTicks = metadata.worldAgeTicks.toDouble().coerceAtLeast(0.0)
+                    state.timeOfDayTicks = metadata.timeOfDayTicks.toDouble().coerceAtLeast(0.0)
+                    state.broadcastAccumulatorSeconds = 0.0
+                }
+            }
+        }
+        worldWeatherState = WorldWeatherState(
+            clearWeatherTime = metadata.clearWeatherTime.coerceAtLeast(0),
+            rainTime = metadata.rainTime.coerceAtLeast(0),
+            thunderTime = metadata.thunderTime.coerceAtLeast(0),
+            isRaining = metadata.isRaining,
+            isThundering = metadata.isThundering
+        )
+    }
+
+    fun timeWeatherSnapshotForLevelDat(): VanillaLevelDatSeedStore.TimeWeatherMetadata {
+        val overworldKey = "minecraft:overworld"
+        val timeState = worldTimes.computeIfAbsent(overworldKey) {
+            WorldTimeState(
+                worldAgeTicks = INITIAL_WORLD_TIME_TICKS,
+                timeOfDayTicks = INITIAL_WORLD_TIME_TICKS,
+                broadcastAccumulatorSeconds = 0.0
+            )
+        }
+        val weather = worldWeatherState
+        return VanillaLevelDatSeedStore.TimeWeatherMetadata(
+            worldAgeTicks = timeState.worldAgeTicks.toLong(),
+            timeOfDayTicks = timeState.timeOfDayTicks.toLong(),
+            clearWeatherTime = weather.clearWeatherTime.coerceAtLeast(0),
+            rainTime = weather.rainTime.coerceAtLeast(0),
+            thunderTime = weather.thunderTime.coerceAtLeast(0),
+            isRaining = weather.isRaining,
+            isThundering = weather.isThundering
+        )
     }
 
     fun spawnDroppedItemAt(
@@ -6782,6 +6875,9 @@ private data class PlayerItemTextMeta(
     }
 
     private fun resetRespawningSessionChunkView(session: PlayerSession, ctx: ChannelHandlerContext) {
+        // Invalidate any in-flight stream generation from pre-respawn state.
+        session.chunkStreamVersion.incrementAndGet()
+        session.chunkStreamInFlight.set(false)
         session.pendingChunkTarget.set(null)
         session.targetChunks.clear()
         session.generatingChunks.clear()
@@ -6799,6 +6895,178 @@ private data class PlayerItemTextMeta(
             ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
         }
         refreshRetainedBaseChunksForSession(session)
+    }
+
+    private fun resyncAllOnlinePlayersAfterRuntimeRestart() {
+        val snapshot = sessions.values.toList()
+        if (snapshot.isEmpty()) return
+        val latch = CountDownLatch(snapshot.size)
+        for (session in snapshot) {
+            val ctx = contexts[session.channelId]
+            if (ctx == null || !ctx.channel().isActive) {
+                latch.countDown()
+                continue
+            }
+            ctx.executor().execute {
+                try {
+                    if (!ctx.channel().isActive) return@execute
+                    val world = WorldManager.world(session.worldKey) ?: WorldManager.defaultWorld()
+                    val centerChunkX = ChunkStreamingService.chunkXFromBlockX(session.x)
+                    val centerChunkZ = ChunkStreamingService.chunkZFromBlockZ(session.z)
+                    session.centerChunkX = centerChunkX
+                    session.centerChunkZ = centerChunkZ
+                    val centerChunk = ChunkPos(centerChunkX, centerChunkZ)
+                    lastPushingChunkByPlayerEntityId[session.entityId] = centerChunk
+                    markPushingChunksAwake(session.worldKey, centerChunk)
+
+                    ctx.write(
+                        PlayPackets.respawnPacket(
+                            worldKey = session.worldKey,
+                            gameMode = session.gameMode,
+                            previousGameMode = session.gameMode,
+                            seaLevel = 63,
+                            copyDataFlags = 0
+                        )
+                    )
+                    ctx.write(PlayPackets.gameStateStartLoadingPacket())
+                    resetRespawningSessionChunkView(session, ctx)
+                    requestChunkStream(session, ctx, world, centerChunkX, centerChunkZ, session.chunkRadius)
+                    sendWorldPlayersToSession(session, ctx)
+                    ctx.write(PlayPackets.spawnPositionPacket(session.worldKey, session.x, session.y, session.z))
+                    val teleportId = nextTeleportId(session)
+                    ctx.write(
+                        PlayPackets.playerPositionPacket(
+                            teleportId = teleportId,
+                            x = session.x,
+                            y = session.y,
+                            z = session.z,
+                            yaw = session.yaw,
+                            pitch = session.pitch,
+                            relativeFlags = 0
+                        )
+                    )
+                    ctx.write(PlayPackets.setHeldSlotPacket(session.selectedHotbarSlot))
+                    val worldTime = worldTimeSnapshotOrNull(session.worldKey)
+                    if (worldTime != null) {
+                        ctx.write(
+                            PlayPackets.timeUpdatePacket(
+                                worldAge = worldTime.first,
+                                timeOfDay = worldTime.second,
+                                tickDayTime = true
+                            )
+                        )
+                    }
+                    ctx.write(PlayPackets.setHealthPacket(session.health, session.food, session.saturation))
+                    ctx.flush()
+                    resyncPlayerInventoryViewsForSession(session)
+                } catch (throwable: Throwable) {
+                    logger.warn("Failed to fully resync player after runtime restart: {}", session.profile.username, throwable)
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+        if (!latch.await(15, TimeUnit.SECONDS)) {
+            logger.warn("Timed out while waiting for player full-resync after runtime restart")
+        }
+    }
+
+    private fun sendWorldPlayersToSession(session: PlayerSession, ctx: ChannelHandlerContext) {
+        for (other in sessions.values) {
+            if (other.channelId == session.channelId) continue
+            if (other.worldKey != session.worldKey) continue
+            ctx.write(PlayPackets.playerInfoPacket(other.profile, effectiveDisplayName(other), other.gameMode, other.pingMs))
+            ctx.write(
+                PlayPackets.addPlayerEntityPacket(
+                    entityId = other.entityId,
+                    uuid = other.profile.uuid,
+                    x = other.x,
+                    y = other.y,
+                    z = other.z,
+                    yaw = other.yaw,
+                    pitch = other.pitch
+                )
+            )
+            ctx.write(PlayPackets.playerSkinPartsMetadataPacket(other.entityId, other.skinPartsMask))
+            ctx.write(
+                PlayPackets.playerSharedFlagsMetadataPacket(
+                    other.entityId,
+                    other.sneaking,
+                    other.sprinting,
+                    other.swimming,
+                    other.usingItemHand
+                )
+            )
+            sendHeldItemEquipment(other, ctx, flush = false)
+        }
+    }
+
+    private fun reloadServerConfigFromDiskForRuntimeRestart() {
+        val props = Properties()
+        val externalConfigPath = Path.of("aerogel.properties")
+        if (Files.exists(externalConfigPath)) {
+            Files.newBufferedReader(externalConfigPath, StandardCharsets.UTF_8).use { reader ->
+                props.load(reader)
+            }
+        } else {
+            PlayerSessionManager::class.java.classLoader.getResourceAsStream("aerogel.properties")?.use { input ->
+                InputStreamReader(input, StandardCharsets.UTF_8).use { reader ->
+                    props.load(reader)
+                }
+            }
+        }
+
+        val parsedChunkWorkerThreads = props.getProperty("chunk-worker-threads")?.toIntOrNull()
+            ?.coerceAtLeast(0)
+            ?: 0
+        ServerConfig.onlineMode = props.getProperty("online-mode")?.toBooleanStrictOrNull() ?: true
+        ServerConfig.maxTps = props.getProperty("max-tps")?.toDoubleOrNull()
+            ?.takeIf { it == -1.0 || it > 0.0 }
+            ?: 20.0
+        ServerConfig.maxPlayers = props.getProperty("max-players")?.toIntOrNull()
+            ?.coerceAtLeast(1)
+            ?: 20
+        ServerConfig.timeScale = (
+            props.getProperty("time-scale")
+                ?: props.getProperty("dropped-item-physics-time-scale")
+            )?.toDoubleOrNull()
+            ?.takeIf { it > 0.0 }
+            ?: 1.0
+        ServerConfig.playerTimeScale = props.getProperty("player-time-scale")?.toDoubleOrNull()
+            ?.takeIf { it > 0.0 }
+            ?.coerceAtMost(1.0)
+            ?: 1.0
+        ServerConfig.maxViewDistanceChunks = props.getProperty("max-view-distance-chunks")?.toIntOrNull()
+            ?.coerceIn(2, 32)
+            ?: 32
+        ServerConfig.maxSimulationDistanceChunks = props.getProperty("max-simulation-distance-chunks")?.toIntOrNull()
+            ?.coerceIn(2, 32)
+            ?: 16
+        ServerConfig.chunkWorkerThreads = parsedChunkWorkerThreads
+        ServerConfig.compressionThreshold = props.getProperty("compression-threshold")?.toIntOrNull()
+            ?.takeIf { it == -1 || it >= 0 }
+            ?: 1024
+        ServerConfig.compressionLevel = props.getProperty("compression-level")?.toIntOrNull()
+            ?.coerceIn(0, 9)
+            ?: 1
+        ServerConfig.compressionChunkLevel = props.getProperty("compression-chunk-level")?.toIntOrNull()
+            ?.coerceIn(-1, 9)
+            ?: 1
+        ServerConfig.autosaveIntervalSeconds = props.getProperty("autosave-interval-seconds")?.toDoubleOrNull()
+            ?: 30.0
+        ServerConfig.setGameMode(parseGameModeForRuntimeConfig(props.getProperty("default-gamemode")))
+        VanillaAnvilWorldSaver.configureAutosaveIntervalSeconds(ServerConfig.autosaveIntervalSeconds)
+    }
+
+    private fun parseGameModeForRuntimeConfig(raw: String?): Int {
+        val normalized = raw?.trim()?.lowercase() ?: return 1
+        return when (normalized) {
+            "0", "survival" -> 0
+            "1", "creative" -> 1
+            "2", "adventure" -> 2
+            "3", "spectator" -> 3
+            else -> 1
+        }
     }
 
     fun respawnIfDead(channelId: ChannelId) {
@@ -16012,6 +16280,11 @@ private data class PlayerItemTextMeta(
     private const val MINECRAFT_TICKS_PER_SECOND = 20.0
     private const val MINECRAFT_DAY_TICKS = 24_000.0
     private const val INITIAL_WORLD_TIME_TICKS = 0.0
+    private const val INITIAL_CLEAR_WEATHER_TIME = 0
+    private const val INITIAL_RAIN_TIME = 0
+    private const val INITIAL_THUNDER_TIME = 0
+    private const val INITIAL_IS_RAINING = false
+    private const val INITIAL_IS_THUNDERING = false
     private const val WORLD_TIME_BROADCAST_INTERVAL_SECONDS = 1.0
     private const val MAX_FALLING_BLOCK_COLUMN_SCAN = 32
     private const val SAFE_FALL_DISTANCE_BLOCKS = 3.0

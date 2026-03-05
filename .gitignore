@@ -47,9 +47,12 @@ versions/
 libraries/
 io/
 plugins/
+world/
+runtime-firstboot-test-*/
 
 ### Mac OS ###
 .DS_Store
 
 ### Backups ###
 *~
+*.bak.*

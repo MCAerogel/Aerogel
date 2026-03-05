@@ -536,6 +536,10 @@ object PlayPackets {
                 rootChildren += addLiteral("stop", executable = true)
             }
 
+            fun addSaveLiteral() {
+                rootChildren += addLiteral("save", executable = true)
+            }
+
             fun addTimeSubtree() {
                 val literalIndex = addLiteral("time")
                 val setLiteralIndex = addLiteral("set")
@@ -628,6 +632,7 @@ object PlayPackets {
             addOpSubtree()
             addDeopSubtree()
             addStopLiteral()
+            addSaveLiteral()
             addTimeSubtree()
             addPerfSubtree()
             addReloadSubtree()
@@ -640,6 +645,7 @@ object PlayPackets {
             "op",
             "deop",
             "stop",
+            "save",
             "time",
             "perf",
             "reload"

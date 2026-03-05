@@ -44,6 +44,8 @@ interface CommandContext {
     fun addWorldTime(worldKey: String, deltaTicks: Long): Pair<Long, Long>?
     fun showDashboard(): Boolean
     fun stopServer(): Boolean
+    fun saveWorldsAsync(onComplete: ((Boolean) -> Unit)? = null): Boolean
+    fun restartServer(onComplete: ((Boolean) -> Unit)? = null): Boolean
     fun reloadAllPlugins(): Int
     fun reloadPlugin(pluginId: String): Boolean
     fun pluginIds(): List<String>

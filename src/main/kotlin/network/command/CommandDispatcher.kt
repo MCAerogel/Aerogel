@@ -83,6 +83,7 @@ class CommandDispatcher(
             dispatcher.register("perf", PerfCommand)
             dispatcher.register("dashboard", DashboardCommand)
             dispatcher.register("stop", StopCommand)
+            dispatcher.register("save", SaveCommand)
             dispatcher.register("reload", ReloadCommand)
             return dispatcher
         }

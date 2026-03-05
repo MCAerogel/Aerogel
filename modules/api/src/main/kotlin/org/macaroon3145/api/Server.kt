@@ -1,6 +1,6 @@
 package org.macaroon3145.api
 
-import org.macaroon3145.api.entity.Player
+import org.macaroon3145.api.entity.ConnectedPlayer
 import org.macaroon3145.api.entity.PlayerRegistry
 import org.macaroon3145.api.plugin.PluginRuntime
 import org.macaroon3145.api.scheduler.TaskScheduler
@@ -42,12 +42,12 @@ object Server {
 
     fun getWorld(key: String): World? = worldRegistry?.world(key)
 
-    fun getPlayer(uuid: UUID): Player {
+    fun getPlayer(uuid: UUID): ConnectedPlayer? {
         val registry = checkNotNull(playerRegistry) { "Server is not initialized yet: playerRegistry is unavailable." }
         return registry.player(uuid)
     }
 
-    fun getPlayer(name: String): Player? {
+    fun getPlayer(name: String): ConnectedPlayer? {
         val registry = checkNotNull(playerRegistry) { "Server is not initialized yet: playerRegistry is unavailable." }
         return registry.player(name)
     }

@@ -1,6 +1,10 @@
 package org.macaroon3145.api.entity
 
 import org.macaroon3145.api.command.CommandSender
+import org.macaroon3145.api.packet.PlaySystemChat
+import org.macaroon3145.api.packet.VersionlessPacket
+import org.macaroon3145.api.packet.systemChatTextComponentNbt
+import org.macaroon3145.api.plugin.PluginRuntime
 import org.macaroon3145.api.type.ItemType
 import org.macaroon3145.api.world.Location
 import org.macaroon3145.api.world.Chunk
@@ -297,6 +301,25 @@ abstract class ConnectedPlayer(
 
     abstract fun tr(key: String, vararg args: String): String
     abstract override fun sendMessage(message: String)
+
+    fun sendPacket(packet: VersionlessPacket): Boolean {
+        val context = PluginRuntime.requireCurrentContext()
+        return context.packets.sendOutbound(this, packet)
+    }
+
+    open fun sendActionbar(message: String): Boolean {
+        return sendPacket(
+            PlaySystemChat(
+                componentNbt = systemChatTextComponentNbt(message),
+                overlay = true
+            )
+        )
+    }
+
+    fun sendRawPacket(packetId: Int, payload: ByteArray): Boolean {
+        val context = PluginRuntime.requireCurrentContext()
+        return context.packets.sendRawOutbound(this, packetId, payload)
+    }
 
     override fun hasPermission(node: String): Boolean = op
 }

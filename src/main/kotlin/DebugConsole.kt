@@ -24,6 +24,13 @@ object DebugConsole {
         return String.format(Locale.ROOT, "%.2f%s", seconds, ServerI18n.tr("aerogel.unit.seconds.short"))
     }
 
+    fun clearScreen() {
+        if (System.console() == null) return
+        // ANSI clear screen + cursor home.
+        rawOut.print("\u001B[2J\u001B[H")
+        rawOut.flush()
+    }
+
     inline fun <T> withSpinner(
         progressMessage: String,
         doneMessage: String = progressMessage,

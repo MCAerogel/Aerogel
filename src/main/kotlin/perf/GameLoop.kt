@@ -3,6 +3,7 @@ package org.macaroon3145.perf
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.handler.PlayerSessionManager
 import org.macaroon3145.ui.ServerDashboard
+import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 import kotlin.math.roundToLong
 
 object GameLoop {
@@ -65,6 +66,7 @@ object GameLoop {
             val tickStartNanos = System.nanoTime()
             val deltaSeconds = TickTime.advanceAndGetDeltaSeconds(tickStartNanos)
             PlayerSessionManager.tick(deltaSeconds)
+            VanillaAnvilWorldSaver.tickAutosave(tickStartNanos)
             val tickEndNanos = System.nanoTime()
             PerformanceMonitor.recordTick(tickStartNanos, tickEndNanos)
             ServerDashboard.onTick()

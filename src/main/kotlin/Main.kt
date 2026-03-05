@@ -44,6 +44,7 @@ import org.macaroon3145.world.EntityHitboxRegistry
 import org.macaroon3145.world.World
 import org.macaroon3145.world.WorldManager
 import org.macaroon3145.world.VanillaMiningRules
+import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
 import org.macaroon3145.plugin.PluginSystem
 import java.nio.file.Files
 import java.nio.file.Path
@@ -145,6 +146,9 @@ fun main() {
     ServerConfig.setGameMode(parseGameMode(props.getProperty("default-gamemode")))
     ServerI18n.initialize()
     WorldManager.bootstrap(worldSeeds = worldSeeds, defaultWorld = defaultWorld)
+    VanillaLevelDatSeedStore.loadTimeWeatherMetadata()?.let { metadata ->
+        PlayerSessionManager.applyPersistedTimeWeather(metadata)
+    }
     PluginSystem.initialize()
     warmupPickBlockLookups()
     if (ServerConfig.compressionThreshold >= 0 && ServerConfig.compressionChunkLevel < 0) {
@@ -240,8 +244,15 @@ private fun warmupPickBlockLookups() {
 
 private fun resolveWorldSeeds(props: Properties): LinkedHashMap<String, Long> {
     val worldSeeds = linkedMapOf<String, Long>()
+
+    // Existing world metadata (level.dat) is the primary source of truth for generation seeds.
+    val levelDatSeeds = VanillaLevelDatSeedStore.load()
+    for ((worldKey, seed) in levelDatSeeds) {
+        worldSeeds[worldKey] = seed
+    }
+
     val legacyDefaultSeed = props.getProperty("world.seed")?.toLongOrNull()
-    if (legacyDefaultSeed != null) {
+    if (legacyDefaultSeed != null && "minecraft:overworld" !in worldSeeds) {
         worldSeeds["minecraft:overworld"] = legacyDefaultSeed
     }
     for ((rawKey, rawValue) in props) {
@@ -251,7 +262,7 @@ private fun resolveWorldSeeds(props: Properties): LinkedHashMap<String, Long> {
         val value = rawValue.toString().trim()
         val directSeed = value.toLongOrNull()
         if (directSeed != null) {
-            worldSeeds[worldKey] = directSeed
+            worldSeeds.putIfAbsent(worldKey, directSeed)
             continue
         }
 
@@ -263,7 +274,7 @@ private fun resolveWorldSeeds(props: Properties): LinkedHashMap<String, Long> {
         if (split <= 0 || split >= value.lastIndex) continue
         val suffix = value.substring(0, split).trim()
         val recoveredSeed = value.substring(split + 1).trim().toLongOrNull() ?: continue
-        worldSeeds["$worldKey:$suffix"] = recoveredSeed
+        worldSeeds.putIfAbsent("$worldKey:$suffix", recoveredSeed)
     }
 
     val builtinWorldKeys = listOf(

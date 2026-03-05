@@ -1438,25 +1438,14 @@ private class RuntimeWorldRegistry : WorldRegistry {
 }
 
 private class RuntimePlayerRegistry : PlayerRegistry {
-    override fun player(uuid: UUID): Player {
+    override fun player(uuid: UUID): ConnectedPlayer? {
         val session = PlayerSessionManager.byUuid(uuid)
-        return if (session != null) {
-            RuntimeConnectedPlayer.fromSession(session)
-        } else {
-            RuntimePlayerReference.offlineReference(
-                playerUuid = uuid,
-                fallbackName = null
-            )
-        }
+        return if (session != null) RuntimeConnectedPlayer.fromSession(session) else null
     }
 
-    override fun player(name: String): Player? {
+    override fun player(name: String): ConnectedPlayer? {
         val session = PlayerSessionManager.byName(name)
-        return if (session != null) {
-            RuntimeConnectedPlayer.fromSession(session)
-        } else {
-            null
-        }
+        return if (session != null) RuntimeConnectedPlayer.fromSession(session) else null
     }
 }
 
@@ -1482,6 +1471,10 @@ private class RuntimeTypeRegistry : TypeRegistry {
     override fun itemById(id: Int): ItemType? = ItemType.fromId(id)
 
     override fun itemByKey(key: String): ItemType? = ItemType.fromKey(key)
+
+    override fun itemMaxAmountById(id: Int): Int = 64
+
+    override fun itemMaxAmountByKey(key: String): Int = 64
 
     override fun blockById(id: Int): BlockType? = BlockType.fromId(id)
 

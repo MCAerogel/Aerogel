@@ -23,6 +23,7 @@ import org.objectweb.asm.Type
 import org.objectweb.asm.commons.AdviceAdapter
 import org.objectweb.asm.commons.Method as AsmMethod
 import org.slf4j.LoggerFactory
+import java.lang.instrument.ClassDefinition
 import java.lang.instrument.ClassFileTransformer
 import java.lang.instrument.Instrumentation
 import java.lang.reflect.Method as ReflectMethod
@@ -33,12 +34,14 @@ import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.reflect.KClass
 
 internal object MixinWeavingEngine {
     private val logger = LoggerFactory.getLogger(MixinWeavingEngine::class.java)
     private val started = AtomicBoolean(false)
     private val specsByTarget = ConcurrentHashMap<String, CopyOnWriteArrayList<HookSpec>>()
     private val appliedHookKeysByClass = ConcurrentHashMap<String, MutableSet<String>>()
+    private val originalClassBytesByClass = ConcurrentHashMap<String, ByteArray>()
 
     private val instrumentation: Instrumentation by lazy { ByteBuddyAgent.install() }
 
@@ -73,22 +76,59 @@ internal object MixinWeavingEngine {
                 .onFailure { logger.warn("Failed to retransform mixin target class {}", targetClass, it) }
         }
 
-        logger.info("Registered {} mixin hook(s) for plugin {}", specs.size, owner)
     }
 
     fun unregisterOwner(owner: String) {
         MixinCallbackBridge.unregisterOwner(owner)
+        val affectedTargets = HashSet<String>()
         val it = specsByTarget.entries.iterator()
         while (it.hasNext()) {
             val entry = it.next()
-            entry.value.removeIf { spec -> spec.owner == owner }
+            val removed = entry.value.removeIf { spec -> spec.owner == owner }
+            if (removed) affectedTargets += entry.key
             if (entry.value.isEmpty()) it.remove()
         }
+        restoreTargetsAfterUnregister(affectedTargets)
     }
 
     private fun ensureStarted() {
         if (!started.compareAndSet(false, true)) return
         instrumentation.addTransformer(transformer, true)
+    }
+
+    private fun restoreTargetsAfterUnregister(targetInternalNames: Set<String>) {
+        if (targetInternalNames.isEmpty()) return
+        val loadedClasses = instrumentation.allLoadedClasses.associateBy { it.name }
+        for (targetInternalName in targetInternalNames) {
+            val targetClassName = targetInternalName.replace('/', '.')
+            val clazz = loadedClasses[targetClassName]
+            if (clazz == null) {
+                if (specsByTarget[targetInternalName].isNullOrEmpty()) {
+                    appliedHookKeysByClass.remove(targetInternalName)
+                    originalClassBytesByClass.remove(targetInternalName)
+                }
+                continue
+            }
+            if (!instrumentation.isModifiableClass(clazz)) continue
+            val originalBytes = originalClassBytesByClass[targetInternalName] ?: continue
+            val restored = runCatching {
+                instrumentation.redefineClasses(ClassDefinition(clazz, originalBytes))
+            }.onFailure { throwable ->
+                logger.warn("Failed to restore original class bytes for mixin target {}", targetClassName, throwable)
+            }.isSuccess
+            if (!restored) continue
+
+            appliedHookKeysByClass.remove(targetInternalName)
+            val remainingSpecs = specsByTarget[targetInternalName].orEmpty()
+            if (remainingSpecs.isEmpty()) {
+                originalClassBytesByClass.remove(targetInternalName)
+                continue
+            }
+            runCatching { instrumentation.retransformClasses(clazz) }
+                .onFailure { throwable ->
+                    logger.warn("Failed to re-apply remaining mixins for target {}", targetClassName, throwable)
+                }
+        }
     }
 
     private fun readAnnotationBasedSpecs(
@@ -100,11 +140,10 @@ internal object MixinWeavingEngine {
         val classNames = discoverClassNames(pluginJar)
         for (className in classNames) {
             val klass = runCatching { Class.forName(className, false, classLoader) }.getOrNull() ?: continue
-            val mixin = klass.getAnnotation(Mixin::class.java) ?: continue
-            val targetClassName = mixin.target.trim()
-            if (targetClassName.isEmpty()) {
+            val classMixin = klass.getAnnotation(Mixin::class.java)
+            val declaredClassTarget = resolveExplicitTarget(classMixin?.target)
+            if (classMixin != null && declaredClassTarget.isEmpty()) {
                 logger.warn("Skipping @Mixin {} because target is empty.", className)
-                continue
             }
 
             val methods = runCatching { klass.declaredMethods.toList() }.getOrDefault(emptyList())
@@ -121,6 +160,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(Inject::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "Inject"
+                    ) ?: return@let
                     val hookKey = "$owner:inject:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -140,6 +186,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(Wrap::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "Wrap"
+                    ) ?: return@let
                     val hookKey = "$owner:wrap:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -159,6 +212,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(Overwrite::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "Overwrite"
+                    ) ?: return@let
                     val hookKey = "$owner:overwrite:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -175,6 +235,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(ModifyField::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "ModifyField"
+                    ) ?: return@let
                     val hookKey = "$owner:field:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -194,6 +261,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(ModifyIntConstant::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "ModifyIntConstant"
+                    ) ?: return@let
                     val hookKey = "$owner:const-int:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -211,6 +285,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(ModifyStringConstant::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "ModifyStringConstant"
+                    ) ?: return@let
                     val hookKey = "$owner:const-str:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -228,6 +309,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(RedirectNew::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "RedirectNew"
+                    ) ?: return@let
                     val hookKey = "$owner:redirect-new:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -246,6 +334,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(RedirectCall::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "RedirectCall"
+                    ) ?: return@let
                     val hookKey = "$owner:redirect-call:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -265,6 +360,13 @@ internal object MixinWeavingEngine {
                 }
 
                 method.getAnnotation(ModifyReturn::class.java)?.let { ann ->
+                    val targetClassName = resolveTargetClass(
+                        classTarget = declaredClassTarget,
+                        methodTarget = resolveExplicitTarget(ann.target),
+                        className = className,
+                        methodName = method.name,
+                        annotationName = "ModifyReturn"
+                    ) ?: return@let
                     val hookKey = "$owner:modify-return:$className#${method.name}:$index"
                     val callback = resolveCallback(owner, hookKey, method) ?: return@let
                     MixinCallbackBridge.register(owner, hookKey, callback)
@@ -294,6 +396,30 @@ internal object MixinWeavingEngine {
             method.isAnnotationPresent(RedirectNew::class.java) ||
             method.isAnnotationPresent(RedirectCall::class.java) ||
             method.isAnnotationPresent(ModifyReturn::class.java)
+    }
+
+    private fun resolveTargetClass(
+        classTarget: String,
+        methodTarget: String,
+        className: String,
+        methodName: String,
+        annotationName: String
+    ): String? {
+        val resolved = methodTarget.trim().ifEmpty { classTarget.trim() }
+        if (resolved.isNotEmpty()) return resolved
+        logger.warn(
+            "Skipping mixin hook {}#{} (@{}) because target class is empty. Set target=... on @Mixin or the method annotation.",
+            className,
+            methodName,
+            annotationName
+        )
+        return null
+    }
+
+    private fun resolveExplicitTarget(type: KClass<*>?): String {
+        if (type == null) return ""
+        if (type == Any::class) return ""
+        return type.java.name
     }
 
     private fun discoverClassNames(pluginJar: Path): List<String> {
@@ -736,7 +862,9 @@ internal object MixinWeavingEngine {
         }
 
         reader.accept(visitor, ClassReader.EXPAND_FRAMES)
-        return if (changed) writer.toByteArray() else null
+        if (!changed) return null
+        originalClassBytesByClass.putIfAbsent(classInternalName, classfileBuffer.copyOf())
+        return writer.toByteArray()
     }
 
     private enum class HookKind {

@@ -1,11 +1,23 @@
 package org.macaroon3145.api.packet
 
+import org.macaroon3145.api.entity.ConnectedPlayer
 import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import kotlin.reflect.KClass
 import kotlin.text.Charsets.UTF_8
 
 enum class PacketDirection {
     INBOUND,
     OUTBOUND
+}
+
+enum class PacketPriority {
+    LOWEST,
+    LOW,
+    NORMAL,
+    HIGH,
+    HIGHEST,
+    MONITOR
 }
 
 enum class ProtocolPhase {
@@ -207,6 +219,17 @@ class PacketWriter {
     fun toByteArray(): ByteArray = out.toByteArray()
 }
 
+fun systemChatTextComponentNbt(text: String): ByteArray {
+    val packet = ByteArrayOutputStream()
+    val out = DataOutputStream(packet)
+    out.writeByte(10) // TAG_Compound (root, unnamed)
+    out.writeByte(8) // TAG_String
+    out.writeUTF("text")
+    out.writeUTF(text)
+    out.writeByte(0) // TAG_End
+    return packet.toByteArray()
+}
+
 fun interface PacketInterceptor {
     fun intercept(packet: PacketEnvelope): PacketEnvelope?
 }
@@ -222,6 +245,40 @@ interface PacketInterceptorRegistry {
 
     fun intercept(packet: PacketEnvelope): PacketEnvelope?
 
+    fun registerAnnotated(owner: String, listener: Any): List<PacketInterceptorHandle> = emptyList()
+
+    fun <T : VersionlessPacket> onInbound(
+        owner: String,
+        packetType: Class<T>,
+        priority: PacketPriority = PacketPriority.NORMAL,
+        listener: (VersionlessPacketEvent<T>) -> Unit
+    ): PacketInterceptorHandle {
+        throw UnsupportedOperationException("Versionless packet listeners are not supported by this registry.")
+    }
+
+    fun <T : VersionlessPacket> onOutbound(
+        owner: String,
+        packetType: Class<T>,
+        priority: PacketPriority = PacketPriority.NORMAL,
+        listener: (VersionlessPacketEvent<T>) -> Unit
+    ): PacketInterceptorHandle {
+        throw UnsupportedOperationException("Versionless packet listeners are not supported by this registry.")
+    }
+
+    fun supports(packetType: Class<out VersionlessPacket>, direction: PacketDirection? = null): Boolean = false
+
+    fun supportedPacketTypes(direction: PacketDirection? = null): Set<Class<out VersionlessPacket>> = emptySet()
+
+    fun sendOutbound(player: ConnectedPlayer, packet: VersionlessPacket): Boolean = false
+
+    fun sendOutbound(connection: PacketConnection, packet: VersionlessPacket): Boolean = false
+
+    fun sendRawOutbound(player: ConnectedPlayer, packetId: Int, payload: ByteArray): Boolean = false
+
+    fun sendRawOutbound(connection: PacketConnection, packetId: Int, payload: ByteArray): Boolean = false
+
+    fun sendRawOutbound(packet: PacketEnvelope): Boolean = false
+
     fun registerKnown(
         owner: String,
         knownType: KnownPacketType,
@@ -232,3 +289,163 @@ interface PacketInterceptorRegistry {
         }
     }
 }
+
+interface VersionlessPacket
+
+data class HandshakeIntention(
+    val protocolVersion: Int,
+    val serverAddress: String,
+    val serverPort: Int,
+    val nextState: Int,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class LoginStart(
+    val name: String,
+    val playerUuid: java.util.UUID? = null,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class LoginEncryptionResponse(
+    val sharedSecret: ByteArray,
+    val verifyToken: ByteArray,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class LoginAck(
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class ConfigClientInformation(
+    val locale: String,
+    val viewDistance: Int,
+    val chatMode: Int,
+    val chatColors: Boolean,
+    val skinPartsMask: Int,
+    val mainHand: Int,
+    val textFiltering: Boolean,
+    val allowServerListing: Boolean,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class ConfigAckFinish(
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class ChatMessage(
+    val message: String,
+    val timestamp: Long? = null,
+    val salt: Long? = null,
+    val signature: ByteArray? = null,
+    val ackOffset: Int? = null,
+    val ackMask: ByteArray? = null,
+    val checksum: Int? = null,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class ChatCommand(
+    val command: String,
+    val signed: Boolean,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class CommandSuggestionRequest(
+    val requestId: Int,
+    val input: String,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class PlayLogin(
+    val entityId: Int,
+    val hardcore: Boolean,
+    val worldKeys: List<String>,
+    val maxPlayers: Int,
+    val viewDistance: Int,
+    val simulationDistance: Int,
+    val reducedDebugInfo: Boolean,
+    val enableRespawnScreen: Boolean,
+    val doLimitedCrafting: Boolean,
+    val gameMode: Int,
+    val worldKey: String,
+    val hashedSeed: Long,
+    val previousGameMode: Int,
+    val debugWorld: Boolean,
+    val flatWorld: Boolean,
+    val hasDeathLocation: Boolean,
+    val portalCooldown: Int,
+    val secureChatEnforced: Boolean,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class PlaySystemChat(
+    val componentNbt: ByteArray,
+    val overlay: Boolean,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class PlayCommandSuggestionEntry(
+    val text: String,
+    val hasTooltip: Boolean = false
+)
+
+data class PlayCommandSuggestions(
+    val requestId: Int,
+    val start: Int,
+    val length: Int,
+    val suggestions: List<PlayCommandSuggestionEntry>,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class PlayCommandsNode(
+    val flags: Int,
+    val children: List<Int>,
+    val redirectIndex: Int? = null,
+    val literal: String? = null,
+    val argumentName: String? = null,
+    val parserTypeId: Int? = null,
+    val parserPayload: ByteArray = ByteArray(0),
+    val suggestionType: String? = null
+)
+
+data class PlayCommands(
+    val nodes: List<PlayCommandsNode>,
+    val rootIndex: Int,
+    val trailingData: ByteArray = ByteArray(0)
+) : VersionlessPacket
+
+data class VersionlessPacketEvent<T : VersionlessPacket>(
+    val direction: PacketDirection,
+    val phase: ProtocolPhase,
+    val channelKey: String,
+    val player: ConnectedPlayer?,
+    val connection: PacketConnection,
+    val raw: PacketEnvelope,
+    var packet: T,
+    var cancelled: Boolean = false
+) {
+    val knownType: KnownPacketType?
+        get() = raw.knownType
+
+    fun cancel() {
+        cancelled = true
+    }
+}
+
+data class PacketConnection(
+    val channelKey: String,
+    val phase: ProtocolPhase
+)
+
+@Target(AnnotationTarget.FUNCTION)
+@Retention(AnnotationRetention.RUNTIME)
+annotation class OnInbound(
+    val value: KClass<out VersionlessPacket>,
+    val priority: PacketPriority = PacketPriority.NORMAL
+)
+
+@Target(AnnotationTarget.FUNCTION)
+@Retention(AnnotationRetention.RUNTIME)
+annotation class OnOutbound(
+    val value: KClass<out VersionlessPacket>,
+    val priority: PacketPriority = PacketPriority.NORMAL
+)

@@ -5,6 +5,7 @@ import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.DroppedItemSnapshot
 import org.macaroon3145.world.World
+import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 import org.slf4j.LoggerFactory
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CancellationException
@@ -119,7 +120,6 @@ object ChunkStreamingService {
 
         val coords = coordsInput
         val completion = CompletableFuture<Int>()
-        val includeDeltas = world.hasChunkDeltaChanges()
         val includeDroppedItems = world.hasDroppedItems()
         val sent = AtomicInteger(0)
         val nextIndex = AtomicInteger(0)
@@ -185,7 +185,21 @@ object ChunkStreamingService {
                 if (!generatingChunks.add(coord)) continue
 
                 inFlightBuildTasks.incrementAndGet()
-                world.buildChunkAsync(coord, workerPool).whenComplete { generated, error ->
+                CompletableFuture
+                    .runAsync(
+                        {
+                            runCatching {
+                                VanillaAnvilWorldSaver.loadChunkOverrideIfPresent(world, coord)
+                            }.onFailure { throwable ->
+                                logger.warn("Failed to apply saved chunk override for {},{}", coord.x, coord.z, throwable)
+                            }
+                        },
+                        workerPool
+                    )
+                    .thenCompose {
+                        world.buildChunkAsync(coord, workerPool)
+                    }
+                    .whenComplete { generated, error ->
                     try {
                         if (error != null) {
                             generatingChunks.remove(coord)
@@ -208,7 +222,7 @@ object ChunkStreamingService {
                             try {
                                 if (ctx.channel().isActive && shouldSend()) {
                                     val chunkPacket = PlayPackets.mapChunkPacket(coord.x, coord.z, generated)
-                                    val deltaPackets = if (includeDeltas) buildChunkDeltaPackets(world, coord) else emptyList()
+                                    val deltaPackets = buildChunkDeltaPackets(world, coord)
                                     val droppedItems = if (includeDroppedItems) world.droppedItemsInChunk(coord.x, coord.z) else emptyList()
 
                                     ctx.write(chunkPacket)

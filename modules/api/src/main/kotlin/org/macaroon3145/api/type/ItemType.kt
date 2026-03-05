@@ -1,6 +1,6 @@
 package org.macaroon3145.api.type
 
-enum class ItemType(val id: Int, val key: String, val blockType: BlockType?) {
+enum class ItemType(val id: Int, rawKey: String, val blockType: BlockType?) {
     AIR(0, "minecraft:air", null),
     STONE(1, "minecraft:stone", BlockType.STONE),
     GRANITE(2, "minecraft:granite", BlockType.GRANITE),
@@ -1507,6 +1507,8 @@ enum class ItemType(val id: Int, val key: String, val blockType: BlockType?) {
     VAULT(1503, "minecraft:vault", BlockType.VAULT),
     OMINOUS_BOTTLE(1504, "minecraft:ominous_bottle", null);
 
+    val key: String = rawKey.removePrefix("minecraft:")
+
     companion object {
         private val byId = entries.associateBy { it.id }
         private val byKey = entries.associateBy { it.key.lowercase() }
@@ -1515,7 +1517,14 @@ enum class ItemType(val id: Int, val key: String, val blockType: BlockType?) {
             .mapNotNull { item -> item.blockType?.let { block -> block to item } }
             .toMap()
         fun fromId(id: Int): ItemType? = byId[id]
-        fun fromKey(key: String): ItemType? = byKey[key.lowercase()]
+        fun fromKey(key: String): ItemType? = byKey[normalizeKey(key)]
         fun fromBlockType(blockType: BlockType): ItemType? = byBlockType[blockType]
+
+        private fun normalizeKey(key: String): String {
+            val normalized = key.trim().lowercase()
+            if (normalized.isEmpty()) return normalized
+            if (':' in normalized) return ""
+            return normalized
+        }
     }
 }

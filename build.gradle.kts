@@ -29,6 +29,7 @@ dependencies {
     implementation("org.jline:jline:3.26.3")
     implementation("com.formdev:flatlaf:3.4.1")
     implementation("org.slf4j:slf4j-api:2.0.16")
+    implementation("net.kyori:adventure-api:4.26.1")
     implementation("org.recast4j:recast:1.5.11")
     implementation("org.recast4j:detour:1.5.11")
     implementation("org.ow2.asm:asm:9.7.1")
@@ -43,8 +44,9 @@ dependencies {
     runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-linux-x64:$skikoVersion")
     runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-linux-arm64:$skikoVersion")
 
-    // Mojang-mapped NMS classes via Paper userdev.
+    // Mojang-mapped NMS classes for Folia bridge plugin compilation.
     paperweight.paperDevBundle("1.21.11-R0.1-SNAPSHOT")
+
 }
 
 val foliaPlugin by sourceSets.creating
@@ -74,7 +76,6 @@ tasks.register<Jar>("aerogelJar") {
     archiveClassifier.set("")
     destinationDirectory.set(layout.buildDirectory.dir("libs"))
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-
     val foliaPluginJar = tasks.named<Jar>("foliaPluginJar")
     dependsOn(foliaPluginJar)
 
@@ -119,7 +120,6 @@ tasks.register<Jar>("foliaPluginJar") {
     archiveClassifier.set("")
     destinationDirectory.set(layout.buildDirectory.dir("libs"))
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-
     from(foliaPlugin.output)
 }
 

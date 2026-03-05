@@ -52,6 +52,10 @@ object ServerConfig {
     @Volatile
     var compressionChunkLevel: Int = 1
 
+    // <= 0 disables periodic world autosave.
+    @Volatile
+    var autosaveIntervalSeconds: Double = 30.0
+
     // 0=survival, 1=creative, 2=adventure, 3=spectator
     @Volatile
     var defaultGameMode: Int = 1

@@ -36,6 +36,9 @@ private data class FoliaDownloadInfo(
 private object FoliaRuntimeBootstrap {
     private const val API_BASE = "https://api.papermc.io/v2/projects/folia"
     private val runtimeDir: Path = Path.of(".aerogel-cache/folia/runtime")
+    private val sourceWorldDir: Path = Path.of("world")
+    private val sourceLevelDatPath: Path = sourceWorldDir.resolve("level.dat")
+    private val sourceLevelDatOldPath: Path = sourceWorldDir.resolve("level.dat_old")
     private val jarPath: Path = runtimeDir.resolve("folia-server.jar")
     private val downloadMetadataPath: Path = runtimeDir.resolve("folia-download.properties")
     private val runtimeStatePath: Path = runtimeDir.resolve("runtime-state.properties")
@@ -95,6 +98,7 @@ private object FoliaRuntimeBootstrap {
             val running = process
             if (running?.isAlive == true) {
                 awaitBridgeReady(chunkIpcSlots, running, runtimeDir.resolve("folia-sidecar.log"))
+                syncSourceWorldMetadataFromSidecar(runtimeDir)
                 return
             }
             started.set(false)
@@ -106,6 +110,7 @@ private object FoliaRuntimeBootstrap {
         prepareSidecarServerProperties(runtimeDir)
         prepareSidecarConfigFiles(runtimeDir, chunkIpcSlots, regionGridExponent)
         prepareRuntimeStateCache(regionGridExponent)
+        prepareSidecarWorldMetadata(runtimeDir)
         prepareIpcDirectory(runtimeDir)
 
         val appArgs = listOf(
@@ -127,7 +132,6 @@ private object FoliaRuntimeBootstrap {
         addOptionalSystemProperty(command, "aerogel.folia.seed.the_nether")
         addOptionalSystemProperty(command, "aerogel.folia.seed.the_end")
         command.add("-DMC_DEBUG_ENABLED=true")
-        command.add("-DMC_DEBUG_DONT_SAVE_WORLD=true")
         command.add("-jar")
         command.add(jarPath.toAbsolutePath().toString())
         command.addAll(appArgs)
@@ -163,6 +167,7 @@ private object FoliaRuntimeBootstrap {
         }
 
         awaitBridgeReady(chunkIpcSlots, startedProcess, logPath)
+        syncSourceWorldMetadataFromSidecar(runtimeDir)
     }
 
     private fun prepareIpcDirectory(runtimeDir: Path) {
@@ -563,7 +568,8 @@ private object FoliaRuntimeBootstrap {
             "sidecarLevelSeed" to runtimeStateProperty("aerogel.folia.sidecar.level-seed"),
             "overworldSeed" to runtimeStateProperty("aerogel.folia.seed.overworld"),
             "netherSeed" to runtimeStateProperty("aerogel.folia.seed.the_nether"),
-            "endSeed" to runtimeStateProperty("aerogel.folia.seed.the_end")
+            "endSeed" to runtimeStateProperty("aerogel.folia.seed.the_end"),
+            "sourceLevelDatSha256" to sourceLevelDatSha256()
         )
         val existing = readProperties(runtimeStatePath)
         val hasCachedWorlds = worldDirs.any { Files.exists(runtimeDir.resolve(it)) }
@@ -577,6 +583,39 @@ private object FoliaRuntimeBootstrap {
         }
 
         cleanupTransientRuntimeFiles()
+    }
+
+    private fun prepareSidecarWorldMetadata(runtimeDir: Path) {
+        val sidecarWorldDir = runtimeDir.resolve("world")
+        Files.createDirectories(sidecarWorldDir)
+        copyIfRegularFile(sourceLevelDatPath, sidecarWorldDir.resolve("level.dat"))
+        copyIfRegularFile(sourceLevelDatOldPath, sidecarWorldDir.resolve("level.dat_old"))
+    }
+
+    private fun syncSourceWorldMetadataFromSidecar(runtimeDir: Path) {
+        val sidecarWorldDir = runtimeDir.resolve("world")
+        if (!Files.isDirectory(sidecarWorldDir)) return
+        Files.createDirectories(sourceWorldDir)
+        copyIfRegularFileWithoutDelete(sidecarWorldDir.resolve("level.dat"), sourceLevelDatPath)
+        copyIfRegularFileWithoutDelete(sidecarWorldDir.resolve("level.dat_old"), sourceLevelDatOldPath)
+    }
+
+    private fun copyIfRegularFile(source: Path, target: Path) {
+        if (Files.isRegularFile(source)) {
+            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING)
+        } else {
+            Files.deleteIfExists(target)
+        }
+    }
+
+    private fun copyIfRegularFileWithoutDelete(source: Path, target: Path) {
+        if (!Files.isRegularFile(source)) return
+        Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING)
+    }
+
+    private fun sourceLevelDatSha256(): String {
+        if (!Files.isRegularFile(sourceLevelDatPath)) return ""
+        return runCatching { sha256Hex(sourceLevelDatPath) }.getOrDefault("")
     }
 
     private fun readExistingConfigVersion(path: Path, fallback: Int): Int {
