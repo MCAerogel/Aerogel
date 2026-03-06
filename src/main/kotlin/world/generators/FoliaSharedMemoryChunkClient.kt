@@ -148,7 +148,6 @@ private class FoliaSharedMemoryChunkClient {
     private val slots = ArrayList<IpcSlot>()
     @Volatile private var slotBusy: AtomicIntegerArray? = null
     private val chunkCache = ConcurrentHashMap<ChunkCacheKey, ChunkCacheEntry>()
-    private val bridgeRequestWriteLocks = ConcurrentHashMap<String, Any>()
     private val pushedBlockUpdateRevisionByChunk = ConcurrentHashMap<ChunkCacheKey, Long>()
     private val decodedChunkOrder = ConcurrentLinkedDeque<ChunkCacheKey>()
     private val retainedChunkKeys = ConcurrentHashMap.newKeySet<ChunkCacheKey>()
@@ -480,24 +479,20 @@ private class FoliaSharedMemoryChunkClient {
         val requestPath = ipcDir.resolve(fileName)
         return runCatching {
             Files.createDirectories(ipcDir)
-            val lockKey = requestPath.toAbsolutePath().normalize().toString()
-            val writeLock = bridgeRequestWriteLocks.computeIfAbsent(lockKey) { Any() }
-            synchronized(writeLock) {
-                FileChannel.open(
-                    requestPath,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.READ,
-                    StandardOpenOption.WRITE
-                ).use { channel ->
-                    channel.lock().use {
-                        channel.position(channel.size())
-                        val bytes = payload.toByteArray(StandardCharsets.UTF_8)
-                        var offset = 0
-                        while (offset < bytes.size) {
-                            val wrote = channel.write(java.nio.ByteBuffer.wrap(bytes, offset, bytes.size - offset))
-                            if (wrote <= 0) break
-                            offset += wrote
-                        }
+            FileChannel.open(
+                requestPath,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE
+            ).use { channel ->
+                channel.lock().use {
+                    channel.position(channel.size())
+                    val bytes = payload.toByteArray(StandardCharsets.UTF_8)
+                    var offset = 0
+                    while (offset < bytes.size) {
+                        val wrote = channel.write(java.nio.ByteBuffer.wrap(bytes, offset, bytes.size - offset))
+                        if (wrote <= 0) break
+                        offset += wrote
                     }
                 }
             }

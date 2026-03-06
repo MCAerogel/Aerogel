@@ -20,6 +20,7 @@ import java.io.DataOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.imageio.ImageIO
 import org.slf4j.LoggerFactory
 
@@ -28,7 +29,7 @@ class StatusHandler(private val protocolVersion: Int) : SimpleChannelInboundHand
         private val logger = LoggerFactory.getLogger(StatusHandler::class.java)
         private val iconPath: Path = Path.of("icon.png")
         private const val ICON_SIZE = 64
-        private val iconCacheLock = Any()
+        private val iconCacheLoading = AtomicBoolean(false)
 
         @Volatile
         private var cachedFavicon: String? = null
@@ -65,13 +66,17 @@ class StatusHandler(private val protocolVersion: Int) : SimpleChannelInboundHand
         if (iconCacheInitialized) {
             return cachedFavicon
         }
-
-        synchronized(iconCacheLock) {
-            if (iconCacheInitialized) {
-                return cachedFavicon
+        if (iconCacheLoading.compareAndSet(false, true)) {
+            try {
+                if (iconCacheInitialized) {
+                    return cachedFavicon
+                }
+                return initializeCachedIconOnce()
+            } finally {
+                iconCacheLoading.set(false)
             }
-            return initializeCachedIconOnce()
         }
+        return cachedFavicon
     }
 
     private fun initializeCachedIconOnce(): String? {

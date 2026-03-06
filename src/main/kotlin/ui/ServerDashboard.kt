@@ -55,6 +55,7 @@ import java.text.DecimalFormat
 import java.util.Base64
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -1416,7 +1417,7 @@ object ServerDashboard {
         }
         private val pendingCallPaths = ConcurrentLinkedQueue<List<String>>()
         private val pendingAllocations = ConcurrentLinkedQueue<AllocationEvent>()
-        private val samples = ArrayDeque<SampleEvent>()
+        private val samples = ConcurrentLinkedDeque<SampleEvent>()
         @Volatile private var lastHeapUsedBytes = ManagementFactory.getMemoryMXBean().heapMemoryUsage.used.coerceAtLeast(0L)
         private val maxWindowNanos = TimeUnit.MINUTES.toNanos(30)
 
@@ -1441,9 +1442,7 @@ object ServerDashboard {
             }
 
             if (drained.isEmpty()) {
-                synchronized(this) {
-                    pruneOldSamples(nowNanos)
-                }
+                pruneOldSamples(nowNanos)
                 return
             }
 
@@ -1461,26 +1460,24 @@ object ServerDashboard {
                 fallbackAllocPerPath = if (delta > 0L) delta / drained.size.coerceAtLeast(1) else 0L
             }
 
-            synchronized(this) {
-                for (callPath in drained) {
-                    val leaf = callPath.lastOrNull().orEmpty()
-                    val allocPerPath = if (allocByLeaf.isNotEmpty()) {
-                        val leafTotal = allocByLeaf[leaf] ?: 0L
-                        val leafCount = countsByLeaf[leaf] ?: 1
-                        if (leafCount > 0) leafTotal / leafCount else 0L
-                    } else {
-                        fallbackAllocPerPath
-                    }
-                    samples.addLast(
-                        SampleEvent(
-                            atNanos = nowNanos,
-                            callPath = callPath,
-                            allocatedBytesDelta = allocPerPath
-                        )
-                    )
+            for (callPath in drained) {
+                val leaf = callPath.lastOrNull().orEmpty()
+                val allocPerPath = if (allocByLeaf.isNotEmpty()) {
+                    val leafTotal = allocByLeaf[leaf] ?: 0L
+                    val leafCount = countsByLeaf[leaf] ?: 1
+                    if (leafCount > 0) leafTotal / leafCount else 0L
+                } else {
+                    fallbackAllocPerPath
                 }
-                pruneOldSamples(nowNanos)
+                samples.addLast(
+                    SampleEvent(
+                        atNanos = nowNanos,
+                        callPath = callPath,
+                        allocatedBytesDelta = allocPerPath
+                    )
+                )
             }
+            pruneOldSamples(nowNanos)
         }
 
         fun snapshot(currentMspt: Double, windowSeconds: Int): MethodProfileSnapshot {
@@ -1491,19 +1488,17 @@ object ServerDashboard {
             val samplesByMethod = HashMap<String, Long>()
             val allocByMethod = HashMap<String, Long>()
             val treeRoot = AggNode("<root>")
-            synchronized(this) {
-                pruneOldSamples(nowNanos)
-                for (event in samples) {
-                    if (event.atNanos < minNanos) continue
-                    if (event.callPath.isEmpty()) continue
-                    total += 1
-                    val leaf = event.callPath.last()
-                    samplesByMethod[leaf] = (samplesByMethod[leaf] ?: 0L) + 1
-                    if (event.allocatedBytesDelta > 0L) {
-                        allocByMethod[leaf] = (allocByMethod[leaf] ?: 0L) + event.allocatedBytesDelta
-                    }
-                    addPathToTree(treeRoot, event.callPath, event.allocatedBytesDelta)
+            pruneOldSamples(nowNanos)
+            for (event in samples) {
+                if (event.atNanos < minNanos) continue
+                if (event.callPath.isEmpty()) continue
+                total += 1
+                val leaf = event.callPath.last()
+                samplesByMethod[leaf] = (samplesByMethod[leaf] ?: 0L) + 1
+                if (event.allocatedBytesDelta > 0L) {
+                    allocByMethod[leaf] = (allocByMethod[leaf] ?: 0L) + event.allocatedBytesDelta
                 }
+                addPathToTree(treeRoot, event.callPath, event.allocatedBytesDelta)
             }
             val safeTotal = total.coerceAtLeast(1L)
             val rows = ArrayList<MethodProfileRow>(samplesByMethod.size)
@@ -1582,8 +1577,10 @@ object ServerDashboard {
 
         private fun pruneOldSamples(nowNanos: Long) {
             val minNanos = nowNanos - maxWindowNanos
-            while (samples.isNotEmpty() && samples.first().atNanos < minNanos) {
-                samples.removeFirst()
+            while (true) {
+                val head = samples.peekFirst() ?: break
+                if (head.atNanos >= minNanos) break
+                samples.pollFirst()
             }
         }
 
@@ -2114,7 +2111,7 @@ object ServerDashboard {
         private val worldGap = 14.0
         private val usageTextMinCellPx = 36.0
         private val playerNameMinIconPx = 18.0
-        private val skiaTextureCache = java.util.WeakHashMap<BufferedImage, SkiaImage>()
+        private val skiaTextureCache = ConcurrentHashMap<BufferedImage, SkiaImage>()
         private val playerHeadCache = ConcurrentHashMap<String, BufferedImage>()
         private val pendingPlayerHeadLoads = ConcurrentHashMap.newKeySet<String>()
         private val playerHeadExecutor = Executors.newFixedThreadPool(2) { runnable ->
@@ -2484,10 +2481,8 @@ object ServerDashboard {
         }
 
         private fun skiaImageFor(texture: BufferedImage): SkiaImage? {
-            synchronized(skiaTextureCache) {
-                val cached = skiaTextureCache[texture]
-                if (cached != null) return cached
-            }
+            val cached = skiaTextureCache[texture]
+            if (cached != null) return cached
             val width = texture.width.coerceAtLeast(1)
             val height = texture.height.coerceAtLeast(1)
             val pixels = ByteArray(width * height * 4)
@@ -2503,10 +2498,7 @@ object ServerDashboard {
             }
             val imageInfo = ImageInfo(width, height, ColorType.RGBA_8888, ColorAlphaType.OPAQUE)
             val image = runCatching { SkiaImage.makeRaster(imageInfo, pixels, width * 4) }.getOrNull() ?: return null
-            synchronized(skiaTextureCache) {
-                skiaTextureCache[texture] = image
-            }
-            return image
+            return skiaTextureCache.putIfAbsent(texture, image) ?: image
         }
 
         private fun drawGridOverlay(

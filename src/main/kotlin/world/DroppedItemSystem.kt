@@ -1,6 +1,7 @@
 package org.macaroon3145.world
 
 import org.macaroon3145.network.codec.BlockStateRegistry
+import org.macaroon3145.network.handler.ItemStackState
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.intOrNull
@@ -21,8 +22,7 @@ import kotlin.math.pow
 data class DroppedItemSnapshot(
     val entityId: Int,
     val uuid: UUID,
-    val itemId: Int,
-    val itemCount: Int,
+    val stack: ItemStackState,
     val x: Double,
     val y: Double,
     val z: Double,
@@ -52,6 +52,32 @@ data class DroppedItemTickEvents(
     }
 }
 
+data class DroppedItemConsumeResult(
+    val consumedCount: Int,
+    val removed: DroppedItemSnapshot?,
+    val updated: DroppedItemSnapshot?
+)
+
+private fun copyDroppedItemStackState(stack: ItemStackState): ItemStackState {
+    return ItemStackState.of(
+        itemId = stack.itemId,
+        count = stack.count,
+        shulkerContents = copyDroppedChestState(stack.shulkerContents)
+    )
+}
+
+private fun copyDroppedChestState(chest: org.macaroon3145.network.handler.ChestState?): org.macaroon3145.network.handler.ChestState? {
+    if (chest == null) return null
+    val nested = Array(chest.shulkerContents.size) { index ->
+        copyDroppedChestState(chest.shulkerContents[index])
+    }
+    return org.macaroon3145.network.handler.ChestState(
+        itemIds = chest.itemIds.copyOf(),
+        itemCounts = chest.itemCounts.copyOf(),
+        shulkerContents = nested
+    )
+}
+
 class DroppedItemSystem(
     private val blockStateAt: (Int, Int, Int) -> Int
 ) {
@@ -70,8 +96,7 @@ class DroppedItemSystem(
     private data class MutableDroppedItem(
         val entityId: Int,
         val uuid: UUID,
-        var itemId: Int,
-        var itemCount: Int,
+        var stack: ItemStackState,
         var x: Double,
         var y: Double,
         var z: Double,
@@ -93,8 +118,7 @@ class DroppedItemSystem(
             return DroppedItemSnapshot(
                 entityId = entityId,
                 uuid = uuid,
-                itemId = itemId,
-                itemCount = itemCount,
+                stack = copyDroppedItemStackState(stack),
                 x = x,
                 y = y,
                 z = z,
@@ -138,10 +162,9 @@ class DroppedItemSystem(
     private val pendingChunkActorTickEvents = ConcurrentLinkedQueue<DroppedItemTickEvents>()
     private val chunkTickInFlight = ConcurrentHashMap<ChunkPos, AtomicBoolean>()
 
-    fun spawn(
+    internal fun spawn(
         entityId: Int,
-        itemId: Int,
-        itemCount: Int,
+        stack: ItemStackState,
         x: Double,
         y: Double,
         z: Double,
@@ -151,14 +174,14 @@ class DroppedItemSystem(
         uuid: UUID = UUID.randomUUID(),
         pickupDelaySeconds: Double = DEFAULT_PICKUP_DELAY_SECONDS
     ): Boolean {
-        if (entityId < 0 || itemId < 0 || itemCount <= 0) return false
+        val normalizedStack = copyDroppedItemStackState(stack)
+        if (entityId < 0 || normalizedStack.itemId < 0 || normalizedStack.count <= 0) return false
         val chunkX = chunkXFromBlockX(x)
         val chunkZ = chunkZFromBlockZ(z)
         val entity = MutableDroppedItem(
             entityId = entityId,
             uuid = uuid,
-            itemId = itemId,
-            itemCount = itemCount,
+            stack = normalizedStack,
             x = x,
             y = y,
             z = z,
@@ -189,7 +212,7 @@ class DroppedItemSystem(
         return true
     }
 
-    fun requestUnstuckForBlock(blockX: Int, blockY: Int, blockZ: Int) {
+    internal fun requestUnstuckForBlock(blockX: Int, blockY: Int, blockZ: Int) {
         if (snapshots.isEmpty()) return
         val stateId = blockStateAt(blockX, blockY, blockZ)
         if (!isCollidableState(stateId)) return
@@ -208,15 +231,19 @@ class DroppedItemSystem(
         return snapshots.values.firstOrNull { it.uuid == uuid }
     }
 
-    fun updateItem(entityId: Int, itemId: Int, itemCount: Int): DroppedItemSnapshot? {
-        if (itemId < 0 || itemCount <= 0) return null
+    internal fun updateItem(entityId: Int, itemId: Int, itemCount: Int): DroppedItemSnapshot? {
+        return updateStack(entityId, ItemStackState.of(itemId = itemId, count = itemCount))
+    }
+
+    internal fun updateStack(entityId: Int, stack: ItemStackState): DroppedItemSnapshot? {
+        val normalized = copyDroppedItemStackState(stack)
+        if (normalized.itemId < 0 || normalized.count <= 0) return null
         return mutate(entityId) { entity ->
-            entity.itemId = itemId
-            entity.itemCount = itemCount
+            entity.stack = normalized
         }
     }
 
-    fun updatePosition(entityId: Int, x: Double, y: Double, z: Double): DroppedItemSnapshot? {
+    internal fun updatePosition(entityId: Int, x: Double, y: Double, z: Double): DroppedItemSnapshot? {
         if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return null
         return mutate(entityId) { entity ->
             entity.x = x
@@ -227,7 +254,7 @@ class DroppedItemSystem(
         }
     }
 
-    fun updateVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): DroppedItemSnapshot? {
+    internal fun updateVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): DroppedItemSnapshot? {
         if (!vx.isFinite() || !vy.isFinite() || !vz.isFinite()) return null
         return mutate(entityId) { entity ->
             entity.vx = vx
@@ -238,7 +265,7 @@ class DroppedItemSystem(
         }
     }
 
-    fun updateAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): DroppedItemSnapshot? {
+    internal fun updateAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): DroppedItemSnapshot? {
         if (!ax.isFinite() || !ay.isFinite() || !az.isFinite()) return null
         return mutate(entityId) { entity ->
             entity.accelerationX = ax
@@ -249,14 +276,14 @@ class DroppedItemSystem(
         }
     }
 
-    fun updatePickupDelay(entityId: Int, pickupDelaySeconds: Double): DroppedItemSnapshot? {
+    internal fun updatePickupDelay(entityId: Int, pickupDelaySeconds: Double): DroppedItemSnapshot? {
         if (!pickupDelaySeconds.isFinite()) return null
         return mutate(entityId) { entity ->
             entity.pickupDelaySeconds = pickupDelaySeconds.coerceAtLeast(0.0)
         }
     }
 
-    fun updateOnGround(entityId: Int, onGround: Boolean): DroppedItemSnapshot? {
+    internal fun updateOnGround(entityId: Int, onGround: Boolean): DroppedItemSnapshot? {
         return mutate(entityId) { entity ->
             entity.onGround = onGround
             if (!onGround) {
@@ -266,14 +293,14 @@ class DroppedItemSystem(
         }
     }
 
-    fun remove(entityId: Int): DroppedItemSnapshot? {
+    internal fun remove(entityId: Int): DroppedItemSnapshot? {
         val removed = snapshots.remove(entityId) ?: return null
         removeFromChunkIndex(removed.chunkPos, entityId)
         dirtyChunksByLane[laneFor(removed.chunkPos.x, removed.chunkPos.z)].add(removed.chunkPos)
         return removed
     }
 
-    fun removeIfUuidMatches(entityId: Int, expectedUuid: UUID): DroppedItemSnapshot? {
+    internal fun removeIfUuidMatches(entityId: Int, expectedUuid: UUID): DroppedItemSnapshot? {
         var removed: DroppedItemSnapshot? = null
         snapshots.compute(entityId) { _, current ->
             if (current != null && current.uuid == expectedUuid) {
@@ -287,6 +314,39 @@ class DroppedItemSystem(
         removeFromChunkIndex(removedSnapshot.chunkPos, entityId)
         dirtyChunksByLane[laneFor(removedSnapshot.chunkPos.x, removedSnapshot.chunkPos.z)].add(removedSnapshot.chunkPos)
         return removedSnapshot
+    }
+
+    internal fun removeIfMatches(entityId: Int, expected: DroppedItemSnapshot): DroppedItemSnapshot? {
+        var removed: DroppedItemSnapshot? = null
+        snapshots.compute(entityId) { _, current ->
+            if (current != null && current == expected) {
+                removed = current
+                null
+            } else {
+                current
+            }
+        }
+        val removedSnapshot = removed ?: return null
+        removeFromChunkIndex(removedSnapshot.chunkPos, entityId)
+        dirtyChunksByLane[laneFor(removedSnapshot.chunkPos.x, removedSnapshot.chunkPos.z)].add(removedSnapshot.chunkPos)
+        return removedSnapshot
+    }
+
+    internal fun consumeIfMatches(entityId: Int, expected: DroppedItemSnapshot, consumeCount: Int): DroppedItemConsumeResult? {
+        if (consumeCount <= 0) return null
+        val current = snapshots[entityId] ?: return null
+        if (current != expected) return null
+        val clampedConsume = consumeCount.coerceAtMost(current.stack.count)
+        if (clampedConsume <= 0) return null
+        if (clampedConsume >= current.stack.count) {
+            val removed = removeIfMatches(entityId, expected) ?: return null
+            return DroppedItemConsumeResult(consumedCount = removed.stack.count, removed = removed, updated = null)
+        }
+        val remainingCount = current.stack.count - clampedConsume
+        val updated = mutate(entityId) { entity ->
+            entity.stack = copyDroppedItemStackState(current.stack.copy(count = remainingCount))
+        } ?: return null
+        return DroppedItemConsumeResult(consumedCount = clampedConsume, removed = null, updated = updated)
     }
 
     fun hasEntities(): Boolean {
@@ -344,7 +404,8 @@ class DroppedItemSystem(
         chunkDeltaSecondsProvider: ((ChunkPos) -> Double)? = null,
         onChunkEvents: ((DroppedItemTickEvents) -> Unit)? = null,
         onDispatchComplete: (() -> Unit)? = null,
-        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
+        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null,
+        awaitCompletion: Boolean = false
     ): DroppedItemTickEvents {
         val ready = drainPendingChunkActorTickEvents()
         if (snapshots.isEmpty() || deltaSeconds <= 0.0) {
@@ -353,6 +414,7 @@ class DroppedItemSystem(
         }
         collectPendingUnstuckTargets()
         val pendingTasks = java.util.concurrent.atomic.AtomicInteger(0)
+        val scheduled = if (awaitCompletion) ArrayList<Future<DroppedItemTickEvents>>() else null
 
         val laneUnstuckTargets = arrayOfNulls<ConcurrentHashMap<Int, BlockPos>>(laneCount)
         for (lane in 0 until laneCount) {
@@ -373,7 +435,7 @@ class DroppedItemSystem(
                     continue
                 }
                 pendingTasks.incrementAndGet()
-                submitChunkTask(chunkPos) {
+                val submitted = submitChunkTask(chunkPos) {
                     try {
                         val chunkDeltaSeconds = (chunkDeltaSecondsProvider?.invoke(chunkPos) ?: deltaSeconds)
                         if (chunkDeltaSeconds <= 0.0) {
@@ -396,7 +458,7 @@ class DroppedItemSystem(
                         if (!events.isEmpty()) {
                             if (onChunkEvents != null) {
                                 onChunkEvents(events)
-                            } else {
+                            } else if (!awaitCompletion) {
                                 pendingChunkActorTickEvents.add(events)
                             }
                         }
@@ -411,12 +473,67 @@ class DroppedItemSystem(
                         }
                     }
                 }
+                if (scheduled != null) {
+                    scheduled.add(submitted)
+                }
             }
         }
         if (pendingTasks.get() == 0) {
             onDispatchComplete?.invoke()
         }
-        return ready
+        if (scheduled == null || scheduled.isEmpty()) {
+            return if (awaitCompletion) combineTickEvents(ready, mergeNearbyDroppedItems(activeSimulationChunks, deltaSeconds)) else ready
+        }
+        val spawned = ArrayList<DroppedItemSnapshot>(ready.spawned.size)
+        val updated = ArrayList<DroppedItemSnapshot>(ready.updated.size)
+        val removed = ArrayList<DroppedItemRemovedEvent>(ready.removed.size)
+        if (ready.spawned.isNotEmpty()) spawned.addAll(ready.spawned)
+        if (ready.updated.isNotEmpty()) updated.addAll(ready.updated)
+        if (ready.removed.isNotEmpty()) removed.addAll(ready.removed)
+        for (future in scheduled) {
+            val events = runCatching { future.get() }.getOrNull() ?: continue
+            if (events.spawned.isNotEmpty()) spawned.addAll(events.spawned)
+            if (events.updated.isNotEmpty()) updated.addAll(events.updated)
+            if (events.removed.isNotEmpty()) removed.addAll(events.removed)
+        }
+        val base = DroppedItemTickEvents(spawned = spawned, updated = updated, removed = removed)
+        return if (awaitCompletion) combineTickEvents(base, mergeNearbyDroppedItems(activeSimulationChunks, deltaSeconds)) else base
+    }
+
+    private fun combineTickEvents(base: DroppedItemTickEvents, merged: DroppedItemTickEvents): DroppedItemTickEvents {
+        if (merged.isEmpty()) return base
+        val spawnedById = LinkedHashMap<Int, DroppedItemSnapshot>(base.spawned.size)
+        val updatedById = LinkedHashMap<Int, DroppedItemSnapshot>(base.updated.size)
+        val removedById = LinkedHashMap<Int, DroppedItemRemovedEvent>(base.removed.size + merged.removed.size)
+        for (snapshot in base.spawned) spawnedById[snapshot.entityId] = snapshot
+        for (snapshot in base.updated) updatedById[snapshot.entityId] = snapshot
+        for (removed in base.removed) removedById[removed.entityId] = removed
+        for (snapshot in merged.spawned) {
+            removedById.remove(snapshot.entityId)
+            if (spawnedById.containsKey(snapshot.entityId)) {
+                spawnedById[snapshot.entityId] = snapshot
+            } else {
+                updatedById[snapshot.entityId] = snapshot
+            }
+        }
+        for (snapshot in merged.updated) {
+            removedById.remove(snapshot.entityId)
+            if (spawnedById.containsKey(snapshot.entityId)) {
+                spawnedById[snapshot.entityId] = snapshot
+            } else {
+                updatedById[snapshot.entityId] = snapshot
+            }
+        }
+        for (removed in merged.removed) {
+            spawnedById.remove(removed.entityId)
+            updatedById.remove(removed.entityId)
+            removedById[removed.entityId] = removed
+        }
+        return DroppedItemTickEvents(
+            spawned = spawnedById.values.toList(),
+            updated = updatedById.values.toList(),
+            removed = removedById.values.toList()
+        )
     }
 
     private fun drainPendingChunkActorTickEvents(): DroppedItemTickEvents {
@@ -464,10 +581,16 @@ class DroppedItemSystem(
         }
 
         for ((entityId, entity) in chunkState.entities) {
-            if (!snapshots.containsKey(entityId)) {
+            val baselineSnapshot = snapshots[entityId]
+            if (baselineSnapshot == null) {
                 chunkState.entities.remove(entityId, entity)
                 continue
             }
+            if (baselineSnapshot.uuid != entity.uuid) {
+                chunkState.entities.remove(entityId, entity)
+                continue
+            }
+            syncMutableEntityToSnapshot(entity, baselineSnapshot)
             val oldX = entity.x
             val oldY = entity.y
             val oldZ = entity.z
@@ -487,7 +610,9 @@ class DroppedItemSystem(
                         chunkState.entities.remove(entityId, entity)
                         continue
                     }
-                    snapshots[entityId] = entity.snapshot()
+                    if (canCommitChunkSnapshot(entityId, entity.uuid, baselineSnapshot)) {
+                        snapshots[entityId] = entity.snapshot()
+                    }
                 }
                 continue
             }
@@ -507,7 +632,9 @@ class DroppedItemSystem(
                         chunkState.entities.remove(entityId, entity)
                         continue
                     }
-                    snapshots[entityId] = entity.snapshot()
+                    if (canCommitChunkSnapshot(entityId, entity.uuid, baselineSnapshot)) {
+                        snapshots[entityId] = entity.snapshot()
+                    }
                 }
                 continue
             }
@@ -560,14 +687,20 @@ class DroppedItemSystem(
 
             if (spawnedIds.remove(entityId)) {
                 val snapshot = entity.snapshot()
-                snapshots[entityId] = snapshot
-                result.spawned.add(snapshot)
+                if (canCommitChunkSnapshot(entityId, entity.uuid, baselineSnapshot)) {
+                    snapshots[entityId] = snapshot
+                    result.spawned.add(snapshot)
+                }
             } else if (moved) {
                 val snapshot = entity.snapshot()
-                snapshots[entityId] = snapshot
-                result.updated.add(snapshot)
+                if (canCommitChunkSnapshot(entityId, entity.uuid, baselineSnapshot)) {
+                    snapshots[entityId] = snapshot
+                    result.updated.add(snapshot)
+                }
             } else if (pickupDelayChanged) {
-                snapshots[entityId] = entity.snapshot()
+                if (canCommitChunkSnapshot(entityId, entity.uuid, baselineSnapshot)) {
+                    snapshots[entityId] = entity.snapshot()
+                }
             }
         }
 
@@ -584,6 +717,29 @@ class DroppedItemSystem(
     private fun isLiveSnapshot(entityId: Int, expectedUuid: UUID): Boolean {
         val snapshot = snapshots[entityId] ?: return false
         return snapshot.uuid == expectedUuid
+    }
+
+    private fun canCommitChunkSnapshot(entityId: Int, expectedUuid: UUID, baseline: DroppedItemSnapshot): Boolean {
+        val current = snapshots[entityId] ?: return false
+        if (current.uuid != expectedUuid) return false
+        return current == baseline
+    }
+
+    private fun syncMutableEntityToSnapshot(entity: MutableDroppedItem, snapshot: DroppedItemSnapshot) {
+        entity.stack = copyDroppedItemStackState(snapshot.stack)
+        entity.x = snapshot.x
+        entity.y = snapshot.y
+        entity.z = snapshot.z
+        entity.vx = snapshot.vx
+        entity.vy = snapshot.vy
+        entity.vz = snapshot.vz
+        entity.accelerationX = snapshot.accelerationX
+        entity.accelerationY = snapshot.accelerationY
+        entity.accelerationZ = snapshot.accelerationZ
+        entity.pickupDelaySeconds = snapshot.pickupDelaySeconds
+        entity.onGround = snapshot.onGround
+        entity.chunkX = snapshot.chunkPos.x
+        entity.chunkZ = snapshot.chunkPos.z
     }
 
     private fun collectLaneChunkPositions(
@@ -608,6 +764,9 @@ class DroppedItemSystem(
     }
 
     private fun stepEntity(entity: MutableDroppedItem, deltaSeconds: Double, tickScale: Double) {
+        if (!canOccupy(entity.x, entity.y, entity.z)) {
+            resolveSpawnEmbedding(entity)
+        }
         entity.ageTicks += tickScale
         entity.pickupDelaySeconds = (entity.pickupDelaySeconds - deltaSeconds).coerceAtLeast(0.0)
         if (entity.accelerationX != 0.0 || entity.accelerationY != 0.0 || entity.accelerationZ != 0.0) {
@@ -615,7 +774,7 @@ class DroppedItemSystem(
             entity.vy += (entity.accelerationY * deltaSeconds) / 20.0
             entity.vz += (entity.accelerationZ * deltaSeconds) / 20.0
         }
-        val buoyancyProfile = buoyancyProfile(entity.itemId)
+        val buoyancyProfile = buoyancyProfile(entity.stack.itemId)
         val buoyantItem = buoyancyProfile.buoyancyPerTick > buoyancyProfile.sinkPerTick
 
         // Split fast movement into a few sub-steps to avoid tunneling through side/top blocks.
@@ -893,11 +1052,11 @@ class DroppedItemSystem(
     }
 
     private fun resolveSpawnEmbedding(entity: MutableDroppedItem) {
-        if (!isEmbedded(entity.x, entity.y, entity.z)) return
+        if (canOccupy(entity.x, entity.y, entity.z)) return
         val base = floor(entity.y).toInt()
         for (offset in 0..4) {
             val candidateY = base + offset + 1.0 + COLLISION_EPSILON
-            if (isEmbedded(entity.x, candidateY, entity.z)) continue
+            if (!canOccupy(entity.x, candidateY, entity.z)) continue
             entity.y = candidateY
             entity.vy = 0.0
             entity.onGround = collidesFootprint(entity.x, entity.y - 0.01, entity.z)
@@ -1029,6 +1188,242 @@ class DroppedItemSystem(
         return required.coerceAtLeast(1L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
+    private fun mergeNearbyDroppedItems(activeSimulationChunks: Set<ChunkPos>?, deltaSeconds: Double): DroppedItemTickEvents {
+        if (deltaSeconds <= 0.0) return DroppedItemTickEvents(emptyList(), emptyList(), emptyList())
+        val candidates = snapshots.values
+            .asSequence()
+            .filter { activeSimulationChunks == null || it.chunkPos in activeSimulationChunks }
+            .filter { it.stack.itemId >= 0 && it.stack.count > 0 }
+            .toList()
+        if (candidates.size < 2) return DroppedItemTickEvents(emptyList(), emptyList(), emptyList())
+
+        val chunked = HashMap<ChunkPos, MutableList<DroppedItemSnapshot>>()
+        for (snapshot in candidates) {
+            chunked.computeIfAbsent(snapshot.chunkPos) { ArrayList() }.add(snapshot)
+        }
+
+        val updated = LinkedHashMap<Int, DroppedItemSnapshot>()
+        val removed = LinkedHashMap<Int, DroppedItemRemovedEvent>()
+        val consumed = HashSet<Int>()
+        val ordered = candidates.sortedBy { it.entityId }
+
+        for (snapshot in ordered) {
+            if (snapshot.entityId in consumed) continue
+            val self = this.snapshot(snapshot.entityId) ?: continue
+            if (self.uuid != snapshot.uuid || self.stack.count <= 0 || self.stack.itemId < 0) continue
+            val partner = findBestMergePartner(self, chunked, activeSimulationChunks, consumed) ?: continue
+            val partnerLive = this.snapshot(partner.entityId) ?: continue
+            if (partnerLive.uuid != partner.uuid || partnerLive.stack.count <= 0 || partnerLive.stack.itemId < 0) continue
+            if (!canMergeStacks(self, partnerLive)) continue
+            val maxStackSize = itemMaxStackSize(self.stack.itemId)
+            if (maxStackSize <= 0) continue
+            if (self.stack.count >= maxStackSize && partnerLive.stack.count >= maxStackSize) continue
+
+            val dx = partnerLive.x - self.x
+            val dy = partnerLive.y - self.y
+            val dz = partnerLive.z - self.z
+            val distanceSq = (dx * dx) + (dy * dy) + (dz * dz)
+            val canSnapMergeNow = distanceSq <= MERGE_SNAP_DISTANCE_SQ
+            if (canSnapMergeNow) {
+                val keep = if (self.stack.count > partnerLive.stack.count) self else if (self.stack.count < partnerLive.stack.count) partnerLive else if (self.entityId <= partnerLive.entityId) self else partnerLive
+                val merge = if (keep.entityId == self.entityId) partnerLive else self
+                val transferable = minOf(maxStackSize - keep.stack.count, merge.stack.count)
+                if (transferable <= 0) continue
+
+                val midpointVx = (self.vx + partnerLive.vx) * 0.5
+                val midpointVy = (self.vy + partnerLive.vy) * 0.5
+                val midpointVz = (self.vz + partnerLive.vz) * 0.5
+                val totalCountForAccel = (self.stack.count + partnerLive.stack.count).coerceAtLeast(1)
+                val mergedAx =
+                    ((self.accelerationX * self.stack.count) + (partnerLive.accelerationX * partnerLive.stack.count)) / totalCountForAccel
+                val mergedAy =
+                    ((self.accelerationY * self.stack.count) + (partnerLive.accelerationY * partnerLive.stack.count)) / totalCountForAccel
+                val mergedAz =
+                    ((self.accelerationZ * self.stack.count) + (partnerLive.accelerationZ * partnerLive.stack.count)) / totalCountForAccel
+                val tx = applyMergeTransaction(
+                    keep = keep,
+                    merge = merge,
+                    keepCount = keep.stack.count + transferable,
+                    mergeCount = merge.stack.count - transferable,
+                    vx = midpointVx,
+                    vy = midpointVy,
+                    vz = midpointVz,
+                    ax = mergedAx,
+                    ay = mergedAy,
+                    az = mergedAz
+                ) ?: continue
+                updated[tx.keep.entityId] = tx.keep
+                if (tx.merge == null) {
+                    removed[merge.entityId] = DroppedItemRemovedEvent(merge.entityId, merge.chunkPos)
+                } else {
+                    updated[tx.merge.entityId] = tx.merge
+                }
+                consumed.add(keep.entityId)
+                consumed.add(merge.entityId)
+                continue
+            }
+
+            if (distanceSq > MERGE_ATTRACT_DISTANCE_SQ) continue
+            val distance = sqrt(distanceSq)
+            if (distance <= 1.0e-6) continue
+            val midpointX = (self.x + partnerLive.x) * 0.5
+            val midpointZ = (self.z + partnerLive.z) * 0.5
+            val pullStep = (MERGE_PULL_PER_SECOND * deltaSeconds).coerceAtMost(MERGE_MAX_PULL_STEP)
+            val selfDirX = (midpointX - self.x) / distance
+            val selfDirZ = (midpointZ - self.z) / distance
+            val partnerDirX = (midpointX - partnerLive.x) / distance
+            val partnerDirZ = (midpointZ - partnerLive.z) / distance
+            val selfUpdated = updateVelocity(
+                self.entityId,
+                (self.vx + selfDirX * pullStep).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED),
+                self.vy,
+                (self.vz + selfDirZ * pullStep).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED)
+            )
+            val partnerUpdated = updateVelocity(
+                partnerLive.entityId,
+                (partnerLive.vx + partnerDirX * pullStep).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED),
+                partnerLive.vy,
+                (partnerLive.vz + partnerDirZ * pullStep).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED)
+            )
+            if (selfUpdated != null) updated[self.entityId] = selfUpdated
+            if (partnerUpdated != null) updated[partnerLive.entityId] = partnerUpdated
+            consumed.add(self.entityId)
+            consumed.add(partnerLive.entityId)
+        }
+        return DroppedItemTickEvents(
+            spawned = emptyList(),
+            updated = updated.values.toList(),
+            removed = removed.values.toList()
+        )
+    }
+
+    private data class MergeTxResult(
+        val keep: DroppedItemSnapshot,
+        val merge: DroppedItemSnapshot?
+    )
+
+    private fun applyMergeTransaction(
+        keep: DroppedItemSnapshot,
+        merge: DroppedItemSnapshot,
+        keepCount: Int,
+        mergeCount: Int,
+        vx: Double,
+        vy: Double,
+        vz: Double,
+        ax: Double,
+        ay: Double,
+        az: Double
+    ): MergeTxResult? {
+        if (keepCount <= 0 || mergeCount < 0) return null
+        val keepSnapshot = snapshot(keep.entityId) ?: return null
+        val mergeSnapshot = snapshot(merge.entityId) ?: return null
+        if (keepSnapshot.uuid != keep.uuid || mergeSnapshot.uuid != merge.uuid) return null
+
+        val mergedPickupDelay = minOf(keepSnapshot.pickupDelaySeconds, mergeSnapshot.pickupDelaySeconds)
+        val keepLive = mutateIfUuidMatches(keep.entityId, keep.uuid) { entity ->
+            entity.stack = copyDroppedItemStackState(entity.stack.copy(count = keepCount))
+            entity.vx = vx
+            entity.vy = vy
+            entity.vz = vz
+            if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
+                entity.accelerationX = ax
+                entity.accelerationY = ay
+                entity.accelerationZ = az
+            }
+            entity.pickupDelaySeconds = mergedPickupDelay
+            entity.sleeping = false
+            entity.restTicks = 0.0
+        } ?: return null
+
+        if (mergeCount <= 0) {
+            removeIfUuidMatches(merge.entityId, merge.uuid) ?: return null
+            return MergeTxResult(keep = keepLive, merge = null)
+        }
+        val mergeLive = mutateIfUuidMatches(merge.entityId, merge.uuid) { entity ->
+            entity.stack = copyDroppedItemStackState(entity.stack.copy(count = mergeCount))
+            entity.vx = vx
+            entity.vy = vy
+            entity.vz = vz
+            if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
+                entity.accelerationX = ax
+                entity.accelerationY = ay
+                entity.accelerationZ = az
+            }
+            entity.pickupDelaySeconds = mergedPickupDelay
+            entity.sleeping = false
+            entity.restTicks = 0.0
+        } ?: return null
+        return MergeTxResult(keep = keepLive, merge = mergeLive)
+    }
+
+    private fun findBestMergePartner(
+        origin: DroppedItemSnapshot,
+        candidatesByChunk: Map<ChunkPos, List<DroppedItemSnapshot>>,
+        activeSimulationChunks: Set<ChunkPos>?,
+        consumed: Set<Int>
+    ): DroppedItemSnapshot? {
+        var best: DroppedItemSnapshot? = null
+        var bestDistanceSq = Double.POSITIVE_INFINITY
+        for (chunkX in (origin.chunkPos.x - 1)..(origin.chunkPos.x + 1)) {
+            for (chunkZ in (origin.chunkPos.z - 1)..(origin.chunkPos.z + 1)) {
+                val chunkPos = ChunkPos(chunkX, chunkZ)
+                if (activeSimulationChunks != null && chunkPos !in activeSimulationChunks) continue
+                val candidates = candidatesByChunk[chunkPos] ?: continue
+                for (candidate in candidates) {
+                    if (candidate.entityId == origin.entityId) continue
+                    if (candidate.entityId in consumed) continue
+                    val live = snapshot(candidate.entityId) ?: continue
+                    if (live.uuid != candidate.uuid || live.stack.count <= 0 || live.stack.itemId < 0) continue
+                    if (!canMergeStacks(origin, live)) continue
+                    val maxStack = itemMaxStackSize(origin.stack.itemId)
+                    if (maxStack <= 0) continue
+                    if (origin.stack.count >= maxStack && live.stack.count >= maxStack) continue
+                    val dx = live.x - origin.x
+                    val dy = live.y - origin.y
+                    val dz = live.z - origin.z
+                    val distanceSq = (dx * dx) + (dy * dy) + (dz * dz)
+                    if (distanceSq > MERGE_ATTRACT_DISTANCE_SQ) continue
+                    if (distanceSq < bestDistanceSq ||
+                        (abs(distanceSq - bestDistanceSq) <= MERGE_DISTANCE_EPSILON && live.entityId < (best?.entityId ?: Int.MAX_VALUE))
+                    ) {
+                        best = live
+                        bestDistanceSq = distanceSq
+                    }
+                }
+            }
+        }
+        return best
+    }
+
+    private fun canMergeStacks(left: DroppedItemSnapshot, right: DroppedItemSnapshot): Boolean {
+        if (left.stack.itemId != right.stack.itemId) return false
+        if (!areStackMetadataEqual(left.stack, right.stack)) return false
+        val maxStackSize = itemMaxStackSize(left.stack.itemId)
+        if (maxStackSize <= 0) return false
+        return left.stack.count < maxStackSize || right.stack.count < maxStackSize
+    }
+
+    private fun areStackMetadataEqual(left: ItemStackState, right: ItemStackState): Boolean {
+        return areChestStatesEqual(left.shulkerContents, right.shulkerContents)
+    }
+
+    private fun areChestStatesEqual(left: org.macaroon3145.network.handler.ChestState?, right: org.macaroon3145.network.handler.ChestState?): Boolean {
+        if (left === right) return true
+        if (left == null || right == null) return false
+        if (!left.itemIds.contentEquals(right.itemIds)) return false
+        if (!left.itemCounts.contentEquals(right.itemCounts)) return false
+        if (left.shulkerContents.size != right.shulkerContents.size) return false
+        for (i in left.shulkerContents.indices) {
+            if (!areChestStatesEqual(left.shulkerContents[i], right.shulkerContents[i])) return false
+        }
+        return true
+    }
+
+    private fun itemMaxStackSize(itemId: Int): Int {
+        if (itemId < 0 || itemId >= ITEM_MAX_STACK_SIZE_BY_ITEM_ID.size) return DEFAULT_MAX_STACK_SIZE
+        return ITEM_MAX_STACK_SIZE_BY_ITEM_ID[itemId].coerceIn(1, DEFAULT_MAX_STACK_SIZE)
+    }
+
     private fun collidesXFace(testX: Double, baseY: Double, centerZ: Double): Boolean {
         val y1 = baseY + 0.01
         val y2 = baseY + ENTITY_HEIGHT * 0.5
@@ -1132,6 +1527,15 @@ class DroppedItemSystem(
         )
 
         private const val GRAVITY_PER_TICK = 0.04
+        private const val DEFAULT_MAX_STACK_SIZE = 64
+        private const val MERGE_ATTRACT_DISTANCE = 1.75
+        private const val MERGE_ATTRACT_DISTANCE_SQ = MERGE_ATTRACT_DISTANCE * MERGE_ATTRACT_DISTANCE
+        private const val MERGE_SNAP_DISTANCE = 0.35
+        private const val MERGE_SNAP_DISTANCE_SQ = MERGE_SNAP_DISTANCE * MERGE_SNAP_DISTANCE
+        private const val MERGE_PULL_PER_SECOND = 0.75
+        private const val MERGE_MAX_PULL_STEP = 0.30
+        private const val MERGE_MAX_PULL_SPEED = 0.80
+        private const val MERGE_DISTANCE_EPSILON = 1.0e-6
         private const val AIR_DRAG = 0.98
         private const val GROUND_DRAG = 0.60
         private const val WATER_HORIZONTAL_DRAG = 0.99
@@ -1165,6 +1569,7 @@ class DroppedItemSystem(
         private val NON_COLLIDING_BLOCK_KEYS = loadBlockTag("dropped_item_non_colliding")
         private val ITEM_ID_BY_KEY = loadItemIdsByKey()
         private val ITEM_KEY_BY_ID = ITEM_ID_BY_KEY.entries.associate { (key, id) -> id to key }
+        private val ITEM_MAX_STACK_SIZE_BY_ITEM_ID = loadItemMaxStackSizeByItemId()
         private val ITEM_BUOYANCY_PROFILE_BY_KEY = loadItemBuoyancyProfilesByKey()
         private val globalCollidableStateCache = ConcurrentHashMap<Int, Boolean>()
         private val globalWaterStateCache = ConcurrentHashMap<Int, Boolean>()
@@ -1202,6 +1607,34 @@ class DroppedItemSystem(
             for (itemId in ITEM_ID_BY_KEY.values) {
                 globalBuoyancyProfileByItemId.computeIfAbsent(itemId, ::computeBuoyancyProfileByItemId)
             }
+        }
+
+        private fun loadItemMaxStackSizeByItemId(): IntArray {
+            val maxId = ITEM_ID_BY_KEY.values.maxOrNull() ?: -1
+            if (maxId < 0) return IntArray(0)
+            val out = IntArray(maxId + 1) { DEFAULT_MAX_STACK_SIZE }
+            val resource = DroppedItemSystem::class.java.classLoader
+                .getResourceAsStream("data/minecraft/item/max_stack_size.json")
+                ?: return out
+            val root = runCatching {
+                resource.bufferedReader().use { json.parseToJsonElement(it.readText()).jsonObject }
+            }.getOrNull() ?: return out
+            val defaultSize = root["default"]?.jsonPrimitive?.intOrNull
+                ?.coerceIn(1, DEFAULT_MAX_STACK_SIZE)
+                ?: DEFAULT_MAX_STACK_SIZE
+            for (i in out.indices) {
+                out[i] = defaultSize
+            }
+            val entries = root["entries"]?.jsonObject ?: return out
+            for ((itemKey, maxElement) in entries) {
+                val itemId = ITEM_ID_BY_KEY[itemKey] ?: continue
+                if (itemId !in out.indices) continue
+                val maxStack = maxElement.jsonPrimitive.intOrNull
+                    ?.coerceIn(1, DEFAULT_MAX_STACK_SIZE)
+                    ?: continue
+                out[itemId] = maxStack
+            }
+            return out
         }
 
         private fun isBuoyantItem(itemId: Int): Boolean {
@@ -1386,8 +1819,7 @@ class DroppedItemSystem(
         return MutableDroppedItem(
             entityId = snapshot.entityId,
             uuid = snapshot.uuid,
-            itemId = snapshot.itemId,
-            itemCount = snapshot.itemCount,
+            stack = copyDroppedItemStackState(snapshot.stack),
             x = snapshot.x,
             y = snapshot.y,
             z = snapshot.z,
@@ -1458,4 +1890,16 @@ class DroppedItemSystem(
         }
         return newSnapshot
     }
+
+    private inline fun mutateIfUuidMatches(
+        entityId: Int,
+        expectedUuid: UUID,
+        mutator: (MutableDroppedItem) -> Unit
+    ): DroppedItemSnapshot? {
+        val current = snapshots[entityId] ?: return null
+        if (current.uuid != expectedUuid) return null
+        val updated = mutate(entityId, mutator) ?: return null
+        return if (updated.uuid == expectedUuid) updated else null
+    }
+
 }

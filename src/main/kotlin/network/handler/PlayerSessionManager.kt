@@ -100,6 +100,7 @@ data class DroppedItemTrackerState(
     var lastVz: Double,
     var lastOnGround: Boolean,
     var secondsSinceHardSync: Double,
+    var lastEncodedItemStack: ByteArray? = null,
     var lastYaw: Float = 0f,
     var lastPitch: Float = 0f,
     var lastHeadYaw: Float = 0f
@@ -530,8 +531,6 @@ data class EncodedStackSection(
     private val nextEntityId = AtomicInteger(1)
     private val sessions = ConcurrentHashMap<ChannelId, PlayerSession>()
     private val itemTextMetaByPlayerUuid = ConcurrentHashMap<UUID, PlayerItemTextMeta>()
-    private val droppedItemTextMetaByEntityId = ConcurrentHashMap<Int, ItemTextMeta>()
-    private val droppedShulkerContentsByEntityId = ConcurrentHashMap<Int, ChestState>()
     private val contexts = ConcurrentHashMap<ChannelId, ChannelHandlerContext>()
     private val channelFlushStates = ConcurrentHashMap<ChannelId, ChannelFlushState>()
     private val pendingAnimalRemovals = ConcurrentLinkedQueue<PendingAnimalRemoval>()
@@ -718,8 +717,7 @@ data class EncodedStackSection(
     private val activeSimulationRefCountByWorld = ConcurrentHashMap<String, ConcurrentHashMap<ChunkPos, Int>>()
     private val activeSimulationStampByPlayerEntityId = ConcurrentHashMap<Int, PlayerSimulationStamp>()
     private val activeSimulationChunksByPlayerEntityId = ConcurrentHashMap<Int, Set<ChunkPos>>()
-    private val activeSimulationDeltaLock = Any()
-    private val activeSimulationDeltaByWorld = HashMap<String, SimulationChunkDelta>()
+    private val activeSimulationDeltaByWorldRef = AtomicReference(ConcurrentHashMap<String, SimulationChunkDelta>())
     @Volatile private var activeSimulationLastMaxDistanceChunks = -1
     private val retainedBaseChunksCacheByWorld = ConcurrentHashMap<String, Set<ChunkPos>>()
     private val retainedBaseRefCountByWorld = ConcurrentHashMap<String, ConcurrentHashMap<ChunkPos, Int>>()
@@ -1044,9 +1042,16 @@ data class EncodedStackSection(
         val collectorEntityId: Int,
         val pickupItemCount: Int,
         val showTakeAnimation: Boolean,
+        val removed: Boolean,
+        val remainingSnapshot: DroppedItemSnapshot?,
         val x: Double,
         val y: Double,
         val z: Double
+    )
+
+    private data class DroppedItemMergeResult(
+        val updated: List<DroppedItemSnapshot>,
+        val removed: List<org.macaroon3145.world.DroppedItemRemovedEvent>
     )
 
     private fun allocateEntityId(): Int = nextEntityId.getAndIncrement()
@@ -2065,18 +2070,16 @@ data class EncodedStackSection(
     }
 
     fun consumeActiveSimulationChunkDeltas(): Map<String, SimulationChunkDelta> {
-        synchronized(activeSimulationDeltaLock) {
-            if (activeSimulationDeltaByWorld.isEmpty()) return emptyMap()
-            val out = HashMap<String, SimulationChunkDelta>(activeSimulationDeltaByWorld.size)
-            for ((worldKey, delta) in activeSimulationDeltaByWorld) {
-                out[worldKey] = SimulationChunkDelta(
-                    added = HashSet(delta.added),
-                    removed = HashSet(delta.removed)
-                )
-            }
-            activeSimulationDeltaByWorld.clear()
-            return out
+        val deltaMap = activeSimulationDeltaByWorldRef.getAndSet(ConcurrentHashMap())
+        if (deltaMap.isEmpty()) return emptyMap()
+        val out = HashMap<String, SimulationChunkDelta>(deltaMap.size)
+        for ((worldKey, delta) in deltaMap) {
+            out[worldKey] = SimulationChunkDelta(
+                added = HashSet(delta.added),
+                removed = HashSet(delta.removed)
+            )
         }
+        return out
     }
 
     fun statusPlayerSamples(limit: Int = 12): List<PlayerSample> {
@@ -3016,14 +3019,14 @@ data class EncodedStackSection(
 
     fun spawnDroppedItemAt(
         worldKey: String,
-        itemId: Int,
-        itemCount: Int,
+        stack: ItemStackState,
         x: Double,
         y: Double,
         z: Double,
         impulse: Boolean = false
     ): Boolean {
-        if (itemId < 0 || itemCount <= 0) return false
+        val normalized = normalizeItemStackState(stack)
+        if (normalized.itemId < 0 || normalized.count <= 0) return false
         val world = WorldManager.world(worldKey) ?: return false
         val (vx, vy, vz) = if (!impulse) {
             Triple(0.0, 0.0, 0.0)
@@ -3037,8 +3040,7 @@ data class EncodedStackSection(
         }
         return world.spawnDroppedItem(
             entityId = allocateEntityId(),
-            itemId = itemId,
-            itemCount = itemCount,
+            stack = normalized,
             x = x,
             y = y,
             z = z,
@@ -3051,14 +3053,14 @@ data class EncodedStackSection(
 
     fun spawnDroppedItemEntityAt(
         worldKey: String,
-        itemId: Int,
-        itemCount: Int,
+        stack: ItemStackState,
         x: Double,
         y: Double,
         z: Double,
         impulse: Boolean = false
     ): DroppedItemSnapshot? {
-        if (itemId < 0 || itemCount <= 0) return null
+        val normalized = normalizeItemStackState(stack)
+        if (normalized.itemId < 0 || normalized.count <= 0) return null
         val world = WorldManager.world(worldKey) ?: return null
         val (vx, vy, vz) = if (!impulse) {
             Triple(0.0, 0.0, 0.0)
@@ -3073,8 +3075,7 @@ data class EncodedStackSection(
         val entityId = allocateEntityId()
         val spawned = world.spawnDroppedItem(
             entityId = entityId,
-            itemId = itemId,
-            itemCount = itemCount,
+            stack = normalized,
             x = x,
             y = y,
             z = z,
@@ -3304,13 +3305,14 @@ data class EncodedStackSection(
 
     fun setDroppedItemStack(worldKey: String, entityId: Int, itemId: Int, amount: Int): Boolean {
         if (itemId < 0 || amount <= 0) return false
+        return setDroppedItemStack(worldKey, entityId, buildStackState(itemId = itemId, count = amount))
+    }
+
+    fun setDroppedItemStack(worldKey: String, entityId: Int, stack: ItemStackState): Boolean {
+        val normalized = normalizeItemStackState(stack)
+        if (normalized.itemId < 0 || normalized.count <= 0) return false
         val world = WorldManager.world(worldKey) ?: return false
-        val updated = world.setDroppedItemStack(entityId, itemId, amount) ?: return false
-        val meta = droppedItemTextMetaByEntityId[entityId]
-        if (meta != null && meta.expectedItemId != updated.itemId) {
-            droppedItemTextMetaByEntityId.remove(entityId)
-        }
-        return true
+        return world.setDroppedItemStack(entityId, normalized) != null
     }
 
     fun setDroppedItemPosition(worldKey: String, entityId: Int, x: Double, y: Double, z: Double): Boolean {
@@ -3513,24 +3515,9 @@ data class EncodedStackSection(
                     }
                 }
                 val chunkProcessingFrame = world.beginChunkProcessingFrame(tickSequence)
-                pendingAsync.incrementAndGet()
                 val droppedEvents = world.tickDroppedItems(
                     physicsDeltaSeconds,
-                    activeSimulationChunks,
-                    onChunkEvents = { chunkEvents ->
-                        dispatchWorldPhysicsEvents(
-                            world = world,
-                            worldSessions = sessionsSnapshot,
-                            events = WorldPhysicsEvents(
-                                droppedItems = chunkEvents,
-                                fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
-                                thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
-                                animals = org.macaroon3145.world.AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
-                            ),
-                            deltaSeconds = deltaSeconds
-                        )
-                    },
-                    onDispatchComplete = { done() }
+                    activeSimulationChunks
                 ) { chunkPos, elapsedNanos ->
                     world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "dropped")
                 }
@@ -3680,8 +3667,6 @@ data class EncodedStackSection(
 
         for (chunkPos in chunksInOrder) {
             for (pickup in pickupsByChunk[chunkPos].orEmpty()) {
-                droppedItemTextMetaByEntityId.remove(pickup.entityId)
-                droppedShulkerContentsByEntityId.remove(pickup.entityId)
                 val takePacket = if (pickup.showTakeAnimation && pickup.pickupItemCount > 0) {
                     PlayPackets.takeItemEntityPacket(
                         collectedEntityId = pickup.entityId,
@@ -3691,26 +3676,53 @@ data class EncodedStackSection(
                 } else {
                     null
                 }
-                val removePacket = PlayPackets.removeEntitiesPacket(intArrayOf(pickup.entityId))
+                val removePacket = if (pickup.removed) {
+                    PlayPackets.removeEntitiesPacket(intArrayOf(pickup.entityId))
+                } else {
+                    null
+                }
                 for (session in worldSessions) {
                     val isCollector = session.entityId == pickup.collectorEntityId
                     val wasVisible = session.visibleDroppedItemEntityIds.contains(pickup.entityId)
                     val inLoadedChunk = session.loadedChunks.contains(chunkPos)
                     if (!isCollector && !wasVisible && !inLoadedChunk) continue
-                    session.visibleDroppedItemEntityIds.remove(pickup.entityId)
-                    session.droppedItemTrackerStates.remove(pickup.entityId)
                     val ctx = contexts[session.channelId] ?: continue
                     if (!ctx.channel().isActive) continue
                     if (takePacket != null && (isCollector || wasVisible || inLoadedChunk)) {
                         enqueueDroppedItemPacket(outboundByContext, ctx, takePacket)
                     }
-                    enqueueDroppedItemPacket(outboundByContext, ctx, removePacket)
+                    if (pickup.removed) {
+                        session.visibleDroppedItemEntityIds.remove(pickup.entityId)
+                        session.droppedItemTrackerStates.remove(pickup.entityId)
+                        if (removePacket != null) {
+                            enqueueDroppedItemPacket(outboundByContext, ctx, removePacket)
+                        }
+                    } else {
+                        val remaining = pickup.remainingSnapshot
+                        if (remaining != null) {
+                            enqueueDroppedItemPacket(
+                                outboundByContext,
+                                ctx,
+                                PlayPackets.itemEntityMetadataPacket(
+                                    entityId = pickup.entityId,
+                                    encodedItemStack = encodedItemStack(
+                                        stack = remaining.stack,
+                                        localeTag = session.locale
+                                    )
+                                )
+                            )
+                            session.droppedItemTrackerStates[pickup.entityId]?.let { tracker ->
+                                tracker.lastEncodedItemStack = encodedItemStack(
+                                    stack = remaining.stack,
+                                    localeTag = session.locale
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
             for (removed in droppedRemovedByChunk[chunkPos].orEmpty()) {
-                droppedItemTextMetaByEntityId.remove(removed.entityId)
-                droppedShulkerContentsByEntityId.remove(removed.entityId)
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
                     val wasVisible = session.visibleDroppedItemEntityIds.remove(removed.entityId)
@@ -5375,34 +5387,30 @@ data class EncodedStackSection(
 
     private fun refreshRetainedBaseChunksForSession(session: PlayerSession) {
         val worldKey = session.worldKey
-        synchronized(session) {
-            val next = buildRetainedBaseChunkFootprint(session)
-            val previous = retainedBaseChunksByPlayerEntityId[session.entityId]
-            if (previous == next) {
-                return
-            }
-            if (previous != null) {
-                removeRetainedBaseFootprintRefs(worldKey, previous)
-            }
-            if (next.isEmpty()) {
-                retainedBaseChunksByPlayerEntityId.remove(session.entityId)
-                retainedBaseWorldKeyByPlayerEntityId.remove(session.entityId)
-            } else {
-                retainedBaseChunksByPlayerEntityId[session.entityId] = next
-                retainedBaseWorldKeyByPlayerEntityId[session.entityId] = worldKey
-                addRetainedBaseFootprintRefs(worldKey, next)
-            }
+        val next = buildRetainedBaseChunkFootprint(session)
+        val previous = retainedBaseChunksByPlayerEntityId[session.entityId]
+        if (previous == next) {
+            return
+        }
+        if (previous != null) {
+            removeRetainedBaseFootprintRefs(worldKey, previous)
+        }
+        if (next.isEmpty()) {
+            retainedBaseChunksByPlayerEntityId.remove(session.entityId)
+            retainedBaseWorldKeyByPlayerEntityId.remove(session.entityId)
+        } else {
+            retainedBaseChunksByPlayerEntityId[session.entityId] = next
+            retainedBaseWorldKeyByPlayerEntityId[session.entityId] = worldKey
+            addRetainedBaseFootprintRefs(worldKey, next)
         }
         publishRetainedBaseChunksForWorld(worldKey)
     }
 
     private fun removeRetainedBaseChunksForSession(session: PlayerSession) {
         val worldKey = session.worldKey
-        synchronized(session) {
-            val previous = retainedBaseChunksByPlayerEntityId.remove(session.entityId) ?: return
-            retainedBaseWorldKeyByPlayerEntityId.remove(session.entityId)
-            removeRetainedBaseFootprintRefs(worldKey, previous)
-        }
+        val previous = retainedBaseChunksByPlayerEntityId.remove(session.entityId) ?: return
+        retainedBaseWorldKeyByPlayerEntityId.remove(session.entityId)
+        removeRetainedBaseFootprintRefs(worldKey, previous)
         publishRetainedBaseChunksForWorld(worldKey)
     }
 
@@ -5441,9 +5449,7 @@ data class EncodedStackSection(
     }
 
     private fun clearActiveSimulationChunkDeltas() {
-        synchronized(activeSimulationDeltaLock) {
-            activeSimulationDeltaByWorld.clear()
-        }
+        activeSimulationDeltaByWorldRef.set(ConcurrentHashMap())
     }
 
     private fun recordActiveSimulationChunkDelta(worldKey: String, previous: Set<ChunkPos>, next: Set<ChunkPos>) {
@@ -5458,11 +5464,10 @@ data class EncodedStackSection(
         }
         if (added.isEmpty() && removed.isEmpty()) return
 
-        synchronized(activeSimulationDeltaLock) {
-            val previousDelta = activeSimulationDeltaByWorld[worldKey]
+        val deltaMap = activeSimulationDeltaByWorldRef.get()
+        deltaMap.compute(worldKey) { _, previousDelta ->
             if (previousDelta == null) {
-                activeSimulationDeltaByWorld[worldKey] = SimulationChunkDelta(added = added, removed = removed)
-                return
+                return@compute SimulationChunkDelta(added = added, removed = removed)
             }
             val mergedAdded = HashSet(previousDelta.added)
             val mergedRemoved = HashSet(previousDelta.removed)
@@ -5477,9 +5482,9 @@ data class EncodedStackSection(
                 }
             }
             if (mergedAdded.isEmpty() && mergedRemoved.isEmpty()) {
-                activeSimulationDeltaByWorld.remove(worldKey)
+                null
             } else {
-                activeSimulationDeltaByWorld[worldKey] = SimulationChunkDelta(added = mergedAdded, removed = mergedRemoved)
+                SimulationChunkDelta(added = mergedAdded, removed = mergedRemoved)
             }
         }
     }
@@ -6530,51 +6535,7 @@ data class EncodedStackSection(
     }
 
     private fun debugLogHeldItemState(session: PlayerSession, reason: String) {
-        if (!HELD_ITEM_DEBUG_LOG_ENABLED) return
-        val selected = session.selectedHotbarSlot.coerceIn(0, 8)
-        val mainId = session.hotbarStacks[selected].itemId
-        val mainCount = session.hotbarStacks[selected].count
-        val mainKey = heldItemKey(mainId) ?: "none"
-        val mainShulkerHas = if (mainId >= 0 && isShulkerItemId(mainId)) {
-            session.hotbarStacks[selected].shulkerContents?.let(::chestHasAnyItems) == true
-        } else {
-            false
-        }
-        val offId = session.offhandStack.itemId
-        val offCount = session.offhandStack.count
-        val offKey = heldItemKey(offId) ?: "none"
-        val offShulkerHas = if (offId >= 0 && isShulkerItemId(offId)) {
-            session.offhandStack.shulkerContents?.let(::chestHasAnyItems) == true
-        } else {
-            false
-        }
-        val hotbarSummary = buildString(128) {
-            for (i in 0..8) {
-                if (i > 0) append(",")
-                val id = session.hotbarStacks[i].itemId
-                append(i)
-                    .append("=")
-                    .append(heldItemKey(id) ?: "none")
-                    .append("x")
-                    .append(session.hotbarStacks[i].count)
-            }
-        }
-        logger.info(
-            "HeldItemDebug reason={} player={} world={} sel={} main={}({})x{} mainShulkerHas={} off={}({})x{} offShulkerHas={} hotbar=[{}]",
-            reason,
-            session.profile.username,
-            session.worldKey,
-            selected,
-            mainKey,
-            mainId,
-            mainCount,
-            mainShulkerHas,
-            offKey,
-            offId,
-            offCount,
-            offShulkerHas,
-            hotbarSummary
-        )
+        // Held-item debug log is intentionally disabled.
     }
 
     private fun vanillaAttackDamageByItemKey(itemKey: String): Float {
@@ -6924,8 +6885,7 @@ data class EncodedStackSection(
         if (dropSaddle && saddleItemId >= 0) {
             world.spawnDroppedItem(
                 entityId = allocateEntityId(),
-                itemId = saddleItemId,
-                itemCount = 1,
+                stack = buildStackState(itemId = saddleItemId, count = 1),
                 x = removed.x,
                 y = removed.y + 0.1,
                 z = removed.z,
@@ -6958,8 +6918,7 @@ data class EncodedStackSection(
 
         world.spawnDroppedItem(
             entityId = allocateEntityId(),
-            itemId = itemId,
-            itemCount = totalCount,
+            stack = buildStackState(itemId = itemId, count = totalCount),
             x = removed.x,
             y = removed.y + 0.1,
             z = removed.z,
@@ -7768,8 +7727,6 @@ data class EncodedStackSection(
         sessions.clear()
         activeBlockBreakVisualByChannelId.clear()
         itemTextMetaByPlayerUuid.clear()
-        droppedItemTextMetaByEntityId.clear()
-        droppedShulkerContentsByEntityId.clear()
         animalSourceDirtyWorlds.clear()
         animalRideControlsActiveWorlds.clear()
         attackCooldownActiveChannelIds.clear()
@@ -7887,17 +7844,13 @@ data class EncodedStackSection(
 
         val world = WorldManager.world(session.worldKey) ?: return
         for (entityId in session.visibleDroppedItemEntityIds) {
-            val meta = droppedItemTextMetaByEntityId[entityId] ?: continue
-            if (!meta.hasTranslations()) continue
             val snapshot = world.droppedItemSnapshot(entityId) ?: continue
-            if (snapshot.itemId != meta.expectedItemId || snapshot.itemCount <= 0) continue
+            if (snapshot.stack.itemId < 0 || snapshot.stack.count <= 0) continue
             ctx.write(
                 PlayPackets.itemEntityMetadataPacket(
                     entityId = entityId,
                     encodedItemStack = encodedItemStack(
-                        itemId = snapshot.itemId,
-                        count = snapshot.itemCount,
-                        textMeta = meta,
+                        stack = snapshot.stack,
                         localeTag = session.locale
                     )
                 )
@@ -7915,10 +7868,7 @@ data class EncodedStackSection(
     }
 
     private fun hasVisibleTranslatedDroppedItems(session: PlayerSession): Boolean {
-        for (entityId in session.visibleDroppedItemEntityIds) {
-            if (droppedItemTextMetaByEntityId[entityId]?.hasTranslations() == true) return true
-        }
-        return false
+        return session.visibleDroppedItemEntityIds.isNotEmpty()
     }
 
     fun inGameCommandSuggestions(sender: PlayerSession?, input: String, includeOperatorCommands: Boolean): CommandSuggestionWindow {
@@ -15042,8 +14992,7 @@ data class EncodedStackSection(
         val entityId = allocateEntityId()
         val spawned = world.spawnDroppedItem(
             entityId = entityId,
-            itemId = itemId,
-            itemCount = itemCount,
+            stack = normalized,
             x = spawnX,
             y = spawnY,
             z = spawnZ,
@@ -15052,24 +15001,400 @@ data class EncodedStackSection(
             vz = vz,
             pickupDelaySeconds = PLAYER_DROPPED_ITEM_PICKUP_DELAY_SECONDS
         )
-        if (spawned) {
-            val normalizedMeta = textMeta?.takeIf { it.expectedItemId == itemId }
-            if (normalizedMeta != null) {
-                droppedItemTextMetaByEntityId[entityId] = normalizedMeta
-            } else {
-                droppedItemTextMetaByEntityId.remove(entityId)
-            }
-            val normalizedShulker = normalized.shulkerContents?.takeIf(::chestHasAnyItems)?.let(::copyChestState)
-            if (normalizedShulker != null) {
-                droppedShulkerContentsByEntityId[entityId] = normalizedShulker
-            } else {
-                droppedShulkerContentsByEntityId.remove(entityId)
-            }
-        } else {
-            droppedItemTextMetaByEntityId.remove(entityId)
-            droppedShulkerContentsByEntityId.remove(entityId)
-        }
+        if (!spawned) return false
         return spawned
+    }
+
+    private fun mergeDroppedTickEvents(
+        base: org.macaroon3145.world.DroppedItemTickEvents,
+        merged: DroppedItemMergeResult
+    ): org.macaroon3145.world.DroppedItemTickEvents {
+        if (merged.updated.isEmpty() && merged.removed.isEmpty()) return base
+        val spawnedById = LinkedHashMap<Int, DroppedItemSnapshot>(base.spawned.size)
+        val updatedById = LinkedHashMap<Int, DroppedItemSnapshot>(base.updated.size)
+        val removedById = LinkedHashMap<Int, org.macaroon3145.world.DroppedItemRemovedEvent>(base.removed.size + merged.removed.size)
+
+        for (snapshot in base.spawned) {
+            spawnedById[snapshot.entityId] = snapshot
+        }
+        for (snapshot in base.updated) {
+            updatedById[snapshot.entityId] = snapshot
+        }
+        for (removed in base.removed) {
+            removedById[removed.entityId] = removed
+        }
+
+        for (snapshot in merged.updated) {
+            if (spawnedById.containsKey(snapshot.entityId)) {
+                spawnedById[snapshot.entityId] = snapshot
+            } else {
+                updatedById[snapshot.entityId] = snapshot
+            }
+        }
+        for (removed in merged.removed) {
+            spawnedById.remove(removed.entityId)
+            updatedById.remove(removed.entityId)
+            removedById[removed.entityId] = removed
+        }
+
+        return org.macaroon3145.world.DroppedItemTickEvents(
+            spawned = spawnedById.values.toList(),
+            updated = updatedById.values.toList(),
+            removed = removedById.values.toList()
+        )
+    }
+
+    private fun mergeNearbyDroppedItems(
+        world: org.macaroon3145.world.World,
+        activeSimulationChunks: Set<ChunkPos>,
+        deltaSeconds: Double
+    ): DroppedItemMergeResult {
+        if (deltaSeconds <= 0.0 || activeSimulationChunks.isEmpty()) {
+            return DroppedItemMergeResult(emptyList(), emptyList())
+        }
+        val snapshots = world.droppedItemSnapshots()
+            .asSequence()
+            .filter { it.chunkPos in activeSimulationChunks }
+            .filter { it.stack.itemId >= 0 && it.stack.count > 0 }
+            .toList()
+        if (snapshots.size < 2) {
+            return DroppedItemMergeResult(emptyList(), emptyList())
+        }
+
+        val chunked = HashMap<ChunkPos, MutableList<DroppedItemSnapshot>>()
+        for (snapshot in snapshots) {
+            chunked.computeIfAbsent(snapshot.chunkPos) { ArrayList() }.add(snapshot)
+        }
+
+        val updated = LinkedHashMap<Int, DroppedItemSnapshot>()
+        val removed = LinkedHashMap<Int, org.macaroon3145.world.DroppedItemRemovedEvent>()
+        val consumed = HashSet<Int>()
+        val ordered = snapshots.sortedBy { it.entityId }
+
+        for (snapshot in ordered) {
+            if (snapshot.entityId in consumed) continue
+            val self = world.droppedItemSnapshot(snapshot.entityId) ?: continue
+            if (self.uuid != snapshot.uuid || self.stack.count <= 0 || self.stack.itemId < 0) continue
+
+            val partner = findBestDroppedMergePartner(
+                world = world,
+                origin = self,
+                candidatesByChunk = chunked,
+                activeSimulationChunks = activeSimulationChunks,
+                consumed = consumed
+            ) ?: continue
+
+            val partnerLive = world.droppedItemSnapshot(partner.entityId) ?: continue
+            if (partnerLive.uuid != partner.uuid || partnerLive.stack.count <= 0 || partnerLive.stack.itemId < 0) continue
+            if (!canMergeDroppedStacks(self, partnerLive)) continue
+            val maxStackSize = itemMaxStackSize(self.stack.itemId)
+            if (maxStackSize <= 0) continue
+            if (self.stack.count >= maxStackSize && partnerLive.stack.count >= maxStackSize) continue
+
+            val dx = partnerLive.x - self.x
+            val dy = partnerLive.y - self.y
+            val dz = partnerLive.z - self.z
+            val distanceSq = (dx * dx) + (dy * dy) + (dz * dz)
+
+            val canSnapMergeNow = distanceSq <= DROPPED_ITEM_MERGE_SNAP_DISTANCE_SQ
+            if (canSnapMergeNow) {
+                val keep = if (self.stack.count > partnerLive.stack.count) self else if (self.stack.count < partnerLive.stack.count) partnerLive else if (self.entityId <= partnerLive.entityId) self else partnerLive
+                val merge = if (keep.entityId == self.entityId) partnerLive else self
+                val transferable = minOf(maxStackSize - keep.stack.count, merge.stack.count)
+                if (transferable <= 0) continue
+
+                val midpointVx = (self.vx + partnerLive.vx) * 0.5
+                val midpointVy = (self.vy + partnerLive.vy) * 0.5
+                val midpointVz = (self.vz + partnerLive.vz) * 0.5
+                val totalCountForAccel = (self.stack.count + partnerLive.stack.count).coerceAtLeast(1)
+                val mergedAx =
+                    ((self.accelerationX * self.stack.count) + (partnerLive.accelerationX * partnerLive.stack.count)) / totalCountForAccel
+                val mergedAy =
+                    ((self.accelerationY * self.stack.count) + (partnerLive.accelerationY * partnerLive.stack.count)) / totalCountForAccel
+                val mergedAz =
+                    ((self.accelerationZ * self.stack.count) + (partnerLive.accelerationZ * partnerLive.stack.count)) / totalCountForAccel
+
+                val remainCount = merge.stack.count - transferable
+                val tx = applyDroppedMergeTransaction(
+                    world = world,
+                    keep = keep,
+                    merge = merge,
+                    keepCount = keep.stack.count + transferable,
+                    mergeCount = remainCount,
+                    vx = midpointVx,
+                    vy = midpointVy,
+                    vz = midpointVz,
+                    ax = mergedAx,
+                    ay = mergedAy,
+                    az = mergedAz
+                ) ?: continue
+                updated[tx.keep.entityId] = tx.keep
+                if (tx.merge != null) {
+                    updated[tx.merge.entityId] = tx.merge
+                } else {
+                    removed[merge.entityId] =
+                        org.macaroon3145.world.DroppedItemRemovedEvent(merge.entityId, merge.chunkPos)
+                }
+                consumed.add(keep.entityId)
+                consumed.add(merge.entityId)
+                continue
+            }
+
+            if (distanceSq > DROPPED_ITEM_MERGE_ATTRACT_DISTANCE_SQ) continue
+            val distance = sqrt(distanceSq)
+            if (distance <= 1.0e-6) continue
+            val midpointX = (self.x + partnerLive.x) * 0.5
+            val midpointY = (self.y + partnerLive.y) * 0.5
+            val midpointZ = (self.z + partnerLive.z) * 0.5
+            val pullStep = (DROPPED_ITEM_MERGE_PULL_PER_SECOND * deltaSeconds).coerceAtMost(DROPPED_ITEM_MERGE_MAX_PULL_STEP)
+
+            val selfDirX = (midpointX - self.x) / distance
+            val selfDirZ = (midpointZ - self.z) / distance
+            val partnerDirX = (midpointX - partnerLive.x) / distance
+            val partnerDirZ = (midpointZ - partnerLive.z) / distance
+
+            val selfUpdated = world.setDroppedItemVelocity(
+                self.entityId,
+                (self.vx + selfDirX * pullStep).coerceIn(-DROPPED_ITEM_MERGE_MAX_PULL_SPEED, DROPPED_ITEM_MERGE_MAX_PULL_SPEED),
+                self.vy,
+                (self.vz + selfDirZ * pullStep).coerceIn(-DROPPED_ITEM_MERGE_MAX_PULL_SPEED, DROPPED_ITEM_MERGE_MAX_PULL_SPEED)
+            )
+            val partnerUpdated = world.setDroppedItemVelocity(
+                partnerLive.entityId,
+                (partnerLive.vx + partnerDirX * pullStep).coerceIn(-DROPPED_ITEM_MERGE_MAX_PULL_SPEED, DROPPED_ITEM_MERGE_MAX_PULL_SPEED),
+                partnerLive.vy,
+                (partnerLive.vz + partnerDirZ * pullStep).coerceIn(-DROPPED_ITEM_MERGE_MAX_PULL_SPEED, DROPPED_ITEM_MERGE_MAX_PULL_SPEED)
+            )
+            if (selfUpdated != null) updated[self.entityId] = selfUpdated
+            if (partnerUpdated != null) updated[partnerLive.entityId] = partnerUpdated
+            consumed.add(self.entityId)
+            consumed.add(partnerLive.entityId)
+        }
+
+        return DroppedItemMergeResult(
+            updated = updated.values.toList(),
+            removed = removed.values.toList()
+        )
+    }
+
+    private fun findBestDroppedMergePartner(
+        world: org.macaroon3145.world.World,
+        origin: DroppedItemSnapshot,
+        candidatesByChunk: Map<ChunkPos, List<DroppedItemSnapshot>>,
+        activeSimulationChunks: Set<ChunkPos>,
+        consumed: Set<Int>
+    ): DroppedItemSnapshot? {
+        var best: DroppedItemSnapshot? = null
+        var bestDistanceSq = Double.POSITIVE_INFINITY
+        for (chunkX in (origin.chunkPos.x - 1)..(origin.chunkPos.x + 1)) {
+            for (chunkZ in (origin.chunkPos.z - 1)..(origin.chunkPos.z + 1)) {
+                val chunkPos = ChunkPos(chunkX, chunkZ)
+                if (chunkPos !in activeSimulationChunks) continue
+                val candidates = candidatesByChunk[chunkPos] ?: continue
+                for (candidate in candidates) {
+                    if (candidate.entityId == origin.entityId) continue
+                    if (candidate.entityId in consumed) continue
+                    val live = world.droppedItemSnapshot(candidate.entityId) ?: continue
+                    if (live.uuid != candidate.uuid || live.stack.count <= 0 || live.stack.itemId < 0) continue
+                    if (!canMergeDroppedStacks(origin, live)) continue
+                    val maxStack = itemMaxStackSize(origin.stack.itemId)
+                    if (maxStack <= 0) continue
+                    if (origin.stack.count >= maxStack && live.stack.count >= maxStack) continue
+                    val dx = live.x - origin.x
+                    val dy = live.y - origin.y
+                    val dz = live.z - origin.z
+                    val distanceSq = (dx * dx) + (dy * dy) + (dz * dz)
+                    if (distanceSq > DROPPED_ITEM_MERGE_ATTRACT_DISTANCE_SQ) continue
+                    if (distanceSq < bestDistanceSq ||
+                        (abs(distanceSq - bestDistanceSq) <= DROPPED_ITEM_PICKUP_DISTANCE_EPSILON && live.entityId < (best?.entityId ?: Int.MAX_VALUE))
+                    ) {
+                        best = live
+                        bestDistanceSq = distanceSq
+                    }
+                }
+            }
+        }
+        return best
+    }
+
+    private fun canMergeDroppedStacks(left: DroppedItemSnapshot, right: DroppedItemSnapshot): Boolean {
+        if (left.stack.itemId != right.stack.itemId) return false
+        val leftStack = droppedSnapshotStackState(left)
+        val rightStack = droppedSnapshotStackState(right)
+        if (!areContainerStacksMergeCompatible(leftStack, rightStack)) return false
+
+        val maxStackSize = itemMaxStackSize(left.stack.itemId)
+        if (maxStackSize <= 0) return false
+        return left.stack.count < maxStackSize || right.stack.count < maxStackSize
+    }
+
+    private fun droppedSnapshotStackState(snapshot: DroppedItemSnapshot): ItemStackState {
+        return snapshot.stack
+    }
+
+    private data class DroppedMergeTransactionResult(
+        val keep: DroppedItemSnapshot,
+        val merge: DroppedItemSnapshot?
+    )
+
+    private fun applyDroppedMergeTransaction(
+        world: org.macaroon3145.world.World,
+        keep: DroppedItemSnapshot,
+        merge: DroppedItemSnapshot,
+        keepCount: Int,
+        mergeCount: Int,
+        vx: Double,
+        vy: Double,
+        vz: Double,
+        ax: Double,
+        ay: Double,
+        az: Double
+    ): DroppedMergeTransactionResult? {
+        if (keepCount <= 0 || mergeCount < 0) return null
+        val removedKeep = world.removeDroppedItemIfMatches(keep.entityId, keep) ?: return null
+        val removedMerge = world.removeDroppedItemIfMatches(merge.entityId, merge)
+        if (removedMerge == null) {
+            restoreDroppedSnapshot(world, removedKeep)
+            return null
+        }
+
+        val mergedPickupDelay = minOf(removedKeep.pickupDelaySeconds, removedMerge.pickupDelaySeconds)
+        val keepLive = respawnDroppedItemSafely(
+            world = world,
+            preferredEntityId = removedKeep.entityId,
+            preferredUuid = removedKeep.uuid,
+            stack = removedKeep.stack.copy(count = keepCount),
+            x = removedKeep.x,
+            y = removedKeep.y,
+            z = removedKeep.z,
+            vx = vx,
+            vy = vy,
+            vz = vz,
+            pickupDelaySeconds = mergedPickupDelay
+        )
+        if (keepLive == null) {
+            restoreDroppedSnapshot(world, removedKeep)
+            restoreDroppedSnapshot(world, removedMerge)
+            return null
+        }
+        if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
+            world.setDroppedItemAcceleration(keepLive.entityId, ax, ay, az)
+        }
+        val refreshedKeepAfterAccel = world.droppedItemSnapshot(keepLive.entityId)
+        if (refreshedKeepAfterAccel == null) {
+            world.removeDroppedItemIfUuidMatches(keepLive.entityId, keepLive.uuid)
+            restoreDroppedSnapshot(world, removedKeep)
+            restoreDroppedSnapshot(world, removedMerge)
+            return null
+        }
+
+        if (mergeCount <= 0) {
+            return DroppedMergeTransactionResult(keep = refreshedKeepAfterAccel, merge = null)
+        }
+
+        val mergeLive = respawnDroppedItemSafely(
+            world = world,
+            preferredEntityId = removedMerge.entityId,
+            preferredUuid = removedMerge.uuid,
+            stack = removedMerge.stack.copy(count = mergeCount),
+            x = removedMerge.x,
+            y = removedMerge.y,
+            z = removedMerge.z,
+            vx = vx,
+            vy = vy,
+            vz = vz,
+            pickupDelaySeconds = mergedPickupDelay
+        )
+        if (mergeLive == null) {
+            world.removeDroppedItemIfUuidMatches(refreshedKeepAfterAccel.entityId, refreshedKeepAfterAccel.uuid)
+            restoreDroppedSnapshot(world, removedKeep)
+            restoreDroppedSnapshot(world, removedMerge)
+            return null
+        }
+        if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
+            world.setDroppedItemAcceleration(mergeLive.entityId, ax, ay, az)
+        }
+        val refreshedMergeAfterAccel = world.droppedItemSnapshot(mergeLive.entityId)
+        if (refreshedMergeAfterAccel == null) {
+            world.removeDroppedItemIfUuidMatches(mergeLive.entityId, mergeLive.uuid)
+            world.removeDroppedItemIfUuidMatches(refreshedKeepAfterAccel.entityId, refreshedKeepAfterAccel.uuid)
+            restoreDroppedSnapshot(world, removedKeep)
+            restoreDroppedSnapshot(world, removedMerge)
+            return null
+        }
+        val refreshedKeep = world.droppedItemSnapshot(refreshedKeepAfterAccel.entityId) ?: refreshedKeepAfterAccel
+        return DroppedMergeTransactionResult(keep = refreshedKeep, merge = refreshedMergeAfterAccel)
+    }
+
+    private fun restoreDroppedSnapshot(world: org.macaroon3145.world.World, snapshot: DroppedItemSnapshot): Boolean {
+        return respawnDroppedItemSafely(
+            world = world,
+            preferredEntityId = snapshot.entityId,
+            preferredUuid = snapshot.uuid,
+            stack = snapshot.stack,
+            x = snapshot.x,
+            y = snapshot.y,
+            z = snapshot.z,
+            vx = snapshot.vx,
+            vy = snapshot.vy,
+            vz = snapshot.vz,
+            pickupDelaySeconds = snapshot.pickupDelaySeconds
+        ) != null
+    }
+
+    private fun respawnDroppedItemSafely(
+        world: org.macaroon3145.world.World,
+        preferredEntityId: Int,
+        preferredUuid: UUID?,
+        stack: ItemStackState,
+        x: Double,
+        y: Double,
+        z: Double,
+        vx: Double,
+        vy: Double,
+        vz: Double,
+        pickupDelaySeconds: Double
+    ): DroppedItemSnapshot? {
+        if (stack.itemId < 0 || stack.count <= 0) return null
+        if (preferredUuid != null) {
+            val existing = world.droppedItemSnapshotByUuid(preferredUuid)
+            if (existing != null) {
+                val updatedStack = world.setDroppedItemStack(existing.entityId, stack) ?: return null
+                world.setDroppedItemPosition(existing.entityId, x, y, z)
+                world.setDroppedItemVelocity(existing.entityId, vx, vy, vz)
+                world.setDroppedItemPickupDelay(existing.entityId, pickupDelaySeconds)
+                return world.droppedItemSnapshot(existing.entityId) ?: updatedStack
+            }
+        }
+        val firstSpawn = world.spawnDroppedItem(
+            entityId = preferredEntityId,
+            stack = stack,
+            x = x,
+            y = y,
+            z = z,
+            vx = vx,
+            vy = vy,
+            vz = vz,
+            uuid = preferredUuid ?: UUID.randomUUID(),
+            pickupDelaySeconds = pickupDelaySeconds
+        )
+        if (firstSpawn) {
+            return world.droppedItemSnapshot(preferredEntityId)
+        }
+        val fallbackEntityId = allocateEntityId()
+        val fallbackSpawn = world.spawnDroppedItem(
+            entityId = fallbackEntityId,
+            stack = stack,
+            x = x,
+            y = y,
+            z = z,
+            vx = vx,
+            vy = vy,
+            vz = vz,
+            uuid = preferredUuid ?: UUID.randomUUID(),
+            pickupDelaySeconds = pickupDelaySeconds
+        )
+        return if (fallbackSpawn) world.droppedItemSnapshot(fallbackEntityId) else null
     }
 
     private fun collectDroppedItemPickups(
@@ -15089,7 +15414,6 @@ data class EncodedStackSection(
         for ((collectorOrder, collector) in collectors.withIndex()) {
             val playerChunkX = ChunkStreamingService.chunkXFromBlockX(collector.x)
             val playerChunkZ = ChunkStreamingService.chunkZFromBlockZ(collector.z)
-
             for (chunkX in (playerChunkX - 1)..(playerChunkX + 1)) {
                 for (chunkZ in (playerChunkZ - 1)..(playerChunkZ + 1)) {
                     val chunkPos = ChunkPos(chunkX, chunkZ)
@@ -15131,80 +15455,39 @@ data class EncodedStackSection(
             )
 
         for (candidate in orderedCandidates) {
-            val snapshot = world.droppedItemSnapshot(candidate.snapshot.entityId) ?: continue
             val collector = candidate.collector
+            val snapshot = world.droppedItemSnapshot(candidate.snapshot.entityId) ?: continue
             if (snapshot.pickupDelaySeconds > DROPPED_ITEM_PICKUP_DELAY_EPSILON) continue
             if (!canPlayerPickDroppedItem(collector, snapshot)) continue
-            val pickupStack = buildStackState(itemId = snapshot.itemId, count = snapshot.itemCount).let { base ->
-                withShulkerContents(base, droppedShulkerContentsByEntityId[snapshot.entityId])
-            }
-            if (!canAbsorbDroppedItem(collector, pickupStack)) continue
+            if (!canAbsorbDroppedItem(collector, snapshot.stack)) continue
 
-            val removedSnapshot = world.removeDroppedItemIfUuidMatches(snapshot.entityId, snapshot.uuid) ?: continue
-            droppedItemTextMetaByEntityId.remove(removedSnapshot.entityId)
-            val removedShulkerContents = droppedShulkerContentsByEntityId.remove(removedSnapshot.entityId)
-            if (HELD_ITEM_DEBUG_LOG_ENABLED && isShulkerItemId(removedSnapshot.itemId)) {
-                logger.info(
-                    "HeldItemDebug reason=dropped_pickup entity={} player={} item={} hasShulkerMeta={} count={}",
-                    removedSnapshot.entityId,
-                    collector.profile.username,
-                    heldItemKey(removedSnapshot.itemId) ?: removedSnapshot.itemId.toString(),
-                    removedShulkerContents?.let(::chestHasAnyItems) == true,
-                    removedSnapshot.itemCount
-                )
-            }
-            if (!absorbDroppedItemIntoHotbar(
-                    session = collector,
-                    stack = withShulkerContents(
-                        pickupStack.copy(
-                            itemId = removedSnapshot.itemId,
-                            count = removedSnapshot.itemCount
-                        ),
-                        removedShulkerContents
-                    ),
-                    outboundByContext = outboundByContext
-                )
-            ) {
-                // Keep items safe if inventory changed between can-absorb check and apply.
-                val restoredEntityId = allocateEntityId()
-                world.spawnDroppedItem(
-                    entityId = restoredEntityId,
-                    itemId = removedSnapshot.itemId,
-                    itemCount = removedSnapshot.itemCount,
-                    x = removedSnapshot.x,
-                    y = removedSnapshot.y,
-                    z = removedSnapshot.z,
-                    vx = removedSnapshot.vx,
-                    vy = removedSnapshot.vy,
-                    vz = removedSnapshot.vz,
-                    pickupDelaySeconds = 0.0
-                )
-                if (removedShulkerContents != null && chestHasAnyItems(removedShulkerContents)) {
-                    droppedShulkerContentsByEntityId[restoredEntityId] = copyChestState(removedShulkerContents)
-                }
-                removed.add(
-                    DroppedItemPickupResult(
-                        entityId = removedSnapshot.entityId,
-                        collectorEntityId = collector.entityId,
-                        pickupItemCount = 0,
-                        showTakeAnimation = false,
-                        x = removedSnapshot.x,
-                        y = removedSnapshot.y,
-                        z = removedSnapshot.z
-                    )
-                )
-                continue
-            }
+            val absorbedCount = absorbDroppedItemIntoInventory(
+                session = collector,
+                stack = snapshot.stack,
+                outboundByContext = outboundByContext
+            )
+            if (absorbedCount <= 0) continue
 
+            val consumed = world.consumeDroppedItemIfMatches(
+                entityId = snapshot.entityId,
+                expected = snapshot,
+                consumeCount = absorbedCount
+            ) ?: continue
+
+            val resolvedX = consumed.removed?.x ?: consumed.updated?.x ?: snapshot.x
+            val resolvedY = consumed.removed?.y ?: consumed.updated?.y ?: snapshot.y
+            val resolvedZ = consumed.removed?.z ?: consumed.updated?.z ?: snapshot.z
             removed.add(
                 DroppedItemPickupResult(
-                    entityId = removedSnapshot.entityId,
+                    entityId = snapshot.entityId,
                     collectorEntityId = collector.entityId,
-                    pickupItemCount = removedSnapshot.itemCount,
-                    showTakeAnimation = true,
-                    x = removedSnapshot.x,
-                    y = removedSnapshot.y,
-                    z = removedSnapshot.z
+                    pickupItemCount = consumed.consumedCount,
+                    showTakeAnimation = consumed.consumedCount > 0,
+                    removed = consumed.removed != null,
+                    remainingSnapshot = consumed.updated,
+                    x = resolvedX,
+                    y = resolvedY,
+                    z = resolvedZ
                 )
             )
         }
@@ -15234,9 +15517,8 @@ data class EncodedStackSection(
     private fun canAbsorbDroppedItem(session: PlayerSession, stack: ItemStackState): Boolean {
         val normalized = normalizeItemStackState(stack)
         val itemId = normalized.itemId
-        val itemCount = normalized.count
         val shulkerContents = normalized.shulkerContents
-        if (itemId < 0 || itemCount <= 0) return false
+        if (itemId < 0 || normalized.count <= 0) return false
         if (shulkerContents != null && chestHasAnyItems(shulkerContents)) {
             for (slot in 0..8) {
                 if (session.hotbarStacks[slot].count <= 0 || session.hotbarStacks[slot].itemId < 0) return true
@@ -15247,46 +15529,36 @@ data class EncodedStackSection(
             return false
         }
         val maxStackSize = itemMaxStackSize(itemId)
-        var remaining = itemCount
-
         for (slot in 0..8) {
             if (session.hotbarStacks[slot].count <= 0 || session.hotbarStacks[slot].itemId != itemId) continue
             val free = maxStackSize - session.hotbarStacks[slot].count
-            if (free <= 0) continue
-            remaining -= free
-            if (remaining <= 0) return true
+            if (free > 0) return true
         }
         for (slot in 0..8) {
-            if (session.hotbarStacks[slot].count > 0 && session.hotbarStacks[slot].itemId >= 0) continue
-            remaining -= maxStackSize
-            if (remaining <= 0) return true
+            if (session.hotbarStacks[slot].count <= 0 || session.hotbarStacks[slot].itemId < 0) return true
         }
 
         for (index in session.mainInventoryStacks.indices) {
             if (session.mainInventoryStacks[index].count <= 0 || session.mainInventoryStacks[index].itemId != itemId) continue
             val free = maxStackSize - session.mainInventoryStacks[index].count
-            if (free <= 0) continue
-            remaining -= free
-            if (remaining <= 0) return true
+            if (free > 0) return true
         }
         for (index in session.mainInventoryStacks.indices) {
-            if (session.mainInventoryStacks[index].count > 0 && session.mainInventoryStacks[index].itemId >= 0) continue
-            remaining -= maxStackSize
-            if (remaining <= 0) return true
+            if (session.mainInventoryStacks[index].count <= 0 || session.mainInventoryStacks[index].itemId < 0) return true
         }
         return false
     }
 
-    private fun absorbDroppedItemIntoHotbar(
+    private fun absorbDroppedItemIntoInventory(
         session: PlayerSession,
         stack: ItemStackState,
         outboundByContext: MutableMap<ChannelHandlerContext, MutableList<ByteArray>>
-    ): Boolean {
+    ): Int {
         val normalized = normalizeItemStackState(stack)
         val itemId = normalized.itemId
         val itemCount = normalized.count
         val shulkerContents = normalized.shulkerContents
-        if (itemId < 0 || itemCount <= 0) return false
+        if (itemId < 0 || itemCount <= 0) return 0
         if (shulkerContents != null && chestHasAnyItems(shulkerContents)) {
             val ctx = contexts[session.channelId]
             val emptyHotbar = (0..8).firstOrNull { session.hotbarStacks[it].count <= 0 || session.hotbarStacks[it].itemId < 0 }
@@ -15316,12 +15588,12 @@ data class EncodedStackSection(
                     session.selectedBlockStateId = session.hotbarBlockStateIds[emptyHotbar]
                     broadcastHeldItemEquipment(session)
                 }
-                return true
+                return 1
             }
 
             val emptyMain = session.mainInventoryStacks.indices
                 .firstOrNull { session.mainInventoryStacks[it].count <= 0 || session.mainInventoryStacks[it].itemId < 0 }
-                ?: return false
+                ?: return 0
             writeMainInventorySlot(session, emptyMain, normalized.copy(count = 1))
             if (ctx != null && ctx.channel().isActive) {
                 val encoded = encodedMainSlot(session, emptyMain)
@@ -15336,7 +15608,7 @@ data class EncodedStackSection(
                     )
                 )
             }
-            return true
+            return 1
         }
 
         val maxStackSize = itemMaxStackSize(itemId)
@@ -15346,48 +15618,80 @@ data class EncodedStackSection(
         val selectedSlot = session.selectedHotbarSlot.coerceIn(0, 8)
         val selectedBeforeItemId = session.hotbarStacks[selectedSlot].itemId
         val selectedBeforeCount = session.hotbarStacks[selectedSlot].count
+        val hotbarAddToExisting = IntArray(9)
+        val hotbarFillCount = IntArray(9)
+        val mainAddToExisting = IntArray(session.mainInventoryStacks.size)
+        val mainFillCount = IntArray(session.mainInventoryStacks.size)
+        val simulatedHotbarCounts = IntArray(9) { session.hotbarStacks[it].count.coerceAtLeast(0) }
+        val simulatedMainCounts = IntArray(session.mainInventoryStacks.size) { session.mainInventoryStacks[it].count.coerceAtLeast(0) }
 
         for (slot in 0..8) {
             if (remaining <= 0) break
             if (session.hotbarStacks[slot].count <= 0 || session.hotbarStacks[slot].itemId != itemId) continue
-            val free = maxStackSize - session.hotbarStacks[slot].count
+            val free = maxStackSize - simulatedHotbarCounts[slot]
             if (free <= 0) continue
             val added = minOf(free, remaining)
-            session.hotbarStacks[slot].count += added
+            hotbarAddToExisting[slot] += added
+            simulatedHotbarCounts[slot] += added
             remaining -= added
-            changedHotbarSlots.add(slot)
         }
 
         for (slot in 0..8) {
             if (remaining <= 0) break
             if (session.hotbarStacks[slot].count > 0 && session.hotbarStacks[slot].itemId >= 0) continue
             val added = minOf(maxStackSize, remaining)
-            setHotbarSlotWithMeta(session, slot, itemId, added, inheritedMeta = null)
+            hotbarFillCount[slot] = added
+            simulatedHotbarCounts[slot] = added
             remaining -= added
-            changedHotbarSlots.add(slot)
         }
 
         for (index in session.mainInventoryStacks.indices) {
             if (remaining <= 0) break
             if (session.mainInventoryStacks[index].count <= 0 || session.mainInventoryStacks[index].itemId != itemId) continue
-            val free = maxStackSize - session.mainInventoryStacks[index].count
+            val free = maxStackSize - simulatedMainCounts[index]
             if (free <= 0) continue
             val added = minOf(free, remaining)
-            session.mainInventoryStacks[index].count += added
+            mainAddToExisting[index] += added
+            simulatedMainCounts[index] += added
             remaining -= added
-            changedMainInventorySlots.add(index)
         }
 
         for (index in session.mainInventoryStacks.indices) {
             if (remaining <= 0) break
             if (session.mainInventoryStacks[index].count > 0 && session.mainInventoryStacks[index].itemId >= 0) continue
             val added = minOf(maxStackSize, remaining)
-            writeMainInventorySlot(session, index, itemId, added)
+            mainFillCount[index] = added
+            simulatedMainCounts[index] = added
             remaining -= added
-            changedMainInventorySlots.add(index)
         }
 
-        if (remaining > 0) return false
+        val absorbed = itemCount - remaining
+        if (absorbed <= 0) return 0
+
+        for (slot in 0..8) {
+            val addExisting = hotbarAddToExisting[slot]
+            if (addExisting > 0) {
+                session.hotbarStacks[slot].count += addExisting
+                changedHotbarSlots.add(slot)
+            }
+            val fill = hotbarFillCount[slot]
+            if (fill > 0) {
+                setHotbarSlotWithMeta(session, slot, itemId, fill, inheritedMeta = null)
+                changedHotbarSlots.add(slot)
+            }
+        }
+        for (index in session.mainInventoryStacks.indices) {
+            val addExisting = mainAddToExisting[index]
+            if (addExisting > 0) {
+                session.mainInventoryStacks[index].count += addExisting
+                changedMainInventorySlots.add(index)
+            }
+            val fill = mainFillCount[index]
+            if (fill > 0) {
+                writeMainInventorySlot(session, index, itemId, fill)
+                changedMainInventorySlots.add(index)
+            }
+        }
 
         val ctx = contexts[session.channelId]
         if (ctx != null && ctx.channel().isActive) {
@@ -15430,7 +15734,7 @@ data class EncodedStackSection(
         if (selectedBeforeItemId != selectedAfterItemId || selectedBeforeCount != selectedAfterCount) {
             broadcastHeldItemEquipment(session)
         }
-        return true
+        return absorbed
     }
 
     fun swapMainHandWithOffhand(channelId: ChannelId) {
@@ -15687,6 +15991,7 @@ data class EncodedStackSection(
         syncVy: Double,
         syncVz: Double
     ) {
+        val encodedStack = encodedDroppedItemStackForSession(session, snapshot)
         enqueueDroppedItemPacket(
             outboundByContext,
             ctx,
@@ -15707,7 +16012,7 @@ data class EncodedStackSection(
             ctx,
             PlayPackets.itemEntityMetadataPacket(
                 entityId = snapshot.entityId,
-                encodedItemStack = encodedDroppedItemStackForSession(session, snapshot)
+                encodedItemStack = encodedStack
             )
         )
         enqueueDroppedItemPacket(
@@ -15720,11 +16025,13 @@ data class EncodedStackSection(
                 vz = syncVz
             )
         )
-        session.droppedItemTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(snapshot, syncVx, syncVy, syncVz)
+        session.droppedItemTrackerStates[snapshot.entityId] =
+            newDroppedItemTrackerState(snapshot, syncVx, syncVy, syncVz, lastEncodedItemStack = encodedStack)
     }
 
     private fun writeDroppedItemSpawnPackets(session: PlayerSession, ctx: ChannelHandlerContext, snapshot: DroppedItemSnapshot) {
         val (syncVx, syncVy, syncVz) = droppedItemNetworkVelocity(snapshot)
+        val encodedStack = encodedDroppedItemStackForSession(session, snapshot)
         ctx.write(
             PlayPackets.addEntityPacket(
                 entityId = snapshot.entityId,
@@ -15741,7 +16048,7 @@ data class EncodedStackSection(
         ctx.write(
             PlayPackets.itemEntityMetadataPacket(
                 entityId = snapshot.entityId,
-                encodedItemStack = encodedDroppedItemStackForSession(session, snapshot)
+                encodedItemStack = encodedStack
             )
         )
         ctx.write(
@@ -15752,18 +16059,12 @@ data class EncodedStackSection(
                 vz = syncVz
             )
         )
-        session.droppedItemTrackerStates[snapshot.entityId] = newDroppedItemTrackerState(snapshot, syncVx, syncVy, syncVz)
+        session.droppedItemTrackerStates[snapshot.entityId] =
+            newDroppedItemTrackerState(snapshot, syncVx, syncVy, syncVz, lastEncodedItemStack = encodedStack)
     }
 
     private fun encodedDroppedItemStackForSession(session: PlayerSession, snapshot: DroppedItemSnapshot): ByteArray {
-        val meta = droppedItemTextMetaByEntityId[snapshot.entityId]
-            ?.takeIf { it.expectedItemId == snapshot.itemId }
-        val shulkerContents = if (isShulkerItemId(snapshot.itemId)) droppedShulkerContentsByEntityId[snapshot.entityId] else null
-        val stack = withShulkerContents(
-            buildStackState(itemId = snapshot.itemId, count = snapshot.itemCount),
-            shulkerContents
-        )
-        return encodedItemStack(stack = stack, textMeta = meta, localeTag = session.locale)
+        return encodedItemStack(stack = snapshot.stack, localeTag = session.locale)
     }
 
     private fun droppedItemMovementPackets(
@@ -15777,6 +16078,7 @@ data class EncodedStackSection(
         val state = session.droppedItemTrackerStates.computeIfAbsent(snapshot.entityId) {
             newDroppedItemTrackerState(snapshot, syncVx, syncVy, syncVz)
         }
+        val encodedStack = encodedDroppedItemStackForSession(session, snapshot)
         state.secondsSinceHardSync = (state.secondsSinceHardSync + deltaSeconds).coerceAtMost(120.0)
         val encodedX = encodeDroppedItemPosition4096(snapshot.x)
         val encodedY = encodeDroppedItemPosition4096(snapshot.y)
@@ -15865,6 +16167,16 @@ data class EncodedStackSection(
                 state.lastVz = 0.0
             }
         }
+        val stackChanged = state.lastEncodedItemStack?.contentEquals(encodedStack) != true
+        if (stackChanged) {
+            packets.add(
+                PlayPackets.itemEntityMetadataPacket(
+                    entityId = snapshot.entityId,
+                    encodedItemStack = encodedStack
+                )
+            )
+            state.lastEncodedItemStack = encodedStack
+        }
         return packets
     }
 
@@ -15872,7 +16184,8 @@ data class EncodedStackSection(
         snapshot: DroppedItemSnapshot,
         syncVx: Double,
         syncVy: Double,
-        syncVz: Double
+        syncVz: Double,
+        lastEncodedItemStack: ByteArray? = null
     ): DroppedItemTrackerState {
         return DroppedItemTrackerState(
             encodedX4096 = encodeDroppedItemPosition4096(snapshot.x),
@@ -15882,7 +16195,8 @@ data class EncodedStackSection(
             lastVy = syncVy,
             lastVz = syncVz,
             lastOnGround = snapshot.onGround,
-            secondsSinceHardSync = 0.0
+            secondsSinceHardSync = 0.0,
+            lastEncodedItemStack = lastEncodedItemStack
         )
     }
 
@@ -16043,8 +16357,7 @@ data class EncodedStackSection(
             snapshot = DroppedItemSnapshot(
                 entityId = snapshot.entityId,
                 uuid = snapshot.uuid,
-                itemId = 0,
-                itemCount = 1,
+                stack = buildStackState(itemId = 0, count = 1),
                 x = snapshot.x,
                 y = snapshot.y,
                 z = snapshot.z,
@@ -16074,8 +16387,7 @@ data class EncodedStackSection(
                 snapshot = DroppedItemSnapshot(
                     entityId = snapshot.entityId,
                     uuid = snapshot.uuid,
-                    itemId = 0,
-                    itemCount = 1,
+                    stack = buildStackState(itemId = 0, count = 1),
                     x = snapshot.x,
                     y = snapshot.y,
                     z = snapshot.z,
@@ -16197,8 +16509,7 @@ data class EncodedStackSection(
             snapshot = DroppedItemSnapshot(
                 entityId = snapshot.entityId,
                 uuid = snapshot.uuid,
-                itemId = 0,
-                itemCount = 1,
+                stack = buildStackState(itemId = 0, count = 1),
                 x = snapshot.x,
                 y = snapshot.y,
                 z = snapshot.z,
@@ -16357,8 +16668,7 @@ data class EncodedStackSection(
             snapshot = DroppedItemSnapshot(
                 entityId = snapshot.entityId,
                 uuid = snapshot.uuid,
-                itemId = 0,
-                itemCount = 1,
+                stack = buildStackState(itemId = 0, count = 1),
                 x = snapshot.x,
                 y = snapshot.y,
                 z = snapshot.z,
@@ -16388,8 +16698,7 @@ data class EncodedStackSection(
                 snapshot = DroppedItemSnapshot(
                     entityId = snapshot.entityId,
                     uuid = snapshot.uuid,
-                    itemId = 0,
-                    itemCount = 1,
+                    stack = buildStackState(itemId = 0, count = 1),
                     x = snapshot.x,
                     y = snapshot.y,
                     z = snapshot.z,
@@ -16523,8 +16832,7 @@ data class EncodedStackSection(
             snapshot = DroppedItemSnapshot(
                 entityId = snapshot.entityId,
                 uuid = snapshot.uuid,
-                itemId = 0,
-                itemCount = 1,
+                stack = buildStackState(itemId = 0, count = 1),
                 x = snapshot.x,
                 y = snapshot.y,
                 z = snapshot.z,
@@ -16720,8 +17028,7 @@ data class EncodedStackSection(
             snapshot = DroppedItemSnapshot(
                 entityId = snapshot.entityId,
                 uuid = snapshot.uuid,
-                itemId = 0,
-                itemCount = 1,
+                stack = buildStackState(itemId = 0, count = 1),
                 x = snapshot.x,
                 y = snapshot.y,
                 z = snapshot.z,
@@ -16755,8 +17062,7 @@ data class EncodedStackSection(
                 snapshot = DroppedItemSnapshot(
                     entityId = snapshot.entityId,
                     uuid = snapshot.uuid,
-                    itemId = 0,
-                    itemCount = 1,
+                    stack = buildStackState(itemId = 0, count = 1),
                     x = snapshot.x,
                     y = snapshot.y,
                     z = snapshot.z,
@@ -16903,8 +17209,7 @@ data class EncodedStackSection(
             snapshot = DroppedItemSnapshot(
                 entityId = snapshot.entityId,
                 uuid = snapshot.uuid,
-                itemId = 0,
-                itemCount = 1,
+                stack = buildStackState(itemId = 0, count = 1),
                 x = snapshot.x,
                 y = snapshot.y,
                 z = snapshot.z,
@@ -17770,7 +18075,6 @@ data class EncodedStackSection(
         }
         val chunk = ChunkPos(x shr 4, z shr 4)
         val clearPacket = PlayPackets.blockChangePacket(x, y, z, 0)
-        val snapshot = world.fallingBlockSnapshot(entityId) ?: return false
         for ((id, other) in sessions) {
             if (other.worldKey != session.worldKey) continue
             if (!other.loadedChunks.contains(chunk)) continue
@@ -17780,9 +18084,6 @@ data class EncodedStackSection(
                 if (!ctx.channel().isActive) return@execute
                 if (!other.loadedChunks.contains(chunk)) return@execute
                 ctx.write(clearPacket)
-                if (other.visibleFallingBlockEntityIds.add(entityId)) {
-                    writeFallingBlockSpawnPackets(other, ctx, snapshot)
-                }
                 ctx.flush()
             }
         }
@@ -18007,10 +18308,9 @@ data class EncodedStackSection(
             if (stack.itemId < 0 || stack.count <= 0) continue
             val random = ThreadLocalRandom.current()
             val entityId = allocateEntityId()
-            val spawned = world.spawnDroppedItem(
+            world.spawnDroppedItem(
                 entityId = entityId,
-                itemId = stack.itemId,
-                itemCount = stack.count,
+                stack = stack,
                 x = x + 0.5,
                 y = y + 0.375,
                 z = z + 0.5,
@@ -18019,14 +18319,6 @@ data class EncodedStackSection(
                 vz = random.nextDouble(BLOCK_DROP_HORIZONTAL_SPEED_MIN, BLOCK_DROP_HORIZONTAL_SPEED_MAX),
                 pickupDelaySeconds = BLOCK_DROP_PICKUP_DELAY_SECONDS
             )
-            if (spawned) {
-                val shulkerContents = stack.shulkerContents?.let(::copyChestState)
-                if (shulkerContents != null) {
-                    droppedShulkerContentsByEntityId[entityId] = shulkerContents
-                } else {
-                    droppedShulkerContentsByEntityId.remove(entityId)
-                }
-            }
         }
     }
 
@@ -19721,8 +20013,6 @@ data class EncodedStackSection(
     private const val VANILLA_ITEM_ATTACK_PROFILE_RESOURCE = "/vanilla-item-attack-profile-1.21.11.json"
     private val PLACEMENT_DEBUG_LOG_ENABLED: Boolean =
         System.getProperty("aerogel.debug.placement")?.toBooleanStrictOrNull() ?: false
-    private val HELD_ITEM_DEBUG_LOG_ENABLED: Boolean =
-        System.getProperty("aerogel.debug.held_item")?.toBooleanStrictOrNull() ?: true
     private const val PLAYER_HITBOX_HALF_WIDTH = 0.3
     private const val PIG_RIDER_OFFSET_Y_FACTOR = 0.75
     private val WATER_BUCKET_REPLACEABLE_BLOCK_KEYS = loadBlockTag("water_breakable")
@@ -19740,6 +20030,15 @@ data class EncodedStackSection(
     private const val DROPPED_ITEM_HEIGHT = 0.25
     private const val DROPPED_ITEM_PICKUP_DELAY_EPSILON = 1.0e-9
     private const val DROPPED_ITEM_PICKUP_DISTANCE_EPSILON = 1.0e-9
+    private const val DROPPED_ITEM_MERGE_ATTRACT_DISTANCE = 1.75
+    private const val DROPPED_ITEM_MERGE_ATTRACT_DISTANCE_SQ =
+        DROPPED_ITEM_MERGE_ATTRACT_DISTANCE * DROPPED_ITEM_MERGE_ATTRACT_DISTANCE
+    private const val DROPPED_ITEM_MERGE_SNAP_DISTANCE = 0.35
+    private const val DROPPED_ITEM_MERGE_SNAP_DISTANCE_SQ =
+        DROPPED_ITEM_MERGE_SNAP_DISTANCE * DROPPED_ITEM_MERGE_SNAP_DISTANCE
+    private const val DROPPED_ITEM_MERGE_PULL_PER_SECOND = 0.75
+    private const val DROPPED_ITEM_MERGE_MAX_PULL_STEP = 0.30
+    private const val DROPPED_ITEM_MERGE_MAX_PULL_SPEED = 0.80
     private const val PLAYER_RELATIVE_MOVE_SCALE = 4096.0
     private const val DROPPED_ITEM_RELATIVE_MOVE_SCALE = 4096.0
     private const val MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC = 20.0

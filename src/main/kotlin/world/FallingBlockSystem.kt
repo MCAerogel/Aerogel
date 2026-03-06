@@ -55,6 +55,17 @@ class FallingBlockSystem(
     private val setBlockState: (Int, Int, Int, Int) -> Unit,
     private val clearBlockEntity: (Int, Int, Int) -> Unit
 ) {
+    private data class PendingSpawn(
+        val entityId: Int,
+        val blockStateId: Int,
+        val x: Double,
+        val y: Double,
+        val z: Double,
+        val vx: Double,
+        val vy: Double,
+        val vz: Double
+    )
+
     private data class MutableFallingBlock(
         val entityId: Int,
         val uuid: UUID,
@@ -89,7 +100,8 @@ class FallingBlockSystem(
     private val entities = ConcurrentHashMap<Int, MutableFallingBlock>()
     private val snapshots = ConcurrentHashMap<Int, FallingBlockSnapshot>()
     private val chunkIndex = ConcurrentHashMap<ChunkPos, MutableSet<Int>>()
-    private val pendingSpawned = ConcurrentLinkedQueue<Int>()
+    private val pendingSpawnRequests = ConcurrentLinkedQueue<PendingSpawn>()
+    private val reservedPendingEntityIds = ConcurrentHashMap.newKeySet<Int>()
     private val collidableStateCache = ConcurrentHashMap<Int, Boolean>()
     private val fallThroughStateCache = ConcurrentHashMap<Int, Boolean>()
 
@@ -104,32 +116,24 @@ class FallingBlockSystem(
         vz: Double
     ): Boolean {
         if (entityId < 0 || blockStateId <= 0) return false
-        val chunkX = chunkXFromBlockX(x)
-        val chunkZ = chunkZFromBlockZ(z)
-        val entity = MutableFallingBlock(
-            entityId = entityId,
-            uuid = UUID.randomUUID(),
-            blockStateId = blockStateId,
-            x = x,
-            y = y,
-            z = z,
-            vx = vx,
-            vy = vy,
-            vz = vz,
-            onGround = false,
-            chunkX = chunkX,
-            chunkZ = chunkZ
+        if (!reservedPendingEntityIds.add(entityId)) return false
+        pendingSpawnRequests.add(
+            PendingSpawn(
+                entityId = entityId,
+                blockStateId = blockStateId,
+                x = x,
+                y = y,
+                z = z,
+                vx = vx,
+                vy = vy,
+                vz = vz
+            )
         )
-        if (entities.putIfAbsent(entityId, entity) != null) return false
-        val snapshot = entity.snapshot()
-        snapshots[entityId] = snapshot
-        addToChunkIndex(snapshot.chunkPos, entityId)
-        pendingSpawned.add(entityId)
         return true
     }
 
     fun hasEntities(): Boolean {
-        return snapshots.isNotEmpty()
+        return snapshots.isNotEmpty() || pendingSpawnRequests.isNotEmpty()
     }
 
     fun snapshot(entityId: Int): FallingBlockSnapshot? {
@@ -172,7 +176,6 @@ class FallingBlockSystem(
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): FallingBlockTickEvents {
         if (deltaSeconds <= 0.0) return FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
-        if (entities.isEmpty()) return FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
 
         val spawned = ArrayList<FallingBlockSnapshot>()
         val updated = ArrayList<FallingBlockSnapshot>()
@@ -180,11 +183,8 @@ class FallingBlockSystem(
         val landed = ArrayList<FallingBlockLandedEvent>()
         val chunkDeltaSecondsByChunk = HashMap<ChunkPos, Double>()
 
-        while (true) {
-            val entityId = pendingSpawned.poll() ?: break
-            val snapshot = snapshots[entityId] ?: continue
-            spawned.add(snapshot)
-        }
+        flushPendingSpawnsInto(spawned)
+        if (entities.isEmpty()) return FallingBlockTickEvents(spawned, updated, removed, landed)
 
         for ((entityId, entity) in entities.toList()) {
             val chunkPos = ChunkPos(entity.chunkX, entity.chunkZ)
@@ -263,6 +263,39 @@ class FallingBlockSystem(
             chunkTimeRecorder?.invoke(newChunk, System.nanoTime() - startedAtNanos)
         }
         return FallingBlockTickEvents(spawned, updated, removed, landed)
+    }
+
+    internal fun flushPendingSpawns() {
+        flushPendingSpawnsInto(null)
+    }
+
+    private fun flushPendingSpawnsInto(spawnedOut: MutableList<FallingBlockSnapshot>?) {
+        while (true) {
+            val request = pendingSpawnRequests.poll() ?: break
+            val chunkX = chunkXFromBlockX(request.x)
+            val chunkZ = chunkZFromBlockZ(request.z)
+            val entity = MutableFallingBlock(
+                entityId = request.entityId,
+                uuid = UUID.randomUUID(),
+                blockStateId = request.blockStateId,
+                x = request.x,
+                y = request.y,
+                z = request.z,
+                vx = request.vx,
+                vy = request.vy,
+                vz = request.vz,
+                onGround = false,
+                chunkX = chunkX,
+                chunkZ = chunkZ
+            )
+            val inserted = entities.putIfAbsent(request.entityId, entity) == null
+            reservedPendingEntityIds.remove(request.entityId)
+            if (!inserted) continue
+            val snapshot = entity.snapshot()
+            snapshots[request.entityId] = snapshot
+            addToChunkIndex(snapshot.chunkPos, request.entityId)
+            spawnedOut?.add(snapshot)
+        }
     }
 
     private fun tryPlaceLandedBlock(x: Int, y: Int, z: Int, stateId: Int): Boolean {

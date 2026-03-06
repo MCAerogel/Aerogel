@@ -101,6 +101,7 @@ import org.macaroon3145.network.command.CommandContext
 import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.network.codec.RegistryCodec
 import org.macaroon3145.network.handler.ConnectionProfile
+import org.macaroon3145.network.handler.ItemStackState
 import org.macaroon3145.network.handler.PlayPackets
 import org.macaroon3145.network.handler.PlayerSession
 import org.macaroon3145.network.handler.PlayerSessionManager
@@ -151,7 +152,6 @@ object PluginSystem {
 
     private val pluginsById = ConcurrentHashMap<String, LoadedPlugin>()
     private val pluginsInLoadOrder = CopyOnWriteArrayList<LoadedPlugin>()
-    private val pluginStateLock = Any()
 
     private enum class PluginLoadReason {
         STARTUP,
@@ -190,20 +190,16 @@ object PluginSystem {
         Server.bindMainTickScheduler(tickScheduler.global())
         Server.bindTaskScheduler(scheduler)
         Server.bindPlayerRegistry(runtimePlayerRegistry)
-        synchronized(pluginStateLock) {
-            loadAllFromDisk()
-        }
+        loadAllFromDisk()
         pluginJarHotReloadLoop.start()
     }
 
     fun shutdown() {
         pluginJarHotReloadLoop.stop()
-        synchronized(pluginStateLock) {
-            disableAll()
-            scheduler.shutdownAll()
-            tickScheduler.shutdownAll()
-            initialized.set(false)
-        }
+        disableAll()
+        scheduler.shutdownAll()
+        tickScheduler.shutdownAll()
+        initialized.set(false)
         PluginRuntime.clearBindings()
         Server.clearBindings()
     }
@@ -217,16 +213,14 @@ object PluginSystem {
     fun runtimeBotSnapshot(worldKey: String, entityId: Int): RuntimeBotSnapshot? {
         val botUuid = runtimeBotUuidByEntityId[entityId] ?: return null
         val state = runtimeBotsByUuid[botUuid] ?: return null
-        synchronized(state) {
-            if (state.worldKey != worldKey) return null
-            if (state.health <= 0f) return null
-            return RuntimeBotSnapshot(
-                entityId = state.entityId,
-                x = state.x,
-                y = state.y,
-                z = state.z
-            )
-        }
+        if (state.worldKey != worldKey) return null
+        if (state.health <= 0f) return null
+        return RuntimeBotSnapshot(
+            entityId = state.entityId,
+            x = state.x,
+            y = state.y,
+            z = state.z
+        )
     }
 
     fun damageRuntimeBot(
@@ -240,39 +234,37 @@ object PluginSystem {
         if (amount <= 0f) return null
         val botUuid = runtimeBotUuidByEntityId[entityId] ?: return null
         val state = runtimeBotsByUuid[botUuid] ?: return null
-        val result = synchronized(state) {
-            if (state.worldKey != worldKey) return null
-            if (state.health <= 0f) return null
-            if (!state.attackable || state.invulnerable) return null
-            if (state.damageDelayRemainingSeconds > 1.0e-6) return null
+        if (state.worldKey != worldKey) return null
+        if (state.health <= 0f) return null
+        if (!state.attackable || state.invulnerable) return null
+        if (state.damageDelayRemainingSeconds > 1.0e-6) return null
 
-            var knockbackApplied = false
-            if (knockbackStrength > 0.0) {
-                val dx = state.x - attackerX
-                val dz = state.z - attackerZ
-                val distSq = (dx * dx) + (dz * dz)
-                if (distSq > 1.0e-9) {
-                    val dist = kotlin.math.sqrt(distSq)
-                    val nx = dx / dist
-                    val nz = dz / dist
-                    val impulse = knockbackStrength * 0.4
-                    state.speedX += nx * impulse * 20.0
-                    state.speedY += 0.15 * 20.0
-                    state.speedZ += nz * impulse * 20.0
-                    knockbackApplied = true
-                }
+        var knockbackApplied = false
+        if (knockbackStrength > 0.0) {
+            val dx = state.x - attackerX
+            val dz = state.z - attackerZ
+            val distSq = (dx * dx) + (dz * dz)
+            if (distSq > 1.0e-9) {
+                val dist = kotlin.math.sqrt(distSq)
+                val nx = dx / dist
+                val nz = dz / dist
+                val impulse = knockbackStrength * 0.4
+                state.speedX += nx * impulse * 20.0
+                state.speedY += 0.15 * 20.0
+                state.speedZ += nz * impulse * 20.0
+                knockbackApplied = true
             }
+        }
 
-            state.health = (state.health - amount).coerceAtLeast(0f)
-            state.damageDelayRemainingSeconds = state.damageDelaySeconds.coerceAtLeast(0.0)
-            RuntimeBotDamageResult(
-                x = state.x,
-                y = state.y,
-                z = state.z,
-                knockbackApplied = knockbackApplied,
-                died = state.health <= 0f
-            )
-        } ?: return null
+        state.health = (state.health - amount).coerceAtLeast(0f)
+        state.damageDelayRemainingSeconds = state.damageDelaySeconds.coerceAtLeast(0.0)
+        val result = RuntimeBotDamageResult(
+            x = state.x,
+            y = state.y,
+            z = state.z,
+            knockbackApplied = knockbackApplied,
+            died = state.health <= 0f
+        )
 
         broadcastRuntimeBotDamage(worldKey, entityId, result.x, result.y, result.z)
         if (result.died) {
@@ -284,11 +276,9 @@ object PluginSystem {
     fun resolveTranslationForLocale(localeTag: String?, key: String, args: List<String> = emptyList()): String? {
         val normalizedKey = key.trim()
         if (normalizedKey.isEmpty()) return null
-        synchronized(pluginStateLock) {
-            for (loaded in pluginsInLoadOrder) {
-                val translated = loaded.context.i18n.trFor(localeTag, normalizedKey, *args.toTypedArray())
-                if (translated != normalizedKey) return translated
-            }
+        for (loaded in pluginsInLoadOrder) {
+            val translated = loaded.context.i18n.trFor(localeTag, normalizedKey, *args.toTypedArray())
+            if (translated != normalizedKey) return translated
         }
         return null
     }
@@ -298,87 +288,71 @@ object PluginSystem {
     }
 
     fun pluginIds(): List<String> {
-        synchronized(pluginStateLock) {
-            return pluginsInLoadOrder.map { it.metadata.id }
-        }
+        return pluginsInLoadOrder.map { it.metadata.id }
     }
 
     fun pluginCompletionCandidates(): List<String> {
-        synchronized(pluginStateLock) {
-            val out = LinkedHashSet<String>()
-            for (loaded in pluginsInLoadOrder) {
-                val displayName = loaded.metadata.name.trim()
-                if (displayName.isNotEmpty()) {
-                    out += displayName
-                } else {
-                    out += loaded.metadata.id
-                }
+        val out = LinkedHashSet<String>()
+        for (loaded in pluginsInLoadOrder) {
+            val displayName = loaded.metadata.name.trim()
+            if (displayName.isNotEmpty()) {
+                out += displayName
+            } else {
+                out += loaded.metadata.id
             }
-            return out.toList()
         }
+        return out.toList()
     }
 
     fun isPluginLoaded(pluginId: String): Boolean {
-        synchronized(pluginStateLock) {
-            return pluginsById.containsKey(pluginId.lowercase())
-        }
+        return pluginsById.containsKey(pluginId.lowercase())
     }
 
     fun pluginMetadata(pluginId: String): PluginMetadata? {
-        synchronized(pluginStateLock) {
-            return pluginsById[pluginId.lowercase()]?.metadata
-        }
+        return pluginsById[pluginId.lowercase()]?.metadata
     }
 
     fun pluginContext(pluginId: String): PluginContext? {
-        synchronized(pluginStateLock) {
-            return pluginsById[pluginId.lowercase()]?.context
-        }
+        return pluginsById[pluginId.lowercase()]?.context
     }
 
     fun reloadTargetNames(): List<String> {
-        synchronized(pluginStateLock) {
-            return pluginsInLoadOrder.asSequence()
-                .map { plugin ->
-                    plugin.metadata.name.takeIf { it.isNotBlank() } ?: plugin.metadata.id
-                }
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .distinct()
-                .sortedWith(String.CASE_INSENSITIVE_ORDER)
-                .toList()
-        }
+        return pluginsInLoadOrder.asSequence()
+            .map { plugin ->
+                plugin.metadata.name.takeIf { it.isNotBlank() } ?: plugin.metadata.id
+            }
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+            .toList()
     }
 
     fun reloadAll(): Int {
-        synchronized(pluginStateLock) {
-            val snapshot = pluginsInLoadOrder.map { it.metadata.id }
-            var reloaded = 0
-            for (pluginId in snapshot) {
-                if (reloadPlugin(pluginId)) {
-                    reloaded++
-                }
+        val snapshot = pluginsInLoadOrder.map { it.metadata.id }
+        var reloaded = 0
+        for (pluginId in snapshot) {
+            if (reloadPlugin(pluginId)) {
+                reloaded++
             }
-            return reloaded
         }
+        return reloaded
     }
 
     fun reloadPlugin(pluginId: String): Boolean {
-        synchronized(pluginStateLock) {
-            val normalized = pluginId.lowercase()
-            val byId = pluginsById[normalized]
-            if (byId != null) {
-                return reloadPluginWithJar(byId.metadata.id, byId.jarPath)
-            }
-            val byNameMatches = pluginsInLoadOrder.filter {
-                it.metadata.name.equals(pluginId, ignoreCase = true)
-            }
-            if (byNameMatches.size != 1) {
-                return false
-            }
-            val existing = byNameMatches.first()
-            return reloadPluginWithJar(existing.metadata.id, existing.jarPath)
+        val normalized = pluginId.lowercase()
+        val byId = pluginsById[normalized]
+        if (byId != null) {
+            return reloadPluginWithJar(byId.metadata.id, byId.jarPath)
         }
+        val byNameMatches = pluginsInLoadOrder.filter {
+            it.metadata.name.equals(pluginId, ignoreCase = true)
+        }
+        if (byNameMatches.size != 1) {
+            return false
+        }
+        val existing = byNameMatches.first()
+        return reloadPluginWithJar(existing.metadata.id, existing.jarPath)
     }
 
     fun beforeCommandDispatch(sender: PlayerSession?, rawCommand: String): Boolean {
@@ -889,29 +863,27 @@ object PluginSystem {
     }
 
     private fun handlePluginJarChanged(jarPath: Path): Boolean {
-        synchronized(pluginStateLock) {
-            val descriptor = runCatching { readDescriptor(jarPath) }
-                .onFailure { logger.error("Failed to parse changed plugin descriptor: {}", jarPath, it) }
-                .getOrNull() ?: return false
-            val pluginId = descriptor.id.lowercase()
-            val loaded = pluginsById[pluginId] ?: return false
-            val reloaded = runCatching { reloadPluginWithJar(pluginId, jarPath) }
-                .onFailure { logger.error("Automatic plugin hot-reload failed for '{}'", pluginId, it) }
-                .getOrDefault(false)
-            val pluginName = loaded.metadata.name.ifBlank { loaded.metadata.id }
-            if (reloaded) {
-                ServerI18n.logCustom(
-                    ServerI18n.style("[시스템] ", ServerI18n.Color.GREEN),
-                    ServerI18n.style(ServerI18n.tr("aerogel.log.plugin.hotreload.applied", pluginName), ServerI18n.Color.GREEN)
-                )
-            } else {
-                ServerI18n.logCustom(
-                    ServerI18n.style("[시스템] ", ServerI18n.Color.RED),
-                    ServerI18n.style(ServerI18n.tr("aerogel.log.plugin.hotreload.failed", pluginName), ServerI18n.Color.RED)
-                )
-            }
-            return reloaded
+        val descriptor = runCatching { readDescriptor(jarPath) }
+            .onFailure { logger.error("Failed to parse changed plugin descriptor: {}", jarPath, it) }
+            .getOrNull() ?: return false
+        val pluginId = descriptor.id.lowercase()
+        val loaded = pluginsById[pluginId] ?: return false
+        val reloaded = runCatching { reloadPluginWithJar(pluginId, jarPath) }
+            .onFailure { logger.error("Automatic plugin hot-reload failed for '{}'", pluginId, it) }
+            .getOrDefault(false)
+        val pluginName = loaded.metadata.name.ifBlank { loaded.metadata.id }
+        if (reloaded) {
+            ServerI18n.logCustom(
+                ServerI18n.style("[시스템] ", ServerI18n.Color.GREEN),
+                ServerI18n.style(ServerI18n.tr("aerogel.log.plugin.hotreload.applied", pluginName), ServerI18n.Color.GREEN)
+            )
+        } else {
+            ServerI18n.logCustom(
+                ServerI18n.style("[시스템] ", ServerI18n.Color.RED),
+                ServerI18n.style(ServerI18n.tr("aerogel.log.plugin.hotreload.failed", pluginName), ServerI18n.Color.RED)
+            )
         }
+        return reloaded
     }
 
     private fun loadPluginJar(jarPath: Path, loadReason: PluginLoadReason): PluginLoadOutcome {
@@ -2575,8 +2547,7 @@ private class RuntimeDroppedItem(
                 ?: throw IllegalStateException("Failed to remove dropped item from source world: $worldKey#$entityId")
             val spawned = targetWorld.spawnDroppedItem(
                 entityId = entityId,
-                itemId = snapshot.itemId,
-                itemCount = snapshot.itemCount,
+                stack = snapshot.stack,
                 x = target.x,
                 y = target.y,
                 z = target.z,
@@ -2729,9 +2700,9 @@ private class RuntimeDroppedItem(
         get() {
             val snapshot = liveSnapshot()
             return Item(
-                id = snapshot.itemId,
-                type = ItemType.fromId(snapshot.itemId),
-                amount = snapshot.itemCount
+                id = snapshot.stack.itemId,
+                type = ItemType.fromId(snapshot.stack.itemId),
+                amount = snapshot.stack.count
             )
         }
         set(value) {
@@ -2847,19 +2818,17 @@ private fun syncRuntimeBotNetwork() {
         val seenBots = HashSet<UUID>(worldBots.size)
 
         for (state in worldBots) {
-            val snapshot = synchronized(state) {
-                RuntimeBotViewerState(
-                    entityId = state.entityId,
-                    listed = state.tabList,
-                    name = state.name,
-                    x = state.x,
-                    y = state.y,
-                    z = state.z,
-                    yaw = state.yaw,
-                    pitch = state.pitch,
-                    onGround = state.onGround
-                )
-            }
+            val snapshot = RuntimeBotViewerState(
+                entityId = state.entityId,
+                listed = state.tabList,
+                name = state.name,
+                x = state.x,
+                y = state.y,
+                z = state.z,
+                yaw = state.yaw,
+                pitch = state.pitch,
+                onGround = state.onGround
+            )
             seenBots.add(state.uuid)
             val botChunk = ChunkPos(floor(snapshot.x / 16.0).toInt(), floor(snapshot.z / 16.0).toInt())
             val visible = session.loadedChunks.contains(botChunk)
@@ -3014,77 +2983,75 @@ private fun tickRuntimeBotOnChunkActor(
     world: org.macaroon3145.world.World,
     state: RuntimeBotState
 ) {
-    synchronized(state) {
-        if (state.damageDelayRemainingSeconds > 0.0) {
-            state.damageDelayRemainingSeconds = (state.damageDelayRemainingSeconds - (1.0 / 20.0)).coerceAtLeast(0.0)
-        }
-        val nextSpeedXMps = state.speedX + (state.accelerationX / 20.0)
-        val nextSpeedYMps = state.speedY + (state.accelerationY / 20.0)
-        val nextSpeedZMps = state.speedZ + (state.accelerationZ / 20.0)
-        var vx = nextSpeedXMps / 20.0
-        var vy = nextSpeedYMps / 20.0
-        var vz = nextSpeedZMps / 20.0
-
-        if (state.pushable) {
-            val pushRadius = BOT_HALF_WIDTH + PLAYER_HALF_WIDTH
-            val players = PlayerSessionManager.playersInWorld(state.worldKey)
-            for (player in players) {
-                if (player.dead) continue
-                val dx = state.x - player.x
-                val dz = state.z - player.z
-                val distSq = (dx * dx) + (dz * dz)
-                if (distSq <= 1.0e-9 || distSq >= (pushRadius * pushRadius)) continue
-                val dist = kotlin.math.sqrt(distSq)
-                val overlap = pushRadius - dist
-                if (overlap <= 0.0) continue
-                val nx = dx / dist
-                val nz = dz / dist
-                val impulse = overlap * BOT_PUSH_STRENGTH
-                vx += nx * impulse
-                vz += nz * impulse
-            }
-        }
-
-        if (state.gravity) {
-            vy -= BOT_GRAVITY_PER_TICK
-        }
-
-        var onGround = false
-        var nextY = state.y + vy
-        if (state.collision && botCollidesAt(world, state.x, nextY, state.z)) {
-            if (vy < 0.0) onGround = true
-            vy = 0.0
-            nextY = state.y
-        }
-        state.y = nextY
-
-        var nextX = state.x + vx
-        if (state.collision && botCollidesAt(world, nextX, state.y, state.z)) {
-            vx = 0.0
-            nextX = state.x
-        }
-        state.x = nextX
-
-        var nextZ = state.z + vz
-        if (state.collision && botCollidesAt(world, state.x, state.y, nextZ)) {
-            vz = 0.0
-            nextZ = state.z
-        }
-        state.z = nextZ
-
-        state.onGround = onGround
-        val drag = if (state.onGround) BOT_AIR_DRAG_PER_TICK else BOT_AIR_DRAG_PER_TICK
-        vx *= drag
-        vy *= BOT_VERTICAL_DRAG_PER_TICK
-        vz *= drag
-        if (abs(vx) < BOT_VELOCITY_EPSILON) vx = 0.0
-        if (abs(vy) < BOT_VELOCITY_EPSILON) vy = 0.0
-        if (abs(vz) < BOT_VELOCITY_EPSILON) vz = 0.0
-
-        state.speedX = vx * 20.0
-        state.speedY = vy * 20.0
-        state.speedZ = vz * 20.0
+    if (state.damageDelayRemainingSeconds > 0.0) {
+        state.damageDelayRemainingSeconds = (state.damageDelayRemainingSeconds - (1.0 / 20.0)).coerceAtLeast(0.0)
     }
+    val nextSpeedXMps = state.speedX + (state.accelerationX / 20.0)
+    val nextSpeedYMps = state.speedY + (state.accelerationY / 20.0)
+    val nextSpeedZMps = state.speedZ + (state.accelerationZ / 20.0)
+    var vx = nextSpeedXMps / 20.0
+    var vy = nextSpeedYMps / 20.0
+    var vz = nextSpeedZMps / 20.0
+
+    if (state.pushable) {
+        val pushRadius = BOT_HALF_WIDTH + PLAYER_HALF_WIDTH
+        val players = PlayerSessionManager.playersInWorld(state.worldKey)
+        for (player in players) {
+            if (player.dead) continue
+            val dx = state.x - player.x
+            val dz = state.z - player.z
+            val distSq = (dx * dx) + (dz * dz)
+            if (distSq <= 1.0e-9 || distSq >= (pushRadius * pushRadius)) continue
+            val dist = kotlin.math.sqrt(distSq)
+            val overlap = pushRadius - dist
+            if (overlap <= 0.0) continue
+            val nx = dx / dist
+            val nz = dz / dist
+            val impulse = overlap * BOT_PUSH_STRENGTH
+            vx += nx * impulse
+            vz += nz * impulse
+        }
+    }
+
+    if (state.gravity) {
+        vy -= BOT_GRAVITY_PER_TICK
+    }
+
+    var onGround = false
+    var nextY = state.y + vy
+    if (state.collision && botCollidesAt(world, state.x, nextY, state.z)) {
+        if (vy < 0.0) onGround = true
+        vy = 0.0
+        nextY = state.y
+    }
+    state.y = nextY
+
+    var nextX = state.x + vx
+    if (state.collision && botCollidesAt(world, nextX, state.y, state.z)) {
+        vx = 0.0
+        nextX = state.x
+    }
+    state.x = nextX
+
+    var nextZ = state.z + vz
+    if (state.collision && botCollidesAt(world, state.x, state.y, nextZ)) {
+        vz = 0.0
+        nextZ = state.z
+    }
+    state.z = nextZ
+
+    state.onGround = onGround
+    val drag = if (state.onGround) BOT_AIR_DRAG_PER_TICK else BOT_AIR_DRAG_PER_TICK
+    vx *= drag
+    vy *= BOT_VERTICAL_DRAG_PER_TICK
+    vz *= drag
+    if (abs(vx) < BOT_VELOCITY_EPSILON) vx = 0.0
+    if (abs(vy) < BOT_VELOCITY_EPSILON) vy = 0.0
+    if (abs(vz) < BOT_VELOCITY_EPSILON) vz = 0.0
+
+    state.speedX = vx * 20.0
+    state.speedY = vy * 20.0
+    state.speedZ = vz * 20.0
 }
 
 private fun botCollidesAt(world: org.macaroon3145.world.World, x: Double, y: Double, z: Double): Boolean {
@@ -3179,8 +3146,7 @@ private class RuntimeWorld(
     override fun pluginInternalDropItem(location: Location, item: Item, impulse: Boolean): DroppedItem? {
         val snapshot = PlayerSessionManager.spawnDroppedItemEntityAt(
             worldKey = key,
-            itemId = item.id,
-            itemCount = item.amount,
+            stack = ItemStackState.of(itemId = item.id, count = item.amount),
             x = location.x,
             y = location.y,
             z = location.z,
@@ -4652,9 +4618,9 @@ private class SimpleTickScheduler : TickScheduler {
         val chunkX: Int?,
         val chunkZ: Int?,
         val periodTicks: Long?,
-        var nextRunTick: Long,
-        var cancelled: Boolean = false,
-        var done: Boolean = false
+        @Volatile var nextRunTick: Long,
+        @Volatile var cancelled: Boolean = false,
+        @Volatile var done: Boolean = false
     )
 
     private enum class ExecutionMode {
@@ -4663,10 +4629,9 @@ private class SimpleTickScheduler : TickScheduler {
     }
 
     private val logger = LoggerFactory.getLogger(SimpleTickScheduler::class.java)
-    private val lock = Any()
     private val nextTaskId = AtomicLong(1L)
     private val currentTickRef = AtomicLong(0L)
-    private val tasksById = LinkedHashMap<Long, TickTaskEntry>()
+    private val tasksById = ConcurrentHashMap<Long, TickTaskEntry>()
 
     override val currentTick: Long
         get() = currentTickRef.get()
@@ -4742,67 +4707,56 @@ private class SimpleTickScheduler : TickScheduler {
     fun pulse(gameTick: Long) {
         currentTickRef.set(gameTick)
         val dueTasks = ArrayList<TickTaskEntry>()
-        synchronized(lock) {
-            val iter = tasksById.values.iterator()
-            while (iter.hasNext()) {
-                val entry = iter.next()
-                if (entry.cancelled) {
+        for (entry in tasksById.values) {
+            if (entry.cancelled) {
+                if (tasksById.remove(entry.id, entry)) {
                     entry.done = true
-                    iter.remove()
-                    continue
                 }
-                if (entry.nextRunTick <= gameTick) {
-                    dueTasks.add(entry)
-                }
+                continue
+            }
+            if (entry.nextRunTick <= gameTick) {
+                dueTasks.add(entry)
             }
         }
         for (entry in dueTasks) {
             if (entry.cancelled || entry.done) continue
             dispatch(entry)
-            synchronized(lock) {
-                val current = tasksById[entry.id] ?: continue
-                if (current.cancelled) {
-                    current.done = true
-                    tasksById.remove(current.id)
-                    continue
-                }
-                val period = current.periodTicks
-                if (period == null) {
-                    current.done = true
-                    tasksById.remove(current.id)
-                    continue
-                }
-                var next = current.nextRunTick + period
-                if (next <= gameTick) {
-                    val missed = ((gameTick - next) / period) + 1L
-                    next += missed * period
-                }
-                current.nextRunTick = next
+            val current = tasksById[entry.id] ?: continue
+            if (current.cancelled) {
+                current.done = true
+                tasksById.remove(current.id, current)
+                continue
             }
+            val period = current.periodTicks
+            if (period == null) {
+                current.done = true
+                tasksById.remove(current.id, current)
+                continue
+            }
+            var next = current.nextRunTick + period
+            if (next <= gameTick) {
+                val missed = ((gameTick - next) / period) + 1L
+                next += missed * period
+            }
+            current.nextRunTick = next
         }
     }
 
     fun shutdownOwner(owner: String) {
-        synchronized(lock) {
-            val iter = tasksById.values.iterator()
-            while (iter.hasNext()) {
-                val entry = iter.next()
-                if (entry.owner != owner) continue
-                entry.cancelled = true
-                entry.done = true
-                iter.remove()
-            }
+        for (entry in tasksById.values) {
+            if (entry.owner != owner) continue
+            entry.cancelled = true
+            entry.done = true
+            tasksById.remove(entry.id, entry)
         }
     }
 
     fun shutdownAll() {
-        synchronized(lock) {
-            for (entry in tasksById.values) {
-                entry.cancelled = true
-                entry.done = true
-            }
-            tasksById.clear()
+        for (entry in tasksById.values) {
+            entry.cancelled = true
+            entry.done = true
         }
+        tasksById.clear()
     }
 
     private fun scheduleGame(
@@ -4867,25 +4821,20 @@ private class SimpleTickScheduler : TickScheduler {
             periodTicks = periodTicks,
             nextRunTick = now + safeDelay
         )
-        synchronized(lock) {
-            tasksById[entry.id] = entry
-        }
+        tasksById[entry.id] = entry
         return object : TickTask {
             override val isCancelled: Boolean
-                get() = synchronized(lock) { tasksById[entry.id]?.cancelled ?: true }
+                get() = tasksById[entry.id]?.cancelled ?: true
 
             override val isDone: Boolean
-                get() = synchronized(lock) { tasksById[entry.id]?.done ?: true }
+                get() = tasksById[entry.id]?.done ?: true
 
             override fun cancel(): Boolean {
-                synchronized(lock) {
-                    val current = tasksById[entry.id] ?: return false
-                    if (current.done || current.cancelled) return false
-                    current.cancelled = true
-                    current.done = true
-                    tasksById.remove(current.id)
-                    return true
-                }
+                val current = tasksById[entry.id] ?: return false
+                if (current.done || current.cancelled) return false
+                current.cancelled = true
+                current.done = true
+                return tasksById.remove(current.id, current)
             }
         }
     }
@@ -4978,15 +4927,16 @@ private class PluginClassLoader(
         if (name.startsWith("org.macaroon3145.api.")) {
             return super.loadClass(name, resolve)
         }
-        synchronized(getClassLoadingLock(name)) {
+        findLoadedClass(name)?.let { return it }
+        try {
+            val found = findClass(name)
+            if (resolve) resolveClass(found)
+            return found
+        } catch (_: ClassNotFoundException) {
+            return super.loadClass(name, resolve)
+        } catch (_: LinkageError) {
             findLoadedClass(name)?.let { return it }
-            try {
-                val found = findClass(name)
-                if (resolve) resolveClass(found)
-                return found
-            } catch (_: ClassNotFoundException) {
-                return super.loadClass(name, resolve)
-            }
+            return super.loadClass(name, resolve)
         }
     }
 }

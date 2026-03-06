@@ -2,6 +2,7 @@ package org.macaroon3145.world
 
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.codec.BlockStateRegistry
+import org.macaroon3145.network.handler.ItemStackState
 import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
 import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
 import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
@@ -432,8 +433,7 @@ class World(
 
     fun spawnDroppedItem(
         entityId: Int,
-        itemId: Int,
-        itemCount: Int,
+        stack: ItemStackState,
         x: Double,
         y: Double,
         z: Double,
@@ -443,27 +443,59 @@ class World(
         uuid: UUID = UUID.randomUUID(),
         pickupDelaySeconds: Double = 2.0
     ): Boolean {
-        return droppedItemSystem.spawn(
-            entityId = entityId,
-            itemId = itemId,
-            itemCount = itemCount,
-            x = x,
-            y = y,
-            z = z,
-            vx = vx,
-            vy = vy,
-            vz = vz,
-            uuid = uuid,
-            pickupDelaySeconds = pickupDelaySeconds
+        val chunkPos = ChunkPos(kotlin.math.floor(x / 16.0).toInt(), kotlin.math.floor(z / 16.0).toInt())
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = {
+                droppedItemSystem.spawn(
+                    entityId = entityId,
+                    stack = stack,
+                    x = x,
+                    y = y,
+                    z = z,
+                    vx = vx,
+                    vy = vy,
+                    vz = vz,
+                    uuid = uuid,
+                    pickupDelaySeconds = pickupDelaySeconds
+                )
+            },
+            enqueuedFromOtherChunkActor = { false }
         )
     }
 
     fun removeDroppedItem(entityId: Int): DroppedItemSnapshot? {
-        return droppedItemSystem.remove(entityId)
+        val chunkPos = droppedItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = { droppedItemSystem.remove(entityId) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun removeDroppedItemIfUuidMatches(entityId: Int, expectedUuid: UUID): DroppedItemSnapshot? {
-        return droppedItemSystem.removeIfUuidMatches(entityId, expectedUuid)
+        val chunkPos = droppedItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = { droppedItemSystem.removeIfUuidMatches(entityId, expectedUuid) },
+            enqueuedFromOtherChunkActor = { null }
+        )
+    }
+
+    fun removeDroppedItemIfMatches(entityId: Int, expected: DroppedItemSnapshot): DroppedItemSnapshot? {
+        return runOnDroppedChunk(
+            chunkPos = expected.chunkPos,
+            task = { droppedItemSystem.removeIfMatches(entityId, expected) },
+            enqueuedFromOtherChunkActor = { null }
+        )
+    }
+
+    fun consumeDroppedItemIfMatches(entityId: Int, expected: DroppedItemSnapshot, consumeCount: Int): DroppedItemConsumeResult? {
+        return runOnDroppedChunk(
+            chunkPos = expected.chunkPos,
+            task = { droppedItemSystem.consumeIfMatches(entityId, expected, consumeCount) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun droppedItemsInChunk(chunkX: Int, chunkZ: Int): List<DroppedItemSnapshot> {
@@ -487,27 +519,61 @@ class World(
     }
 
     fun setDroppedItemStack(entityId: Int, itemId: Int, itemCount: Int): DroppedItemSnapshot? {
-        return droppedItemSystem.updateItem(entityId, itemId, itemCount)
+        return setDroppedItemStack(entityId, ItemStackState.of(itemId = itemId, count = itemCount))
+    }
+
+    fun setDroppedItemStack(entityId: Int, stack: ItemStackState): DroppedItemSnapshot? {
+        val chunkPos = droppedItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = { droppedItemSystem.updateStack(entityId, stack) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setDroppedItemPosition(entityId: Int, x: Double, y: Double, z: Double): DroppedItemSnapshot? {
-        return droppedItemSystem.updatePosition(entityId, x, y, z)
+        val chunkPos = droppedItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = { droppedItemSystem.updatePosition(entityId, x, y, z) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setDroppedItemVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): DroppedItemSnapshot? {
-        return droppedItemSystem.updateVelocity(entityId, vx, vy, vz)
+        val chunkPos = droppedItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = { droppedItemSystem.updateVelocity(entityId, vx, vy, vz) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setDroppedItemAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): DroppedItemSnapshot? {
-        return droppedItemSystem.updateAcceleration(entityId, ax, ay, az)
+        val chunkPos = droppedItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = { droppedItemSystem.updateAcceleration(entityId, ax, ay, az) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setDroppedItemPickupDelay(entityId: Int, pickupDelaySeconds: Double): DroppedItemSnapshot? {
-        return droppedItemSystem.updatePickupDelay(entityId, pickupDelaySeconds)
+        val chunkPos = droppedItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = { droppedItemSystem.updatePickupDelay(entityId, pickupDelaySeconds) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setDroppedItemOnGround(entityId: Int, onGround: Boolean): DroppedItemSnapshot? {
-        return droppedItemSystem.updateOnGround(entityId, onGround)
+        val chunkPos = droppedItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnDroppedChunk(
+            chunkPos = chunkPos,
+            task = { droppedItemSystem.updateOnGround(entityId, onGround) },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun beginChunkProcessingFrame(tickSequence: Long = Long.MIN_VALUE): ChunkProcessingProfiler.Frame {
@@ -589,22 +655,40 @@ class World(
         vz: Double,
         uuid: UUID = UUID.randomUUID()
     ): Boolean {
-        return thrownItemSystem.spawn(
-            entityId = entityId,
-            ownerEntityId = ownerEntityId,
-            kind = kind,
-            x = x,
-            y = y,
-            z = z,
-            vx = vx,
-            vy = vy,
-            vz = vz,
-            uuid = uuid
+        val chunkPos = ChunkPos(kotlin.math.floor(x / 16.0).toInt(), kotlin.math.floor(z / 16.0).toInt())
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                val spawned = thrownItemSystem.spawn(
+                    entityId = entityId,
+                    ownerEntityId = ownerEntityId,
+                    kind = kind,
+                    x = x,
+                    y = y,
+                    z = z,
+                    vx = vx,
+                    vy = vy,
+                    vz = vz,
+                    uuid = uuid
+                )
+                thrownItemSystem.flushPendingOps()
+                spawned
+            },
+            enqueuedFromOtherChunkActor = { false }
         )
     }
 
     fun removeThrownItem(entityId: Int, hit: Boolean, x: Double? = null, y: Double? = null, z: Double? = null): ThrownItemRemovedEvent? {
-        return thrownItemSystem.remove(entityId, hit, x, y, z)
+        val chunkPos = thrownItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                val removed = thrownItemSystem.remove(entityId, hit, x, y, z)
+                thrownItemSystem.flushPendingOps()
+                removed
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun hasThrownItems(): Boolean {
@@ -624,31 +708,94 @@ class World(
     }
 
     fun setThrownItemPosition(entityId: Int, x: Double, y: Double, z: Double): ThrownItemSnapshot? {
-        return thrownItemSystem.updatePosition(entityId, x, y, z)
+        val chunkPos = thrownItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                thrownItemSystem.updatePosition(entityId, x, y, z)
+                thrownItemSystem.flushPendingOps()
+                thrownItemSystem.snapshot(entityId)
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setThrownItemVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): ThrownItemSnapshot? {
-        return thrownItemSystem.updateVelocity(entityId, vx, vy, vz)
+        val chunkPos = thrownItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                thrownItemSystem.updateVelocity(entityId, vx, vy, vz)
+                thrownItemSystem.flushPendingOps()
+                thrownItemSystem.snapshot(entityId)
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setThrownItemPreviousPosition(entityId: Int, prevX: Double, prevY: Double, prevZ: Double): ThrownItemSnapshot? {
-        return thrownItemSystem.updatePreviousPosition(entityId, prevX, prevY, prevZ)
+        val chunkPos = thrownItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                thrownItemSystem.updatePreviousPosition(entityId, prevX, prevY, prevZ)
+                thrownItemSystem.flushPendingOps()
+                thrownItemSystem.snapshot(entityId)
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setThrownItemAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): ThrownItemSnapshot? {
-        return thrownItemSystem.updateAcceleration(entityId, ax, ay, az)
+        val chunkPos = thrownItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                thrownItemSystem.updateAcceleration(entityId, ax, ay, az)
+                thrownItemSystem.flushPendingOps()
+                thrownItemSystem.snapshot(entityId)
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setThrownItemOwnerEntityId(entityId: Int, ownerEntityId: Int): ThrownItemSnapshot? {
-        return thrownItemSystem.updateOwnerEntityId(entityId, ownerEntityId)
+        val chunkPos = thrownItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                thrownItemSystem.updateOwnerEntityId(entityId, ownerEntityId)
+                thrownItemSystem.flushPendingOps()
+                thrownItemSystem.snapshot(entityId)
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setThrownItemKind(entityId: Int, kind: ThrownItemKind): ThrownItemSnapshot? {
-        return thrownItemSystem.updateKind(entityId, kind)
+        val chunkPos = thrownItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                thrownItemSystem.updateKind(entityId, kind)
+                thrownItemSystem.flushPendingOps()
+                thrownItemSystem.snapshot(entityId)
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun setThrownItemOnGround(entityId: Int, onGround: Boolean): ThrownItemSnapshot? {
-        return thrownItemSystem.updateOnGround(entityId, onGround)
+        val chunkPos = thrownItemSystem.snapshot(entityId)?.chunkPos ?: return null
+        return runOnThrownChunk(
+            chunkPos = chunkPos,
+            task = {
+                thrownItemSystem.updateOnGround(entityId, onGround)
+                thrownItemSystem.flushPendingOps()
+                thrownItemSystem.snapshot(entityId)
+            },
+            enqueuedFromOtherChunkActor = { null }
+        )
     }
 
     fun thrownItemsInChunk(chunkX: Int, chunkZ: Int): List<ThrownItemSnapshot> {
@@ -714,15 +861,24 @@ class World(
         vy: Double = 0.0,
         vz: Double = 0.0
     ): Boolean {
-        return fallingBlockSystem.spawn(
-            entityId = entityId,
-            blockStateId = blockStateId,
-            x = x,
-            y = y,
-            z = z,
-            vx = vx,
-            vy = vy,
-            vz = vz
+        val chunkPos = ChunkPos(kotlin.math.floor(x / 16.0).toInt(), kotlin.math.floor(z / 16.0).toInt())
+        return runOnFallingChunk(
+            chunkPos = chunkPos,
+            task = {
+                val spawned = fallingBlockSystem.spawn(
+                    entityId = entityId,
+                    blockStateId = blockStateId,
+                    x = x,
+                    y = y,
+                    z = z,
+                    vx = vx,
+                    vy = vy,
+                    vz = vz
+                )
+                fallingBlockSystem.flushPendingSpawns()
+                spawned
+            },
+            enqueuedFromOtherChunkActor = { false }
         )
     }
 
@@ -809,7 +965,8 @@ class World(
                 },
                 onChunkEvents = onChunkEvents,
                 onDispatchComplete = onDispatchComplete,
-                chunkTimeRecorder = chunkTimeRecorder
+                chunkTimeRecorder = chunkTimeRecorder,
+                awaitCompletion = true
             )
         }
         if (activeSimulationChunks != null) {
@@ -836,7 +993,8 @@ class World(
             },
             onChunkEvents = onChunkEvents,
             onDispatchComplete = onDispatchComplete,
-            chunkTimeRecorder = chunkTimeRecorder
+            chunkTimeRecorder = chunkTimeRecorder,
+            awaitCompletion = true
         )
     }
 
@@ -849,7 +1007,12 @@ class World(
         yaw: Float = 0f,
         pitch: Float = 0f
     ): Boolean {
-        return animalSystem.spawn(entityId, kind, x, y, z, yaw, pitch)
+        val chunkPos = ChunkPos(kotlin.math.floor(x / 16.0).toInt(), kotlin.math.floor(z / 16.0).toInt())
+        return runOnAnimalChunk(
+            chunkPos = chunkPos,
+            task = { animalSystem.spawn(entityId, kind, x, y, z, yaw, pitch) },
+            enqueuedFromOtherChunkActor = { false }
+        )
     }
 
     fun hasAnimals(): Boolean {
@@ -873,15 +1036,21 @@ class World(
     }
 
     fun setAnimalTemptSources(sources: List<AnimalTemptSource>) {
-        animalSystem.setTemptSources(sources)
+        runOnGlobalAnimalActor {
+            animalSystem.setTemptSources(sources)
+        }
     }
 
     fun setAnimalLookSources(sources: List<AnimalLookSource>) {
-        animalSystem.setLookSources(sources)
+        runOnGlobalAnimalActor {
+            animalSystem.setLookSources(sources)
+        }
     }
 
     fun setAnimalRideControls(controls: List<AnimalRideControl>) {
-        animalSystem.setRideControls(controls)
+        runOnGlobalAnimalActor {
+            animalSystem.setRideControls(controls)
+        }
     }
 
     fun damageAnimal(entityId: Int, amount: Float, cause: AnimalDamageCause): AnimalDamageResult? {
@@ -1319,6 +1488,68 @@ class World(
         }
         if (currentActorChunk != null) {
             // Never block one chunk actor on another chunk actor.
+            chunkActorScheduler.submit(chunkPos, task)
+            return enqueuedFromOtherChunkActor()
+        }
+        return chunkActorScheduler.submit(chunkPos, task).join()
+    }
+
+    private fun runOnGlobalAnimalActor(task: () -> Unit) {
+        val anchor = ChunkPos(0, 0)
+        val currentActorChunk = currentChunkActorThreadChunkPos()
+        if (currentActorChunk == anchor) {
+            task()
+            return
+        }
+        if (currentActorChunk != null) {
+            chunkActorScheduler.submit(anchor, task)
+            return
+        }
+        chunkActorScheduler.submit(anchor, task).join()
+    }
+
+    private fun <T> runOnDroppedChunk(
+        chunkPos: ChunkPos,
+        task: () -> T,
+        enqueuedFromOtherChunkActor: () -> T
+    ): T {
+        val currentActorChunk = currentChunkActorThreadChunkPos()
+        if (currentActorChunk == chunkPos) {
+            return task()
+        }
+        if (currentActorChunk != null) {
+            chunkActorScheduler.submit(chunkPos, task)
+            return enqueuedFromOtherChunkActor()
+        }
+        return chunkActorScheduler.submit(chunkPos, task).join()
+    }
+
+    private fun <T> runOnThrownChunk(
+        chunkPos: ChunkPos,
+        task: () -> T,
+        enqueuedFromOtherChunkActor: () -> T
+    ): T {
+        val currentActorChunk = currentChunkActorThreadChunkPos()
+        if (currentActorChunk == chunkPos) {
+            return task()
+        }
+        if (currentActorChunk != null) {
+            chunkActorScheduler.submit(chunkPos, task)
+            return enqueuedFromOtherChunkActor()
+        }
+        return chunkActorScheduler.submit(chunkPos, task).join()
+    }
+
+    private fun <T> runOnFallingChunk(
+        chunkPos: ChunkPos,
+        task: () -> T,
+        enqueuedFromOtherChunkActor: () -> T
+    ): T {
+        val currentActorChunk = currentChunkActorThreadChunkPos()
+        if (currentActorChunk == chunkPos) {
+            return task()
+        }
+        if (currentActorChunk != null) {
             chunkActorScheduler.submit(chunkPos, task)
             return enqueuedFromOtherChunkActor()
         }

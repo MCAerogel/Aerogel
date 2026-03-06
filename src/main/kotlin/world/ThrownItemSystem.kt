@@ -70,6 +70,60 @@ data class ThrownItemTickEvents(
 class ThrownItemSystem(
     private val blockStateAt: (Int, Int, Int) -> Int
 ) {
+    private sealed interface PendingOp {
+        data class Spawn(
+            val entityId: Int,
+            val ownerEntityId: Int,
+            val kind: ThrownItemKind,
+            val x: Double,
+            val y: Double,
+            val z: Double,
+            val vx: Double,
+            val vy: Double,
+            val vz: Double,
+            val uuid: UUID
+        ) : PendingOp
+        data class Remove(
+            val entityId: Int
+        ) : PendingOp
+        data class UpdatePosition(
+            val entityId: Int,
+            val x: Double,
+            val y: Double,
+            val z: Double
+        ) : PendingOp
+        data class UpdateVelocity(
+            val entityId: Int,
+            val vx: Double,
+            val vy: Double,
+            val vz: Double
+        ) : PendingOp
+        data class UpdatePreviousPosition(
+            val entityId: Int,
+            val prevX: Double,
+            val prevY: Double,
+            val prevZ: Double
+        ) : PendingOp
+        data class UpdateAcceleration(
+            val entityId: Int,
+            val ax: Double,
+            val ay: Double,
+            val az: Double
+        ) : PendingOp
+        data class UpdateOwner(
+            val entityId: Int,
+            val ownerEntityId: Int
+        ) : PendingOp
+        data class UpdateKind(
+            val entityId: Int,
+            val kind: ThrownItemKind
+        ) : PendingOp
+        data class UpdateOnGround(
+            val entityId: Int,
+            val onGround: Boolean
+        ) : PendingOp
+    }
+
     private data class CollisionHit(
         val t: Double,
         val axis: Int?,
@@ -143,6 +197,7 @@ class ThrownItemSystem(
     private val snapshots = ConcurrentHashMap<Int, ThrownItemSnapshot>()
     private val chunkIndex = ConcurrentHashMap<ChunkPos, MutableSet<Int>>()
     private val pendingSpawned = ConcurrentLinkedQueue<Int>()
+    private val pendingOps = ConcurrentLinkedQueue<PendingOp>()
     private val collisionBoxesByState = ConcurrentHashMap<Int, Array<CollisionBox>>()
 
     fun spawn(
@@ -157,36 +212,21 @@ class ThrownItemSystem(
         vz: Double,
         uuid: UUID = UUID.randomUUID()
     ): Boolean {
-        if (entityId < 0) return false
-        val chunkX = chunkXFromBlockX(x)
-        val chunkZ = chunkZFromBlockZ(z)
-        val entity = MutableThrownItem(
-            entityId = entityId,
-            ownerEntityId = ownerEntityId,
-            uuid = uuid,
-            kind = kind,
-            prevX = x,
-            prevY = y,
-            prevZ = z,
-            x = x,
-            y = y,
-            z = z,
-            vx = vx,
-            vy = vy,
-            vz = vz,
-            accelerationX = 0.0,
-            accelerationY = 0.0,
-            accelerationZ = 0.0,
-            onGround = false,
-            ageTicks = 0.0,
-            chunkX = chunkX,
-            chunkZ = chunkZ
+        if (entityId < 0 || !x.isFinite() || !y.isFinite() || !z.isFinite() || !vx.isFinite() || !vy.isFinite() || !vz.isFinite()) return false
+        pendingOps.add(
+            PendingOp.Spawn(
+                entityId = entityId,
+                ownerEntityId = ownerEntityId,
+                kind = kind,
+                x = x,
+                y = y,
+                z = z,
+                vx = vx,
+                vy = vy,
+                vz = vz,
+                uuid = uuid
+            )
         )
-        if (entities.putIfAbsent(entityId, entity) != null) return false
-        val snapshot = entity.snapshot()
-        snapshots[entityId] = snapshot
-        addToChunkIndex(snapshot.chunkPos, entityId)
-        pendingSpawned.add(entityId)
         return true
     }
 
@@ -200,26 +240,24 @@ class ThrownItemSystem(
         hitDirection: Int? = null,
         hitBoundary: Double? = null
     ): ThrownItemRemovedEvent? {
-        val entity = entities.remove(entityId) ?: return null
-        val oldChunk = ChunkPos(entity.chunkX, entity.chunkZ)
-        snapshots.remove(entityId)
-        removeFromChunkIndex(oldChunk, entityId)
+        val snapshot = snapshots[entityId] ?: return null
+        pendingOps.add(PendingOp.Remove(entityId))
         return ThrownItemRemovedEvent(
             entityId = entityId,
-            ownerEntityId = entity.ownerEntityId,
-            kind = entity.kind,
-            chunkPos = oldChunk,
+            ownerEntityId = snapshot.ownerEntityId,
+            kind = snapshot.kind,
+            chunkPos = snapshot.chunkPos,
             hit = hit,
-            x = x ?: entity.x,
-            y = y ?: entity.y,
-            z = z ?: entity.z,
+            x = x ?: snapshot.x,
+            y = y ?: snapshot.y,
+            z = z ?: snapshot.z,
             hitAxis = hitAxis,
             hitDirection = hitDirection,
             hitBoundary = hitBoundary
         )
     }
 
-    fun hasEntities(): Boolean = snapshots.isNotEmpty()
+    fun hasEntities(): Boolean = snapshots.isNotEmpty() || pendingOps.isNotEmpty()
 
     fun snapshot(entityId: Int): ThrownItemSnapshot? = snapshots[entityId]
 
@@ -233,59 +271,48 @@ class ThrownItemSystem(
 
     fun updatePosition(entityId: Int, x: Double, y: Double, z: Double): ThrownItemSnapshot? {
         if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return null
-        return mutate(entityId) { entity ->
-            entity.x = x
-            entity.y = y
-            entity.z = z
-            entity.prevX = x
-            entity.prevY = y
-            entity.prevZ = z
-        }
+        if (snapshots[entityId] == null) return null
+        pendingOps.add(PendingOp.UpdatePosition(entityId, x, y, z))
+        return snapshots[entityId]
     }
 
     fun updateVelocity(entityId: Int, vx: Double, vy: Double, vz: Double): ThrownItemSnapshot? {
         if (!vx.isFinite() || !vy.isFinite() || !vz.isFinite()) return null
-        return mutate(entityId) { entity ->
-            entity.vx = vx
-            entity.vy = vy
-            entity.vz = vz
-        }
+        if (snapshots[entityId] == null) return null
+        pendingOps.add(PendingOp.UpdateVelocity(entityId, vx, vy, vz))
+        return snapshots[entityId]
     }
 
     fun updatePreviousPosition(entityId: Int, prevX: Double, prevY: Double, prevZ: Double): ThrownItemSnapshot? {
         if (!prevX.isFinite() || !prevY.isFinite() || !prevZ.isFinite()) return null
-        return mutate(entityId) { entity ->
-            entity.prevX = prevX
-            entity.prevY = prevY
-            entity.prevZ = prevZ
-        }
+        if (snapshots[entityId] == null) return null
+        pendingOps.add(PendingOp.UpdatePreviousPosition(entityId, prevX, prevY, prevZ))
+        return snapshots[entityId]
     }
 
     fun updateAcceleration(entityId: Int, ax: Double, ay: Double, az: Double): ThrownItemSnapshot? {
         if (!ax.isFinite() || !ay.isFinite() || !az.isFinite()) return null
-        return mutate(entityId) { entity ->
-            entity.accelerationX = ax
-            entity.accelerationY = ay
-            entity.accelerationZ = az
-        }
+        if (snapshots[entityId] == null) return null
+        pendingOps.add(PendingOp.UpdateAcceleration(entityId, ax, ay, az))
+        return snapshots[entityId]
     }
 
     fun updateOwnerEntityId(entityId: Int, ownerEntityId: Int): ThrownItemSnapshot? {
-        return mutate(entityId) { entity ->
-            entity.ownerEntityId = ownerEntityId
-        }
+        if (snapshots[entityId] == null) return null
+        pendingOps.add(PendingOp.UpdateOwner(entityId, ownerEntityId))
+        return snapshots[entityId]
     }
 
     fun updateKind(entityId: Int, kind: ThrownItemKind): ThrownItemSnapshot? {
-        return mutate(entityId) { entity ->
-            entity.kind = kind
-        }
+        if (snapshots[entityId] == null) return null
+        pendingOps.add(PendingOp.UpdateKind(entityId, kind))
+        return snapshots[entityId]
     }
 
     fun updateOnGround(entityId: Int, onGround: Boolean): ThrownItemSnapshot? {
-        return mutate(entityId) { entity ->
-            entity.onGround = onGround
-        }
+        if (snapshots[entityId] == null) return null
+        pendingOps.add(PendingOp.UpdateOnGround(entityId, onGround))
+        return snapshots[entityId]
     }
 
     fun snapshotsInChunk(chunkX: Int, chunkZ: Int): List<ThrownItemSnapshot> {
@@ -321,6 +348,7 @@ class ThrownItemSystem(
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): ThrownItemTickEvents {
         if (deltaSeconds <= 0.0) return ThrownItemTickEvents(emptyList(), emptyList(), emptyList())
+        flushPendingOps()
         if (entities.isEmpty()) return ThrownItemTickEvents(emptyList(), emptyList(), emptyList())
 
         val spawned = ArrayList<ThrownItemSnapshot>()
@@ -448,19 +476,94 @@ class ThrownItemSystem(
     private inline fun mutate(entityId: Int, mutator: (MutableThrownItem) -> Unit): ThrownItemSnapshot? {
         val entity = entities[entityId] ?: return null
         val oldChunk = ChunkPos(entity.chunkX, entity.chunkZ)
-        synchronized(entity) {
-            mutator(entity)
-            val newChunkX = chunkXFromBlockX(entity.x)
-            val newChunkZ = chunkZFromBlockZ(entity.z)
-            val newChunk = ChunkPos(newChunkX, newChunkZ)
-            entity.chunkX = newChunkX
-            entity.chunkZ = newChunkZ
-            val snapshot = entity.snapshot()
-            snapshots[entityId] = snapshot
-            if (newChunk != oldChunk) {
-                moveChunkIndex(entityId, oldChunk, newChunk)
+        mutator(entity)
+        val newChunkX = chunkXFromBlockX(entity.x)
+        val newChunkZ = chunkZFromBlockZ(entity.z)
+        val newChunk = ChunkPos(newChunkX, newChunkZ)
+        entity.chunkX = newChunkX
+        entity.chunkZ = newChunkZ
+        val snapshot = entity.snapshot()
+        snapshots[entityId] = snapshot
+        if (newChunk != oldChunk) {
+            moveChunkIndex(entityId, oldChunk, newChunk)
+        }
+        return snapshot
+    }
+
+    internal fun flushPendingOps() {
+        while (true) {
+            when (val op = pendingOps.poll() ?: break) {
+                is PendingOp.Spawn -> {
+                    if (entities.containsKey(op.entityId) || snapshots.containsKey(op.entityId)) continue
+                    val chunkX = chunkXFromBlockX(op.x)
+                    val chunkZ = chunkZFromBlockZ(op.z)
+                    val entity = MutableThrownItem(
+                        entityId = op.entityId,
+                        ownerEntityId = op.ownerEntityId,
+                        uuid = op.uuid,
+                        kind = op.kind,
+                        prevX = op.x,
+                        prevY = op.y,
+                        prevZ = op.z,
+                        x = op.x,
+                        y = op.y,
+                        z = op.z,
+                        vx = op.vx,
+                        vy = op.vy,
+                        vz = op.vz,
+                        accelerationX = 0.0,
+                        accelerationY = 0.0,
+                        accelerationZ = 0.0,
+                        onGround = false,
+                        ageTicks = 0.0,
+                        chunkX = chunkX,
+                        chunkZ = chunkZ
+                    )
+                    entities[op.entityId] = entity
+                    val snapshot = entity.snapshot()
+                    snapshots[op.entityId] = snapshot
+                    addToChunkIndex(snapshot.chunkPos, op.entityId)
+                    pendingSpawned.add(op.entityId)
+                }
+                is PendingOp.Remove -> {
+                    val entity = entities.remove(op.entityId) ?: continue
+                    val oldChunk = ChunkPos(entity.chunkX, entity.chunkZ)
+                    snapshots.remove(op.entityId)
+                    removeFromChunkIndex(oldChunk, op.entityId)
+                }
+                is PendingOp.UpdatePosition -> mutate(op.entityId) { entity ->
+                    entity.x = op.x
+                    entity.y = op.y
+                    entity.z = op.z
+                    entity.prevX = op.x
+                    entity.prevY = op.y
+                    entity.prevZ = op.z
+                }
+                is PendingOp.UpdateVelocity -> mutate(op.entityId) { entity ->
+                    entity.vx = op.vx
+                    entity.vy = op.vy
+                    entity.vz = op.vz
+                }
+                is PendingOp.UpdatePreviousPosition -> mutate(op.entityId) { entity ->
+                    entity.prevX = op.prevX
+                    entity.prevY = op.prevY
+                    entity.prevZ = op.prevZ
+                }
+                is PendingOp.UpdateAcceleration -> mutate(op.entityId) { entity ->
+                    entity.accelerationX = op.ax
+                    entity.accelerationY = op.ay
+                    entity.accelerationZ = op.az
+                }
+                is PendingOp.UpdateOwner -> mutate(op.entityId) { entity ->
+                    entity.ownerEntityId = op.ownerEntityId
+                }
+                is PendingOp.UpdateKind -> mutate(op.entityId) { entity ->
+                    entity.kind = op.kind
+                }
+                is PendingOp.UpdateOnGround -> mutate(op.entityId) { entity ->
+                    entity.onGround = op.onGround
+                }
             }
-            return snapshot
         }
     }
 
