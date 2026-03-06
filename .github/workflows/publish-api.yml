@@ -34,26 +34,15 @@ jobs:
       - name: Trigger JitPack build
         run: |
           VERSION="${{ steps.vars.outputs.version }}"
-          URL="https://jitpack.io/com/github/MCAerogel/Aerogel/api/${VERSION}/api-${VERSION}.pom"
+          URL="https://jitpack.io/com/github/MCAerogel/Aerogel/${VERSION}/build.log"
           HTTP_CODE="$(curl --silent --show-error --location \
             --connect-timeout 10 \
             --max-time 30 \
+            --retry 5 \
+            --retry-delay 5 \
+            --retry-all-errors \
             --output /dev/null \
             --write-out "%{http_code}" \
             "$URL" || true)"
 
-          if [[ "$HTTP_CODE" == "404" ]]; then
-            echo "JitPack returned 404, waiting 45s then rechecking..."
-            sleep 45
-            RETRY_CODE="$(curl --silent --show-error --location \
-              --connect-timeout 10 \
-              --max-time 30 \
-              --output /dev/null \
-              --write-out "%{http_code}" \
-              "$URL" || true)"
-            echo "JitPack recheck HTTP $RETRY_CODE: $URL"
-          elif [[ "$HTTP_CODE" == "200" ]]; then
-            echo "JitPack artifact is available (HTTP 200): $URL"
-          else
-            echo "JitPack trigger request returned HTTP $HTTP_CODE (non-blocking): $URL"
-          fi
+          echo "JitPack build trigger response HTTP $HTTP_CODE: $URL (non-blocking)"
