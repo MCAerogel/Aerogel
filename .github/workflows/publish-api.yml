@@ -1,12 +1,15 @@
-name: Publish API Package
+name: Trigger JitPack API Build
 
 on:
   push:
     branches:
       - main
+    tags:
+      - "*"
     paths:
       - "modules/api/**"
       - ".github/workflows/publish-api.yml"
+      - "jitpack.yml"
       - "settings.gradle.kts"
       - "gradle.properties"
       - "gradle/**"
@@ -14,28 +17,21 @@ on:
       - "gradlew.bat"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
-  publish:
+  trigger:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Resolve JitPack target version
+        id: vars
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=main-SNAPSHOT" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "25"
-          cache: gradle
-
-      - name: Publish API to GitHub Packages
-        env:
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./gradlew :api:publish --no-daemon
-
+      - name: Trigger JitPack build
+        run: |
+          curl --fail --show-error --location \
+            "https://jitpack.io/com/github/MCAerogel/Aerogel/${{ steps.vars.outputs.version }}/build.log"

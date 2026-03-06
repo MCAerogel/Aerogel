@@ -31,20 +31,8 @@ publishing {
         create<MavenPublication>("mavenJava") {
             from(components["java"])
             groupId = project.group.toString()
-            artifactId = "aerogel-api"
+            artifactId = "api"
             version = project.version.toString()
-        }
-    }
-    repositories {
-        maven {
-            name = "GitHubPackages"
-            url = uri("https://maven.pkg.github.com/MCAerogel/Aerogel")
-            credentials {
-                username = System.getenv("GITHUB_ACTOR")
-                    ?: findProperty("gpr.user")?.toString()
-                password = System.getenv("GITHUB_TOKEN")
-                    ?: findProperty("gpr.key")?.toString()
-            }
         }
     }
 }

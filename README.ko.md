@@ -93,7 +93,7 @@
 
 - `build/libs/Aerogel.jar` - 메인 서버 런타임
 - `build/libs/AerogelFoliaBridge.jar` - Folia 브리지 플러그인
-- `:api` 모듈 - `org.macaroon3145:aerogel-api:1.0-SNAPSHOT`
+- `:api` 모듈 - `com.github.MCAerogel.Aerogel:api:main-SNAPSHOT`
 
 ## 빠른 시작
 
@@ -125,11 +125,11 @@ java --enable-native-access=ALL-UNNAMED \
 ```kotlin
 repositories {
     mavenCentral()
-    maven("https://maven.pkg.github.com/MCAerogel/Aerogel")
+    maven("https://jitpack.io")
 }
 
 dependencies {
-    compileOnly("org.macaroon3145:aerogel-api:1.0-SNAPSHOT")
+    compileOnly("com.github.MCAerogel.Aerogel:api:main-SNAPSHOT")
 }
 ```
 
@@ -164,12 +164,12 @@ class HelloPlugin : AerogelPlugin {
 
 ## API 배포
 
-`main` 브랜치에서 `modules/api/**` 변경 시 GitHub Actions를 통해 GitHub Packages로 자동 배포됩니다.
+`main` 브랜치 API 변경 시 스냅샷(`main-SNAPSHOT`) 빌드를, 태그 푸시 시 릴리스 빌드를 GitHub Actions가 JitPack에 자동 트리거합니다.
 
-- Group: `org.macaroon3145`
-- Artifact: `aerogel-api`
-- Version: `1.0-SNAPSHOT`
-- Repository: `https://maven.pkg.github.com/MCAerogel/Aerogel`
+- Group: `com.github.MCAerogel.Aerogel`
+- Artifact: `api`
+- Version: `main-SNAPSHOT` (또는 Git 태그 예: `v1.0.0`)
+- Repository: `https://jitpack.io`
 
 ## 기여 우선 영역
 
