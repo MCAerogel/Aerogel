@@ -193,5 +193,7 @@
   "aerogel.dashboard.world.all": "All Worlds",
   "aerogel.dashboard.world.unavailable": "Unavailable",
   "aerogel.console.dashboard.opened": "Dashboard opened.",
-  "aerogel.console.dashboard.unavailable": "Dashboard unavailable in headless mode."
+  "aerogel.console.dashboard.unavailable": "Dashboard unavailable in headless mode.",
+  "aerogel.inventory.plugin.page_navigation.previous": "Go To Previous Page",
+  "aerogel.inventory.plugin.page_navigation.next": "Go To Next Page"
 }

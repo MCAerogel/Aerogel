@@ -54,6 +54,7 @@ import org.macaroon3145.api.entity.GameMode
 import org.macaroon3145.api.entity.Hand
 import org.macaroon3145.api.entity.Item
 import org.macaroon3145.api.entity.InventorySlotView
+import org.macaroon3145.api.entity.InventoryAddResult
 import org.macaroon3145.api.entity.Player
 import org.macaroon3145.api.entity.PlayerInventory
 import org.macaroon3145.api.entity.PlayerRegistry
@@ -69,6 +70,7 @@ import org.macaroon3145.api.world.Location
 import org.macaroon3145.api.world.World
 import org.macaroon3145.api.world.WorldRegistry
 import org.macaroon3145.api.event.Subscribe
+import org.macaroon3145.api.inventory.InventoryRuntimeBridge
 import org.macaroon3145.api.packet.PacketEnvelope
 import org.macaroon3145.api.packet.PacketInterceptor
 import org.macaroon3145.api.packet.PacketInterceptorHandle
@@ -93,6 +95,7 @@ import org.macaroon3145.api.service.ServiceHandle
 import org.macaroon3145.api.service.ServiceRegistry
 import org.macaroon3145.api.type.BlockType
 import org.macaroon3145.api.type.ItemType
+import org.macaroon3145.api.type.Sound
 import org.macaroon3145.api.type.TypeRegistry
 import org.macaroon3145.i18n.ServerI18n
 import org.macaroon3145.network.command.Command
@@ -190,6 +193,7 @@ object PluginSystem {
         Server.bindMainTickScheduler(tickScheduler.global())
         Server.bindTaskScheduler(scheduler)
         Server.bindPlayerRegistry(runtimePlayerRegistry)
+        Server.bindInventoryBridge(runtimeInventoryBridge)
         loadAllFromDisk()
         pluginJarHotReloadLoop.start()
     }
@@ -1326,6 +1330,7 @@ private class RuntimePluginI18n(
 private val runtimeTypeRegistry: TypeRegistry by lazy { RuntimeTypeRegistry() }
 private val runtimeWorldRegistry: WorldRegistry by lazy { RuntimeWorldRegistry() }
 private val runtimePlayerRegistry: PlayerRegistry by lazy { RuntimePlayerRegistry() }
+private val runtimeInventoryBridge: InventoryRuntimeBridge by lazy { RuntimeInventoryBridge() }
 private val runtimePluginRegistry: PluginRegistry by lazy { RuntimePluginRegistry() }
 private val runtimeFallbackAirBlockType: BlockType by lazy {
     BlockType.fromKey("minecraft:air") ?: BlockType.entries.first()
@@ -1418,6 +1423,171 @@ private class RuntimePlayerRegistry : PlayerRegistry {
     override fun player(name: String): ConnectedPlayer? {
         val session = PlayerSessionManager.byName(name)
         return if (session != null) RuntimeConnectedPlayer.fromSession(session) else null
+    }
+}
+
+private class RuntimeInventoryBridge : InventoryRuntimeBridge {
+    override fun createChestInventory(size: Int, title: String?, location: Location?): Long {
+        return PlayerSessionManager.createPluginChestInventory(
+            size = size,
+            title = title,
+            locationWorldKey = location?.world?.key,
+            locationX = location?.blockX ?: 0,
+            locationY = location?.blockY ?: 0,
+            locationZ = location?.blockZ ?: 0
+        )
+    }
+
+    override fun openChestInventory(playerUuid: UUID, inventoryId: Long, page: Int): Boolean {
+        return PlayerSessionManager.openPluginChestInventory(playerUuid, inventoryId, page)
+    }
+
+    override fun chestInventoryCurrentPage(playerUuid: UUID, inventoryId: Long): Int? {
+        return PlayerSessionManager.pluginChestInventoryCurrentPage(playerUuid, inventoryId)
+    }
+
+    override fun chestInventoryPageCount(inventoryId: Long): Int {
+        return PlayerSessionManager.pluginChestInventoryPageCount(inventoryId)
+    }
+
+    override fun chestInventoryPageNavigationItems(inventoryId: Long): Boolean {
+        return PlayerSessionManager.pluginChestPageNavigationItems(inventoryId)
+    }
+
+    override fun chestInventoryPageNavigationClickSound(inventoryId: Long): Boolean {
+        return PlayerSessionManager.pluginChestPageNavigationClickSound(inventoryId)
+    }
+
+    override fun chestInventoryNavigationItem(inventoryId: Long, previous: Boolean): Item? {
+        val raw = PlayerSessionManager.pluginChestNavigationItem(inventoryId, previous) ?: return null
+        val itemId = raw.first
+        val amount = raw.second
+        if (itemId < 0 || amount <= 0) return null
+        return Item(
+            id = itemId,
+            type = ItemType.fromId(itemId),
+            amount = amount
+        )
+    }
+
+    override fun getChestInventorySlot(inventoryId: Long, slot: Int): Pair<Int, Int>? {
+        return PlayerSessionManager.pluginChestInventorySlot(inventoryId, slot)
+    }
+
+    override fun setChestInventorySlot(inventoryId: Long, slot: Int, item: Item?): Boolean {
+        return PlayerSessionManager.setPluginChestInventorySlot(inventoryId, slot, item)
+    }
+
+    override fun setChestInventorySlot(inventoryId: Long, slot: Int, itemId: Int, amount: Int): Boolean {
+        return PlayerSessionManager.setPluginChestInventorySlot(inventoryId, slot, itemId, amount)
+    }
+
+    override fun addChestInventoryItem(inventoryId: Long, item: Item, overflowDrop: Boolean): InventoryAddResult {
+        return PlayerSessionManager.addPluginChestInventoryItem(
+            inventoryId = inventoryId,
+            item = item,
+            overflowDrop = overflowDrop
+        )
+    }
+
+    override fun setChestInventorySize(inventoryId: Long, size: Int): Boolean {
+        return PlayerSessionManager.setPluginChestInventorySize(inventoryId, size)
+    }
+
+    override fun setChestInventoryTitle(inventoryId: Long, title: String?): Boolean {
+        return PlayerSessionManager.setPluginChestInventoryTitle(inventoryId, title)
+    }
+
+    override fun setChestInventoryNavigationItem(inventoryId: Long, previous: Boolean, item: Item?): Boolean {
+        return PlayerSessionManager.setPluginChestNavigationItem(
+            inventoryId = inventoryId,
+            previous = previous,
+            itemId = item?.id ?: -1,
+            amount = item?.amount ?: 0
+        )
+    }
+
+    override fun setChestInventoryPageNavigationItems(inventoryId: Long, enabled: Boolean): Boolean {
+        return PlayerSessionManager.setPluginChestPageNavigationItems(
+            inventoryId = inventoryId,
+            enabled = enabled
+        )
+    }
+
+    override fun setChestInventoryPageNavigationClickSound(inventoryId: Long, enabled: Boolean): Boolean {
+        return PlayerSessionManager.setPluginChestPageNavigationClickSound(
+            inventoryId = inventoryId,
+            enabled = enabled
+        )
+    }
+
+    override fun setChestInventoryPageNavigationClickSoundKey(inventoryId: Long, soundKey: String): Boolean {
+        return PlayerSessionManager.setPluginChestPageNavigationClickSoundKey(
+            inventoryId = inventoryId,
+            soundKey = soundKey
+        )
+    }
+
+    override fun chestInventoryReadOnly(inventoryId: Long): Boolean {
+        return PlayerSessionManager.pluginChestInventoryReadOnly(inventoryId)
+    }
+
+    override fun setChestInventoryReadOnly(inventoryId: Long, readOnly: Boolean): Boolean {
+        return PlayerSessionManager.setPluginChestInventoryReadOnly(inventoryId, readOnly)
+    }
+
+    override fun chestInventoryReadOnlyItem(inventoryId: Long, slot: Int): Boolean {
+        return PlayerSessionManager.pluginChestInventoryReadOnlySlot(inventoryId, slot)
+    }
+
+    override fun setChestInventoryReadOnlyItem(inventoryId: Long, slot: Int, readOnly: Boolean): Boolean {
+        return PlayerSessionManager.setPluginChestInventoryReadOnlySlot(inventoryId, slot, readOnly)
+    }
+
+    override fun chestInventoryViewers(inventoryId: Long): List<ConnectedPlayer> {
+        return PlayerSessionManager.pluginChestInventoryViewers(inventoryId).mapNotNull(Server::getPlayer)
+    }
+
+    override fun playSound(playerUuid: UUID, sound: Sound, volume: Float, pitch: Float): Boolean {
+        return PlayerSessionManager.playSoundForPlayer(
+            uuid = playerUuid,
+            soundKey = sound.key,
+            volume = volume,
+            pitch = pitch
+        )
+    }
+
+    override fun playSound(location: Location, sound: Sound, volume: Float, pitch: Float): Boolean {
+        return PlayerSessionManager.playSoundAt(
+            worldKey = location.world.key,
+            x = location.x,
+            y = location.y,
+            z = location.z,
+            soundKey = sound.key,
+            volume = volume,
+            pitch = pitch
+        )
+    }
+
+    override fun playSound(playerUuid: UUID, soundKey: String, volume: Float, pitch: Float): Boolean {
+        return PlayerSessionManager.playSoundForPlayer(
+            uuid = playerUuid,
+            soundKey = soundKey,
+            volume = volume,
+            pitch = pitch
+        )
+    }
+
+    override fun playSound(location: Location, soundKey: String, volume: Float, pitch: Float): Boolean {
+        return PlayerSessionManager.playSoundAt(
+            worldKey = location.world.key,
+            x = location.x,
+            y = location.y,
+            z = location.z,
+            soundKey = soundKey,
+            volume = volume,
+            pitch = pitch
+        )
     }
 }
 
@@ -1862,6 +2032,76 @@ private class RuntimeConnectedPlayer(
         if (!wasDead) return false
         PlayerSessionManager.respawnIfDead(session.channelId)
         return true
+    }
+
+    override fun close(): Boolean {
+        return PlayerSessionManager.closeOpenContainer(playerUuid)
+    }
+
+    override fun openCraftingTable(): Boolean {
+        return PlayerSessionManager.openCraftingTable(playerUuid)
+    }
+
+    override fun openFurnaceAt(location: Location): Boolean {
+        val session = liveSession()
+        if (session.worldKey != location.world.key) return false
+        return PlayerSessionManager.openFurnace(
+            uuid = playerUuid,
+            x = location.blockX,
+            y = location.blockY,
+            z = location.blockZ
+        )
+    }
+
+    override fun openChestAt(location: Location): Boolean {
+        val session = liveSession()
+        if (session.worldKey != location.world.key) return false
+        return PlayerSessionManager.openChest(
+            uuid = playerUuid,
+            x = location.blockX,
+            y = location.blockY,
+            z = location.blockZ
+        )
+    }
+
+    override fun openShulkerAt(location: Location): Boolean {
+        val session = liveSession()
+        if (session.worldKey != location.world.key) return false
+        return PlayerSessionManager.openShulker(
+            uuid = playerUuid,
+            x = location.blockX,
+            y = location.blockY,
+            z = location.blockZ
+        )
+    }
+
+    override fun openEnderChestAt(location: Location): Boolean {
+        val session = liveSession()
+        if (session.worldKey != location.world.key) return false
+        return PlayerSessionManager.openEnderChest(
+            uuid = playerUuid,
+            x = location.blockX,
+            y = location.blockY,
+            z = location.blockZ
+        )
+    }
+
+    override fun playSound(sound: Sound, volume: Float, pitch: Float): Boolean {
+        return PlayerSessionManager.playSoundForPlayer(
+            uuid = playerUuid,
+            soundKey = sound.key,
+            volume = volume,
+            pitch = pitch
+        )
+    }
+
+    override fun playSound(soundKey: String, volume: Float, pitch: Float): Boolean {
+        return PlayerSessionManager.playSoundForPlayer(
+            uuid = playerUuid,
+            soundKey = soundKey,
+            volume = volume,
+            pitch = pitch
+        )
     }
 
     private fun inventoryStackOf(itemId: Int, count: Int): Item? {

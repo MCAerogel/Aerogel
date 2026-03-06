@@ -6,6 +6,7 @@ import org.macaroon3145.api.packet.VersionlessPacket
 import org.macaroon3145.api.packet.systemChatTextComponentNbt
 import org.macaroon3145.api.plugin.PluginRuntime
 import org.macaroon3145.api.type.ItemType
+import org.macaroon3145.api.type.Sound
 import org.macaroon3145.api.world.Location
 import org.macaroon3145.api.world.Chunk
 import org.macaroon3145.api.world.World
@@ -265,7 +266,39 @@ abstract class ConnectedPlayer(
     abstract fun setMainItem(slot: Int, item: Item?): Boolean
     abstract fun setArmorItem(slot: ArmorSlot, item: Item?): Boolean
     abstract fun setOffhandItem(item: Item?): Boolean
+    abstract fun close(): Boolean
     abstract fun respawn(): Boolean
+    abstract fun openCraftingTable(): Boolean
+    abstract fun openFurnaceAt(location: Location): Boolean
+    abstract fun openChestAt(location: Location): Boolean
+    abstract fun openShulkerAt(location: Location): Boolean
+    abstract fun openEnderChestAt(location: Location): Boolean
+    abstract fun playSound(sound: Sound, volume: Float = 1.0f, pitch: Float = 1.0f): Boolean
+    abstract fun playSound(soundKey: String, volume: Float = 1.0f, pitch: Float = 1.0f): Boolean
+
+    fun openFurnace(): Boolean {
+        return openFurnaceAt(location)
+    }
+
+    fun openChest(): Boolean {
+        return openChestAt(location)
+    }
+
+    fun openShulker(): Boolean {
+        return openShulkerAt(location)
+    }
+
+    fun openEnderChest(): Boolean {
+        return openEnderChestAt(location)
+    }
+
+    fun open(inventory: org.macaroon3145.api.inventory.Inventory<*>): Boolean {
+        return inventory.open(this)
+    }
+
+    fun open(inventory: org.macaroon3145.api.inventory.Inventory<*>, page: Int): Boolean {
+        return inventory.open(this, page)
+    }
 
     fun setHotbar(slot: Int, itemType: ItemType, amount: Int = 1): Boolean {
         return setHotbarItem(slot, Item(type = itemType, amount = amount))

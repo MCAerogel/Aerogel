@@ -1,9 +1,11 @@
 package org.macaroon3145.api.world
 
+import org.macaroon3145.api.Server
 import org.macaroon3145.api.entity.DroppedItem
 import org.macaroon3145.api.entity.Entity
 import org.macaroon3145.api.entity.EntityType
 import org.macaroon3145.api.entity.Item
+import org.macaroon3145.api.type.Sound
 import kotlin.math.floor
 
 data class Location(
@@ -52,5 +54,23 @@ data class Location(
 
     fun spawn(entityType: EntityType): Entity {
         return world.spawn(this, entityType)
+    }
+
+    fun playSound(sound: Sound, volume: Float = 1.0f, pitch: Float = 1.0f): Boolean {
+        return Server.playSound(
+            location = this,
+            sound = sound,
+            volume = volume,
+            pitch = pitch
+        )
+    }
+
+    fun playSound(soundKey: String, volume: Float = 1.0f, pitch: Float = 1.0f): Boolean {
+        return Server.playSound(
+            location = this,
+            soundKey = soundKey,
+            volume = volume,
+            pitch = pitch
+        )
     }
 }

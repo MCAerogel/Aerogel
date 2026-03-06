@@ -193,5 +193,7 @@
   "aerogel.dashboard.world.all": "전체 월드",
   "aerogel.dashboard.world.unavailable": "선택할 수 없음",
   "aerogel.console.dashboard.opened": "대시보드 창을 열었습니다.",
-  "aerogel.console.dashboard.unavailable": "헤드리스 모드에서는 대시보드를 열 수 없습니다."
+  "aerogel.console.dashboard.unavailable": "헤드리스 모드에서는 대시보드를 열 수 없습니다.",
+  "aerogel.inventory.plugin.page_navigation.previous": "이전 페이지로 이동",
+  "aerogel.inventory.plugin.page_navigation.next": "다음 페이지로 이동"
 }

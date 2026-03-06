@@ -430,10 +430,23 @@ data class Item(
  * Fixed-size mutable slot view backed by runtime inventory state.
  */
 class InventorySlotView(
-    override val size: Int,
+    private val sizeProvider: () -> Int,
     private val getter: (Int) -> Item?,
     private val setter: (Int, Item?) -> Boolean
 ) : AbstractMutableList<Item?>() {
+    constructor(
+        size: Int,
+        getter: (Int) -> Item?,
+        setter: (Int, Item?) -> Boolean
+    ) : this(
+        sizeProvider = { size },
+        getter = getter,
+        setter = setter
+    )
+
+    override val size: Int
+        get() = sizeProvider().coerceAtLeast(0)
+
     override fun get(index: Int): Item? {
         require(index in 0 until size) { "Slot out of range: $index" }
         return getter(index)
