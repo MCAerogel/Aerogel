@@ -32,6 +32,31 @@
 - Java requirement: 25
 - Vanilla parity: partial and expanding continuously
 
+## Team
+
+<div align="center">
+
+<table>
+  <tr>
+    <th>Role</th>
+    <th>Profile</th>
+  </tr>
+  <tr>
+    <td align="center">Project Owner</td>
+    <td align="center"><img src="https://github.com/Mkkas3145.png" width="64" height="64" alt="Mkkas3145"/><br/><strong>Mkkas3145</strong><br/><a href="https://github.com/Mkkas3145">GitHub</a></td>
+  </tr>
+  <tr>
+    <td align="center">Core Developer</td>
+    <td align="center"><img src="https://github.com/Mkkas3145.png" width="64" height="64" alt="Mkkas3145"/><br/><strong>Mkkas3145</strong><br/><a href="https://github.com/Mkkas3145">GitHub</a></td>
+  </tr>
+  <tr>
+    <td align="center">Maintainer</td>
+    <td align="center"><img src="https://github.com/uniformization.png" width="64" height="64" alt="uniformization"/><br/><strong>uniformization</strong><br/><a href="https://github.com/uniformization">GitHub</a></td>
+  </tr>
+</table>
+
+</div>
+
 ## Implemented Foundation
 
 | Area | Current State |
@@ -139,4 +164,3 @@ Community: `https://discord.gg/fBBgMXXv8P`
 ## Development Notice
 
 Aerogel is intentionally iteration-heavy while core architecture stabilizes.
-

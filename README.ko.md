@@ -32,6 +32,31 @@
 - Java 요구 버전: 25
 - 바닐라 패리티: 부분 구현, 지속 확장 중
 
+## 팀
+
+<div align="center">
+
+<table>
+  <tr>
+    <th>역할</th>
+    <th>프로필</th>
+  </tr>
+  <tr>
+    <td align="center">프로젝트 소유자</td>
+    <td align="center"><img src="https://github.com/Mkkas3145.png" width="64" height="64" alt="Mkkas3145"/><br/><strong>Mkkas3145</strong><br/><a href="https://github.com/Mkkas3145">GitHub</a></td>
+  </tr>
+  <tr>
+    <td align="center">핵심 개발자</td>
+    <td align="center"><img src="https://github.com/Mkkas3145.png" width="64" height="64" alt="Mkkas3145"/><br/><strong>Mkkas3145</strong><br/><a href="https://github.com/Mkkas3145">GitHub</a></td>
+  </tr>
+  <tr>
+    <td align="center">유지보수 담당</td>
+    <td align="center"><img src="https://github.com/uniformization.png" width="64" height="64" alt="uniformization"/><br/><strong>uniformization</strong><br/><a href="https://github.com/uniformization">GitHub</a></td>
+  </tr>
+</table>
+
+</div>
+
 ## 현재 구현 기반
 
 | 영역 | 현재 상태 |
@@ -139,4 +164,3 @@ class HelloPlugin : AerogelPlugin {
 ## 개발 안내
 
 핵심 아키텍처 안정화 전까지 빠른 반복 개발이 계속됩니다.
-
