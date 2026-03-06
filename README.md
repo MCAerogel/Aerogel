@@ -16,12 +16,32 @@
 
 ---
 
-| Quick Links | |
-|---|---|
-| Start here | [Quick Start](#quick-start) |
-| Plugin dev | [Plugin Development](#plugin-development) |
-| API package | [API Publishing](#api-publishing) |
-| Contribute | [Contribution Focus](#contribution-focus) |
+<div align="center">
+
+<table>
+  <tr>
+    <th>Quick Links</th>
+    <th></th>
+  </tr>
+  <tr>
+    <td align="center">Start here</td>
+    <td align="center"><a href="#quick-start">Quick Start</a></td>
+  </tr>
+  <tr>
+    <td align="center">Plugin dev</td>
+    <td align="center"><a href="#plugin-development">Plugin Development</a></td>
+  </tr>
+  <tr>
+    <td align="center">API package</td>
+    <td align="center"><a href="#api-publishing">API Publishing</a></td>
+  </tr>
+  <tr>
+    <td align="center">Contribute</td>
+    <td align="center"><a href="#contribution-focus">Contribution Focus</a></td>
+  </tr>
+</table>
+
+</div>
 
 ## Project Snapshot
 

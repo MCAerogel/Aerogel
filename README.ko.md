@@ -16,12 +16,32 @@
 
 ---
 
-| 빠른 이동 | |
-|---|---|
-| 시작하기 | [빠른 시작](#빠른-시작) |
-| 플러그인 개발 | [플러그인 개발](#플러그인-개발) |
-| API 패키지 | [API 배포](#api-배포) |
-| 기여 | [기여 우선 영역](#기여-우선-영역) |
+<div align="center">
+
+<table>
+  <tr>
+    <th>빠른 이동</th>
+    <th></th>
+  </tr>
+  <tr>
+    <td align="center">시작하기</td>
+    <td align="center"><a href="#빠른-시작">빠른 시작</a></td>
+  </tr>
+  <tr>
+    <td align="center">플러그인 개발</td>
+    <td align="center"><a href="#플러그인-개발">플러그인 개발</a></td>
+  </tr>
+  <tr>
+    <td align="center">API 패키지</td>
+    <td align="center"><a href="#api-배포">API 배포</a></td>
+  </tr>
+  <tr>
+    <td align="center">기여</td>
+    <td align="center"><a href="#기여-우선-영역">기여 우선 영역</a></td>
+  </tr>
+</table>
+
+</div>
 
 ## 프로젝트 스냅샷
 
