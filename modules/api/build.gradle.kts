@@ -3,11 +3,15 @@ plugins {
     `maven-publish`
 }
 
-group = "org.macaroon3145"
-version = "1.0-SNAPSHOT"
+group = "com.github.MCAerogel.Aerogel"
+version = "main-SNAPSHOT"
 
 kotlin {
     jvmToolchain(25)
+}
+
+java {
+    withSourcesJar()
 }
 
 repositories {
