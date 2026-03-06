@@ -50,7 +50,7 @@ versions/
 libraries/
 io/
 plugins/
-world/
+/world/
 runtime-firstboot-test-*/
 
 ### Mac OS ###
