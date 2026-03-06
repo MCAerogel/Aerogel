@@ -35,13 +35,15 @@ jobs:
         run: |
           VERSION="${{ steps.vars.outputs.version }}"
           URL="https://jitpack.io/com/github/MCAerogel/Aerogel/api/${VERSION}/api-${VERSION}.pom"
-          curl --fail --show-error --location \
+          HTTP_CODE="$(curl --silent --show-error --location \
             --connect-timeout 10 \
             --max-time 30 \
-            --retry 5 \
-            --retry-delay 5 \
-            --retry-all-errors \
-            "$URL" || {
-              echo "JitPack artifact endpoint did not respond cleanly (non-blocking): $URL"
-              exit 0
-            }
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            "$URL" || true)"
+
+          if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "404" ]]; then
+            echo "JitPack trigger request accepted (HTTP $HTTP_CODE): $URL"
+          else
+            echo "JitPack trigger request returned HTTP $HTTP_CODE (non-blocking): $URL"
+          fi
