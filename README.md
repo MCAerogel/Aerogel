@@ -93,7 +93,7 @@
 
 - `build/libs/Aerogel.jar` - main server runtime
 - `build/libs/AerogelFoliaBridge.jar` - Folia bridge plugin
-- `:api` module - `com.github.MCAerogel.Aerogel:api:main-SNAPSHOT`
+- `:api` module - `com.github.MCAerogel:Aerogel:main-SNAPSHOT`
 
 ## Quick Start
 
@@ -129,7 +129,7 @@ repositories {
 }
 
 dependencies {
-    compileOnly("com.github.MCAerogel.Aerogel:api:main-SNAPSHOT")
+    compileOnly("com.github.MCAerogel:Aerogel:main-SNAPSHOT")
 }
 ```
 
@@ -166,8 +166,8 @@ class HelloPlugin : AerogelPlugin {
 
 API is built and served by JitPack. GitHub Actions triggers JitPack builds automatically for API changes on `main` (snapshot: `main-SNAPSHOT`) and for tags (release).
 
-- Group: `com.github.MCAerogel.Aerogel`
-- Artifact: `api`
+- Group: `com.github.MCAerogel`
+- Artifact: `Aerogel`
 - Version: `main-SNAPSHOT` (or Git tag, e.g. `v1.0.0`)
 - Repository: `https://jitpack.io`
 

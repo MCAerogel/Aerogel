@@ -93,7 +93,7 @@
 
 - `build/libs/Aerogel.jar` - 메인 서버 런타임
 - `build/libs/AerogelFoliaBridge.jar` - Folia 브리지 플러그인
-- `:api` 모듈 - `com.github.MCAerogel.Aerogel:api:main-SNAPSHOT`
+- `:api` 모듈 - `com.github.MCAerogel:Aerogel:main-SNAPSHOT`
 
 ## 빠른 시작
 
@@ -129,7 +129,7 @@ repositories {
 }
 
 dependencies {
-    compileOnly("com.github.MCAerogel.Aerogel:api:main-SNAPSHOT")
+    compileOnly("com.github.MCAerogel:Aerogel:main-SNAPSHOT")
 }
 ```
 
@@ -166,8 +166,8 @@ class HelloPlugin : AerogelPlugin {
 
 `main` 브랜치 API 변경 시 스냅샷(`main-SNAPSHOT`) 빌드를, 태그 푸시 시 릴리스 빌드를 GitHub Actions가 JitPack에 자동 트리거합니다.
 
-- Group: `com.github.MCAerogel.Aerogel`
-- Artifact: `api`
+- Group: `com.github.MCAerogel`
+- Artifact: `Aerogel`
 - Version: `main-SNAPSHOT` (또는 Git 태그 예: `v1.0.0`)
 - Repository: `https://jitpack.io`
 
