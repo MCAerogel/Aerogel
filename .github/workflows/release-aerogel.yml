@@ -98,4 +98,4 @@ jobs:
             "$JAR_PATH#Aerogel.jar" \
             --target "${GITHUB_SHA}" \
             --title "${{ steps.meta.outputs.release_title }}" \
-            --notes "Automated release from ${GITHUB_SHA}."
+            --generate-notes
