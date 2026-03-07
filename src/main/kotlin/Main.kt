@@ -64,6 +64,7 @@ import kotlin.concurrent.thread
 import kotlin.random.Random
 
 object Aerogel {
+    const val VERSION_STAGE = "Early development version"
     const val VERSION = "1.21.11"
     @Volatile
     var PORT = 25565
