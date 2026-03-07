@@ -1,0 +1,101 @@
+name: Release Aerogel Jar
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aerogel-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Aerogel jar
+        run: ./gradlew aerogelJar --no-daemon
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          MAIN_KT="src/main/kotlin/Main.kt"
+
+          VERSION_STAGE="$(sed -n 's/^[[:space:]]*const val VERSION_STAGE = "\(.*\)"/\1/p' "$MAIN_KT" | head -n1)"
+          VERSION="$(sed -n 's/^[[:space:]]*const val VERSION = "\(.*\)"/\1/p' "$MAIN_KT" | head -n1)"
+
+          if [[ -z "$VERSION_STAGE" || -z "$VERSION" ]]; then
+            echo "Failed to parse VERSION_STAGE or VERSION from $MAIN_KT" >&2
+            exit 1
+          fi
+
+          LATEST_TAG="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -n1 || true)"
+          if [[ -z "$LATEST_TAG" ]]; then
+            NEXT_TAG="v1.0.0"
+          else
+            IFS='.' read -r major minor patch <<< "$LATEST_TAG"
+            NEXT_TAG="v${major}.${minor}.$((patch + 1))"
+          fi
+
+          RELEASES_JSON="$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+
+          MAX_MARK_SEQ="$(printf '%s' "$RELEASES_JSON" | jq -r --arg ver "$VERSION" '
+            [.[]
+              | .name
+              | select(type == "string")
+              | select(test("\\(" + $ver + "\\) \\[#([0-9]+)\\]$"))
+              | capture("\\[#(?<n>[0-9]+)\\]$").n
+              | tonumber
+            ]
+            | if length == 0 then 0 else max end
+          ')"
+
+          NEXT_MARK_SEQ="$((MAX_MARK_SEQ + 1))"
+          RELEASE_TITLE="${VERSION_STAGE} (${VERSION}) [#${NEXT_MARK_SEQ}]"
+
+          echo "next_tag=$NEXT_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_title=$RELEASE_TITLE" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release and upload Aerogel.jar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          JAR_PATH="build/libs/Aerogel.jar"
+          if [[ ! -f "$JAR_PATH" ]]; then
+            echo "Jar not found: $JAR_PATH" >&2
+            exit 1
+          fi
+
+          gh release create "${{ steps.meta.outputs.next_tag }}" \
+            "$JAR_PATH#Aerogel.jar" \
+            --target "${GITHUB_SHA}" \
+            --title "${{ steps.meta.outputs.release_title }}" \
+            --notes "Automated release from ${GITHUB_SHA}."
