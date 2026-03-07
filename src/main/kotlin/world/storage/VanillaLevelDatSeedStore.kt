@@ -189,10 +189,15 @@ object VanillaLevelDatSeedStore {
                 )
                 return@runCatching
             }
-            val normalized = normalizedSeeds(seeds)
             val effective = existing
                 ?: runtimeTemplateLevelDatDocument()
-                ?: createNewLevelDatDocument(seeds = normalized, timeWeather = timeWeather)
+            if (effective == null) {
+                logger.info(
+                    "Skipping level.dat write because source metadata is unavailable: {}",
+                    levelDat.toAbsolutePath()
+                )
+                return@runCatching
+            }
             val root = effective.root
             val rootName = effective.rootName
             val compression = effective.compression
@@ -208,40 +213,14 @@ object VanillaLevelDatSeedStore {
             version.entries["Name"] = NbtString(Aerogel.VERSION)
             version.entries["Series"] = NbtString("main")
             version.entries["Snapshot"] = NbtByte(0)
-
-            val overworldSeed = normalized["minecraft:overworld"] ?: normalized.values.firstOrNull()
-            if (overworldSeed != null) {
-                data.entries["RandomSeed"] = NbtLong(overworldSeed)
-            }
-
-            val worldGenSettings = ensureCompound(data, "WorldGenSettings")
-            if (overworldSeed != null) {
-                worldGenSettings.entries["seed"] = NbtLong(overworldSeed)
-            }
-            if (worldGenSettings.entries["generate_features"] !is NbtByte) {
-                worldGenSettings.entries["generate_features"] = NbtByte(1)
-            }
-            if (worldGenSettings.entries["bonus_chest"] !is NbtByte) {
-                worldGenSettings.entries["bonus_chest"] = NbtByte(0)
-            }
-
-            val dimensions = ensureCompound(worldGenSettings, "dimensions")
-            for ((worldKey, dimensionKey) in builtinWorldKeyToDimension) {
-                val seed = normalized[worldKey] ?: continue
-                val dimension = ensureCompound(dimensions, dimensionKey)
-                if (dimension.entries["type"] !is NbtString) {
-                    dimension.entries["type"] = NbtString(dimensionKey)
-                }
-                val generator = ensureCompound(dimension, "generator")
-                if (generator.entries["type"] !is NbtString) {
-                    generator.entries["type"] = NbtString("minecraft:noise")
-                }
-                if (generator.entries["settings"] !is NbtString) {
-                    val settingKey = builtinWorldKeyToGeneratorSettings[worldKey] ?: "minecraft:overworld"
-                    generator.entries["settings"] = NbtString(settingKey)
-                }
-                generator.entries["seed"] = NbtLong(seed)
-            }
+            data.entries["DataPacks"] = NbtCompound(
+                linkedMapOf(
+                    "Enabled" to NbtList(TAG_STRING, mutableListOf()),
+                    "Disabled" to NbtList(TAG_STRING, mutableListOf())
+                )
+            )
+            data.entries.remove("Bukkit.Version")
+            data.entries.remove("ServerBrands")
 
             if (timeWeather != null) {
                 data.entries["Time"] = NbtLong(timeWeather.worldAgeTicks)
@@ -282,7 +261,13 @@ object VanillaLevelDatSeedStore {
             val baseSeeds = normalizedSeeds(load())
             val effective = existing
                 ?: runtimeTemplateLevelDatDocument()
-                ?: createNewLevelDatDocument(seeds = baseSeeds, timeWeather = null)
+            if (effective == null) {
+                logger.info(
+                    "Skipping level.dat spawn write because source metadata is unavailable: {}",
+                    levelDat.toAbsolutePath()
+                )
+                return@runCatching
+            }
             val root = effective.root
             val data = ensureCompound(root, "Data")
             val spawnX = kotlin.math.floor(spawn.x).toInt()
@@ -355,19 +340,22 @@ object VanillaLevelDatSeedStore {
             val biomeSource: NbtCompound = when (worldKey) {
                 "minecraft:the_end" -> NbtCompound(
                     linkedMapOf(
-                        "type" to NbtString("minecraft:the_end")
+                        "type" to NbtString("minecraft:the_end"),
+                        "seed" to NbtLong(seed)
                     )
                 )
                 "minecraft:the_nether" -> NbtCompound(
                     linkedMapOf(
                         "type" to NbtString("minecraft:multi_noise"),
-                        "preset" to NbtString("minecraft:nether")
+                        "preset" to NbtString("minecraft:nether"),
+                        "seed" to NbtLong(seed)
                     )
                 )
                 else -> NbtCompound(
                     linkedMapOf(
                         "type" to NbtString("minecraft:multi_noise"),
-                        "preset" to NbtString("minecraft:overworld")
+                        "preset" to NbtString("minecraft:overworld"),
+                        "seed" to NbtLong(seed)
                     )
                 )
             }

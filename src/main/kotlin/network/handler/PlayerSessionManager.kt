@@ -30,6 +30,7 @@ import org.macaroon3145.network.recipe.CraftingRecipeCache
 import org.macaroon3145.network.recipe.SmeltingRecipeCache
 import org.macaroon3145.network.packet.PlayerSample
 import org.macaroon3145.api.entity.ArmorSlot
+import org.macaroon3145.api.entity.Item
 import org.macaroon3145.api.event.BlockChangeReason
 import org.macaroon3145.api.event.MoveReason
 import org.macaroon3145.world.BlockPos
@@ -105,19 +106,6 @@ data class DroppedItemTrackerState(
     var lastPitch: Float = 0f,
     var lastHeadYaw: Float = 0f
 )
-
-data class ItemTextMeta(
-    val expectedItemId: Int,
-    val name: String?,
-    val lore: List<String>,
-    val translatedNameKey: String? = null,
-    val translatedNameArgs: List<String> = emptyList(),
-    val translatedLore: List<Pair<String, List<String>>> = emptyList()
-) {
-    fun hasTranslations(): Boolean {
-        return translatedNameKey != null || translatedLore.isNotEmpty()
-    }
-}
 
 data class PlayerSession(
     val channelId: ChannelId,
@@ -378,52 +366,6 @@ private data class FurnaceState(
     var cookTotalSeconds: Double,
     var dirty: Boolean
 )
-
-data class ChestState(
-    val itemIds: IntArray,
-    val itemCounts: IntArray,
-    val shulkerContents: Array<ChestState?> = arrayOfNulls(27),
-    val textMeta: Array<ItemTextMeta?> = arrayOfNulls(27)
-)
-
-data class ItemStackState private constructor(
-    var itemId: Int,
-    var count: Int,
-    var shulkerContents: ChestState? = null,
-    var customName: String? = null,
-    var customLore: List<String> = emptyList(),
-    var translatedNameKey: String? = null,
-    var translatedNameArgs: List<String> = emptyList(),
-    var translatedLore: List<Pair<String, List<String>>> = emptyList()
-) {
-    fun isEmpty(): Boolean = itemId < 0 || count <= 0
-
-    companion object {
-        fun of(
-            itemId: Int,
-            count: Int,
-            shulkerContents: ChestState? = null,
-            customName: String? = null,
-            customLore: List<String> = emptyList(),
-            translatedNameKey: String? = null,
-            translatedNameArgs: List<String> = emptyList(),
-            translatedLore: List<Pair<String, List<String>>> = emptyList()
-        ): ItemStackState {
-            return ItemStackState(
-                itemId = itemId,
-                count = count,
-                shulkerContents = shulkerContents,
-                customName = customName,
-                customLore = customLore,
-                translatedNameKey = translatedNameKey,
-                translatedNameArgs = translatedNameArgs,
-                translatedLore = translatedLore
-            )
-        }
-
-        fun empty(): ItemStackState = of(itemId = -1, count = 0, shulkerContents = null)
-    }
-}
 
 private data class EnderChestState(
     val itemIds: IntArray,
@@ -1995,11 +1937,11 @@ data class EncodedStackSection(
         return true
     }
 
-    fun pluginChestNavigationItem(inventoryId: Long, previous: Boolean): Pair<Int, Int>? {
+    fun pluginChestNavigationItem(inventoryId: Long, previous: Boolean): ItemStackState? {
         val inventory = pluginChestInventories[inventoryId] ?: return null
         val stack = if (previous) inventory.previousPageControl else inventory.nextPageControl
         if (stack == null || stack.itemId < 0 || stack.count <= 0) return null
-        return stack.itemId to stack.count
+        return normalizeItemStackState(stack.copy())
     }
 
     fun pluginChestInventoryViewers(inventoryId: Long): List<UUID> {
@@ -2014,15 +1956,12 @@ data class EncodedStackSection(
         return out
     }
 
-    fun pluginChestInventorySlot(inventoryId: Long, slot: Int): Pair<Int, Int>? {
+    fun pluginChestInventorySlot(inventoryId: Long, slot: Int): ItemStackState? {
         val inventory = pluginChestInventories[inventoryId] ?: return null
         if (slot !in 0 until inventory.totalSlots) return null
         val stack = inventory.slots[slot]
-        return if (stack == null || stack.itemId < 0 || stack.count <= 0) {
-            -1 to 0
-        } else {
-            stack.itemId to stack.count
-        }
+        if (stack == null || stack.itemId < 0 || stack.count <= 0) return ItemStackState.empty()
+        return normalizeItemStackState(stack.copy())
     }
 
     fun setPluginChestInventorySlot(inventoryId: Long, slot: Int, item: org.macaroon3145.api.entity.Item?): Boolean {
@@ -2038,7 +1977,7 @@ data class EncodedStackSection(
         val stack = if (item == null) {
             ItemStackState.empty()
         } else {
-            buildStackState(itemId = item.id, count = item.amount)
+            item.toItemStackState()
         }
         return setPluginChestInventorySlotInternal(inventoryId, slot, stack, textMeta)
     }
@@ -19518,19 +19457,6 @@ data class EncodedStackSection(
         }
         val stateId = world.blockStateAt(x, y, z)
         if (stateId == 0) return
-        val breakDecision = org.macaroon3145.plugin.PluginSystem.beforeBlockBreak(session, x, y, z)
-        if (!breakDecision.proceed) {
-            return
-        }
-        if (breakDecision.modifiedByPlugin) {
-            return
-        }
-        val stateAfterEvent = world.blockStateAt(x, y, z)
-        if (stateAfterEvent != stateId) {
-            return
-        }
-        val directPairRemovals = LinkedHashSet<BlockPos>(2)
-        collectDirectVerticalPairRemovals(world, x, y, z, stateId, directPairRemovals)
         val heldItemId = session.hotbarStacks[session.selectedHotbarSlot.coerceIn(0, 8)].itemId
         val (dropStateId, dropPos) = normalizedDropSourceForBreak(world, x, y, z, stateId)
         val rawDrops = if (session.gameMode == GAME_MODE_SURVIVAL) {
@@ -19538,7 +19464,7 @@ data class EncodedStackSection(
         } else {
             emptyList()
         }
-        val drops = if (
+        val normalizedDrops = if (
             shouldSuppressVanillaShulkerDrop(
                 world = world,
                 x = dropPos.x,
@@ -19560,6 +19486,36 @@ data class EncodedStackSection(
         } else {
             rawDrops
         }
+        val dropLookup = java.util.IdentityHashMap<Item, org.macaroon3145.world.VanillaDrop>(normalizedDrops.size)
+        val dropItems = ArrayList<Item>(normalizedDrops.size)
+        for (drop in normalizedDrops) {
+            val item = drop.stack.toItem()
+            dropLookup[item] = drop
+            dropItems.add(item)
+        }
+        val breakDecision = org.macaroon3145.plugin.PluginSystem.beforeBlockBreak(session, x, y, z, dropItems)
+        if (!breakDecision.proceed) return
+        if (breakDecision.modifiedByPlugin) return
+        val stateAfterEvent = world.blockStateAt(x, y, z)
+        if (stateAfterEvent != stateId) return
+        val drops = ArrayList<org.macaroon3145.world.VanillaDrop>(breakDecision.dropItems.size)
+        for (item in breakDecision.dropItems) {
+            val original = dropLookup[item]
+            val candidateStack = item.toItemStackState(fallback = original?.stack)
+            val normalizedStack = normalizeItemStackState(candidateStack)
+            if (normalizedStack.isEmpty()) continue
+            if (original != null) {
+                if (normalizedStack === original.stack) {
+                    drops.add(original)
+                } else {
+                    drops.add(original.copy(stack = normalizedStack))
+                }
+            } else {
+                drops.add(org.macaroon3145.world.VanillaDrop.from(stack = normalizedStack))
+            }
+        }
+        val directPairRemovals = LinkedHashSet<BlockPos>(2)
+        collectDirectVerticalPairRemovals(world, x, y, z, stateId, directPairRemovals)
         val removedPositions = LinkedHashSet<BlockPos>(directPairRemovals.size + 4)
         for (pos in directPairRemovals) {
             setBlockAndBroadcast(session, pos.x, pos.y, pos.z, 0, reason = BlockChangeReason.PLAYER_BREAK)
@@ -21676,8 +21632,9 @@ data class EncodedStackSection(
         val count = normalized.count
         val shulkerContents = normalized.shulkerContents
         val meta = textMeta
-        val name = if (meta?.translatedNameKey != null) {
-            resolveItemTranslation(localeTag, meta.translatedNameKey, meta.translatedNameArgs)
+        val translatedNameKey = meta?.translatedNameKey
+        val name = if (translatedNameKey != null) {
+            resolveItemTranslation(localeTag, translatedNameKey, meta.translatedNameArgs)
         } else {
             meta?.name
         }

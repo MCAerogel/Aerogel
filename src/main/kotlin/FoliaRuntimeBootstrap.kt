@@ -595,8 +595,14 @@ private object FoliaRuntimeBootstrap {
     private fun prepareSidecarWorldMetadata(runtimeDir: Path) {
         val sidecarWorldDir = runtimeDir.resolve("world")
         Files.createDirectories(sidecarWorldDir)
-        copyIfRegularFile(sourceLevelDatPath, sidecarWorldDir.resolve("level.dat"))
-        copyIfRegularFile(sourceLevelDatOldPath, sidecarWorldDir.resolve("level.dat_old"))
+        val sidecarLevelDatPath = sidecarWorldDir.resolve("level.dat")
+        val sidecarLevelDatOldPath = sidecarWorldDir.resolve("level.dat_old")
+        if (Files.isRegularFile(sourceLevelDatPath)) {
+            Files.copy(sourceLevelDatPath, sidecarLevelDatPath, StandardCopyOption.REPLACE_EXISTING)
+        }
+        if (Files.isRegularFile(sourceLevelDatOldPath)) {
+            Files.copy(sourceLevelDatOldPath, sidecarLevelDatOldPath, StandardCopyOption.REPLACE_EXISTING)
+        }
     }
 
     private fun syncSourceWorldMetadataFromSidecar(runtimeDir: Path) {
@@ -605,14 +611,6 @@ private object FoliaRuntimeBootstrap {
         Files.createDirectories(sourceWorldDir)
         copyIfRegularFileWithoutDelete(sidecarWorldDir.resolve("level.dat"), sourceLevelDatPath)
         copyIfRegularFileWithoutDelete(sidecarWorldDir.resolve("level.dat_old"), sourceLevelDatOldPath)
-    }
-
-    private fun copyIfRegularFile(source: Path, target: Path) {
-        if (Files.isRegularFile(source)) {
-            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING)
-        } else {
-            Files.deleteIfExists(target)
-        }
     }
 
     private fun copyIfRegularFileWithoutDelete(source: Path, target: Path) {

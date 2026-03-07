@@ -12,6 +12,7 @@ import org.macaroon3145.api.type.Sound
 import org.macaroon3145.api.world.World
 import org.macaroon3145.api.world.Location
 import org.macaroon3145.api.world.WorldRegistry
+import org.macaroon3145.network.handler.ItemStackState
 import java.util.UUID
 
 object Server {
@@ -120,7 +121,7 @@ object Server {
         return bridge.chestInventoryNavigationItem(inventoryId, previous)
     }
 
-    fun getChestInventorySlot(inventoryId: Long, slot: Int): Pair<Int, Int>? {
+    fun getChestInventorySlot(inventoryId: Long, slot: Int): ItemStackState? {
         val bridge = checkNotNull(inventoryBridge) { "Server is not initialized yet: inventoryBridge is unavailable." }
         return bridge.getChestInventorySlot(inventoryId, slot)
     }

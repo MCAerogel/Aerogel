@@ -96,6 +96,8 @@ data class EntityMoveEvent(
 data class BlockBreakEvent(
     val player: ConnectedPlayer,
     val block: Block,
+    val useItem: Item?,
+    var dropItems: List<Item>,
     override var cancelled: Boolean = false,
     override var cancelReason: String? = null
 ) : CancellableEvent

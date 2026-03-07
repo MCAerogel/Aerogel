@@ -12,6 +12,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.macaroon3145.api.plugin.PluginRuntime
 import org.macaroon3145.api.type.ItemType
+import org.macaroon3145.network.handler.ItemStackState
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -343,6 +344,31 @@ data class Item(
             }
             put("lore", JsonArray(lore.map(::JsonPrimitive)))
         }
+    }
+
+    fun toItemStackState(fallback: ItemStackState? = null): ItemStackState {
+        if (id < 0 || amount <= 0) return ItemStackState.empty()
+        val translatedNameValue = translatedName()
+        val translatedLoreValue = translatedLore()
+        val base = fallback?.takeIf { it.itemId == id }
+        if (base != null) {
+            base.count = amount
+            base.customName = name
+            base.customLore = lore.toList()
+            base.translatedNameKey = translatedNameValue?.key
+            base.translatedNameArgs = translatedNameValue?.args ?: emptyList()
+            base.translatedLore = translatedLoreValue.map { it.key to it.args }
+            return base
+        }
+        return ItemStackState.of(
+            itemId = id,
+            count = amount,
+            customName = name,
+            customLore = lore.toList(),
+            translatedNameKey = translatedNameValue?.key,
+            translatedNameArgs = translatedNameValue?.args ?: emptyList(),
+            translatedLore = translatedLoreValue.map { it.key to it.args }
+        )
     }
 
     companion object {

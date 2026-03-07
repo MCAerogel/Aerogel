@@ -53,7 +53,7 @@ annotation class Subscribe(
 // Intent marker:
 // When used on annotated listeners, runtime may dispatch the handler
 // as fire-and-forget and not wait for completion.
-annotation class NoCancel
+annotation class AsyncListener
 
 fun interface EventFilter<E : Event> {
     fun test(event: E): Boolean
@@ -100,7 +100,7 @@ inline fun <reified E : Event> EventBus.listen(
     )
 }
 
-inline fun <reified E : Event> EventBus.listenNoCancel(
+inline fun <reified E : Event> EventBus.listenAsync(
     owner: String,
     priority: EventPriority = EventPriority.NORMAL,
     receiveCancelled: Boolean = false,
@@ -139,7 +139,7 @@ inline fun <reified E : Event> listen(
     )
 }
 
-inline fun <reified E : Event> listenNoCancel(
+inline fun <reified E : Event> listenAsync(
     priority: EventPriority = EventPriority.NORMAL,
     receiveCancelled: Boolean = false,
     filter: EventFilter<E>? = null,

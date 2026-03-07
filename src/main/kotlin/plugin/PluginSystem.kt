@@ -171,7 +171,8 @@ object PluginSystem {
 
     data class BlockBreakDecision(
         val proceed: Boolean,
-        val modifiedByPlugin: Boolean
+        val modifiedByPlugin: Boolean,
+        val dropItems: List<Item>
     )
 
     data class MoveDecision(
@@ -449,7 +450,13 @@ object PluginSystem {
         )
     }
 
-    fun beforeBlockBreak(session: PlayerSession, x: Int, y: Int, z: Int): BlockBreakDecision {
+    fun beforeBlockBreak(
+        session: PlayerSession,
+        x: Int,
+        y: Int,
+        z: Int,
+        dropItems: List<Item>
+    ): BlockBreakDecision {
         if (!beforePlayerInteract(
                 session = session,
                 action = PlayerInteractAction.LEFT_CLICK_BLOCK,
@@ -462,20 +469,24 @@ object PluginSystem {
         ) {
             return BlockBreakDecision(
                 proceed = false,
-                modifiedByPlugin = false
+                modifiedByPlugin = false,
+                dropItems = dropItems
             )
         }
         val world = runtimeWorldFor(session.worldKey)
         val blockRef = world.blockAt(x, y, z)
         val event = BlockBreakEvent(
             player = playerRef(session),
-            block = blockRef
+            block = blockRef,
+            useItem = handItem(session, Hand.MAIN_HAND),
+            dropItems = dropItems
         )
         eventBus.post(event)
         val modifiedByPlugin = (blockRef as? RuntimeBlock)?.wasMutatedByPlugin() == true
         return BlockBreakDecision(
             proceed = !event.cancelled,
-            modifiedByPlugin = modifiedByPlugin
+            modifiedByPlugin = modifiedByPlugin,
+            dropItems = event.dropItems
         )
     }
 
@@ -732,19 +743,15 @@ object PluginSystem {
     }
 
     private fun handItem(session: PlayerSession, hand: Hand): Item? {
-        val (itemId, amount) = when (hand) {
+        val stack = when (hand) {
             Hand.MAIN_HAND -> {
                 val slot = session.selectedHotbarSlot.coerceIn(0, 8)
-                session.hotbarStacks[slot].itemId to session.hotbarStacks[slot].count
+                session.hotbarStacks[slot]
             }
-            Hand.OFF_HAND -> session.offhandStack.itemId to session.offhandStack.count
+            Hand.OFF_HAND -> session.offhandStack
         }
-        if (itemId < 0 || amount <= 0) return null
-        return Item(
-            id = itemId,
-            type = ItemType.fromId(itemId),
-            amount = amount
-        )
+        if (stack.itemId < 0 || stack.count <= 0) return null
+        return stack.toItem()
     }
 
     private fun playerRef(session: PlayerSession): ConnectedPlayer {
@@ -1459,18 +1466,11 @@ private class RuntimeInventoryBridge : InventoryRuntimeBridge {
     }
 
     override fun chestInventoryNavigationItem(inventoryId: Long, previous: Boolean): Item? {
-        val raw = PlayerSessionManager.pluginChestNavigationItem(inventoryId, previous) ?: return null
-        val itemId = raw.first
-        val amount = raw.second
-        if (itemId < 0 || amount <= 0) return null
-        return Item(
-            id = itemId,
-            type = ItemType.fromId(itemId),
-            amount = amount
-        )
+        val stack = PlayerSessionManager.pluginChestNavigationItem(inventoryId, previous) ?: return null
+        return stack.toItem()
     }
 
-    override fun getChestInventorySlot(inventoryId: Long, slot: Int): Pair<Int, Int>? {
+    override fun getChestInventorySlot(inventoryId: Long, slot: Int): ItemStackState? {
         return PlayerSessionManager.pluginChestInventorySlot(inventoryId, slot)
     }
 
@@ -2106,11 +2106,7 @@ private class RuntimeConnectedPlayer(
 
     private fun inventoryStackOf(itemId: Int, count: Int): Item? {
         if (itemId < 0 || count <= 0) return null
-        return Item(
-            id = itemId,
-            type = ItemType.fromId(itemId),
-            amount = count
-        )
+        return ItemStackState.of(itemId = itemId, count = count).toItem()
     }
 
     companion object {
@@ -2939,11 +2935,7 @@ private class RuntimeDroppedItem(
     override var item: Item
         get() {
             val snapshot = liveSnapshot()
-            return Item(
-                id = snapshot.stack.itemId,
-                type = ItemType.fromId(snapshot.stack.itemId),
-                amount = snapshot.stack.count
-            )
+            return snapshot.stack.toItem()
         }
         set(value) {
             PlayerSessionManager.setDroppedItemStack(

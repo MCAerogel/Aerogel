@@ -6,8 +6,8 @@ import org.macaroon3145.api.entity.ConnectedPlayer
 import org.macaroon3145.api.entity.InventorySlotView
 import org.macaroon3145.api.entity.Item
 import org.macaroon3145.api.type.Sound
-import org.macaroon3145.api.type.ItemType
 import org.macaroon3145.api.world.Location
+import org.macaroon3145.network.handler.ItemStackState
 
 object Chest
 
@@ -90,15 +90,9 @@ class Inventory<T>(
         slots = InventorySlotView(
             sizeProvider = { sizeInternal },
             getter = { slot ->
-                val raw = Server.getChestInventorySlot(inventoryId, slot) ?: return@InventorySlotView null
-                val itemId = raw.first
-                val amount = raw.second
-                if (itemId < 0 || amount <= 0) return@InventorySlotView null
-                Item(
-                    id = itemId,
-                    type = ItemType.fromId(itemId),
-                    amount = amount
-                )
+                val stack = Server.getChestInventorySlot(inventoryId, slot) ?: return@InventorySlotView null
+                if (stack.itemId < 0 || stack.count <= 0) return@InventorySlotView null
+                stack.toItem()
             },
             setter = { slot, item ->
                 Server.setChestInventorySlot(
@@ -210,7 +204,7 @@ interface InventoryRuntimeBridge {
     fun chestInventoryPageNavigationItems(inventoryId: Long): Boolean
     fun chestInventoryPageNavigationClickSound(inventoryId: Long): Boolean
     fun chestInventoryNavigationItem(inventoryId: Long, previous: Boolean): Item?
-    fun getChestInventorySlot(inventoryId: Long, slot: Int): Pair<Int, Int>?
+    fun getChestInventorySlot(inventoryId: Long, slot: Int): ItemStackState?
     fun setChestInventorySlot(inventoryId: Long, slot: Int, item: Item?): Boolean
     fun setChestInventorySlot(inventoryId: Long, slot: Int, itemId: Int, amount: Int): Boolean
     fun addChestInventoryItem(inventoryId: Long, item: Item, overflowDrop: Boolean): InventoryAddResult

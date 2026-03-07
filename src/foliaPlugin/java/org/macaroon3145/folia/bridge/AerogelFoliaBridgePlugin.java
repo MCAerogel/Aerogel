@@ -113,6 +113,7 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
             );
             disableWorldPersistence();
             cacheWorldRefs();
+            ensureInitialLevelDatExists(runtimeDir);
             writeWorldSpawnSnapshot(runtimeDir);
             this.bridgeReadyMarker = writeReadyMarker(runtimeDir, slotCount);
             startPollerThread();
@@ -332,6 +333,31 @@ public final class AerogelFoliaBridgePlugin extends JavaPlugin {
         this.fallbackWorld = this.overworld != null
             ? this.overworld
             : (!Bukkit.getWorlds().isEmpty() ? Bukkit.getWorlds().get(0) : null);
+    }
+
+    private void ensureInitialLevelDatExists(Path runtimeDir) {
+        Path levelDatPath = runtimeDir.resolve(DEFAULT_WORLD_NAME).resolve("level.dat");
+        if (Files.isRegularFile(levelDatPath)) return;
+
+        boolean attemptedSave = false;
+        for (World world : Bukkit.getWorlds()) {
+            try {
+                world.save();
+                attemptedSave = true;
+            } catch (Throwable throwable) {
+                getLogger().warning("Failed to force-save world '" + world.getName() + "' while creating level.dat: " + throwable.getMessage());
+            }
+        }
+
+        if (Files.isRegularFile(levelDatPath)) {
+            getLogger().info("Created runtime world metadata: " + levelDatPath.toAbsolutePath());
+            return;
+        }
+        if (attemptedSave) {
+            getLogger().warning("Runtime world metadata still missing after forced save: " + levelDatPath.toAbsolutePath());
+        } else {
+            getLogger().warning("Skipped runtime world metadata save because no worlds were available yet: " + levelDatPath.toAbsolutePath());
+        }
     }
 
     private Long configuredWorldSeed(String propertyKey) {

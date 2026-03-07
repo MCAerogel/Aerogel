@@ -65,7 +65,8 @@ import kotlin.random.Random
 
 object Aerogel {
     const val VERSION = "1.21.11"
-    const val PORT = 25565
+    @Volatile
+    var PORT = 25565
 }
 
 private data class EventLoopSelection(
@@ -96,6 +97,9 @@ fun main() {
     val parsedChunkWorkerThreads = props.getProperty("chunk-worker-threads")?.toIntOrNull()
         ?.coerceAtLeast(0)
         ?: 0
+    Aerogel.PORT = props.getProperty("port")?.toIntOrNull()
+        ?.takeIf { it in 1..65535 }
+        ?: 25565
     val worldSeeds = resolveWorldSeeds(props)
     val defaultWorld = props.getProperty("world.default")
     val sidecarLevelSeed = worldSeeds["minecraft:overworld"] ?: worldSeeds.values.firstOrNull()
@@ -148,8 +152,6 @@ fun main() {
     ServerConfig.setDifficulty(parseDifficulty(props.getProperty("difficulty")))
     ServerI18n.initialize()
     WorldManager.bootstrap(worldSeeds = worldSeeds, defaultWorld = defaultWorld)
-    // Ensure a canonical level.dat exists from the first boot so generation seeds stay stable across restarts.
-    VanillaLevelDatSeedStore.save(worldSeeds)
     VanillaLevelDatSeedStore.loadTimeWeatherMetadata()?.let { metadata ->
         PlayerSessionManager.applyPersistedTimeWeather(metadata)
     }
@@ -282,14 +284,10 @@ private fun resolveWorldSeeds(props: Properties): LinkedHashMap<String, Long> {
         worldSeeds.putIfAbsent("$worldKey:$suffix", recoveredSeed)
     }
 
-    val builtinWorldKeys = listOf(
-        "minecraft:overworld",
-        "minecraft:the_nether",
-        "minecraft:the_end"
-    )
-    for (worldKey in builtinWorldKeys) {
-        worldSeeds.computeIfAbsent(worldKey) { Random.nextLong() }
-    }
+    val baseSeed = worldSeeds["minecraft:overworld"] ?: worldSeeds.values.firstOrNull() ?: Random.nextLong()
+    worldSeeds.putIfAbsent("minecraft:overworld", baseSeed)
+    worldSeeds.putIfAbsent("minecraft:the_nether", baseSeed)
+    worldSeeds.putIfAbsent("minecraft:the_end", baseSeed)
     return worldSeeds
 }
 
