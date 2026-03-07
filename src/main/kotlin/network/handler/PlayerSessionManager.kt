@@ -79,7 +79,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.atomic.DoubleAdder
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -2879,12 +2878,31 @@ data class EncodedStackSection(
                     }
                 }
                 tickUsingItemForSession(session, gameplayDeltaSeconds)
+                tickOutOfWorldDamageForSession(session)
             }
 
             if (hasDelta) {
                 tickNaturalRegenerationForSession(session, deltaSeconds)
             }
         }
+    }
+
+    private fun tickOutOfWorldDamageForSession(session: PlayerSession) {
+        if (session.dead) return
+        if (session.gameMode == GAME_MODE_SPECTATOR) return
+        if (session.y >= VANILLA_OUT_OF_WORLD_DAMAGE_Y_THRESHOLD) return
+        damagePlayer(
+            session = session,
+            amount = VANILLA_OUT_OF_WORLD_DAMAGE_AMOUNT,
+            damageTypeId = OUT_OF_WORLD_DAMAGE_TYPE_ID,
+            hurtSoundId = PLAYER_HURT_SOUND_ID,
+            bigHurtSoundId = PLAYER_HURT_SOUND_ID,
+            deathMessage = PlayPackets.ChatComponent.Translate(
+                key = "death.attack.outOfWorld",
+                args = listOf(playerNameComponent(session))
+            ),
+            allowCreativeDamage = true
+        )
     }
 
     private fun tickAttackStrengthCooldownsIncremental(tickDelta: Double) {
@@ -4240,7 +4258,20 @@ data class EncodedStackSection(
                 val chunkProcessingFrame = world.beginChunkProcessingFrame(tickSequence)
                 val droppedEvents = world.tickDroppedItems(
                     physicsDeltaSeconds,
-                    activeSimulationChunks
+                    activeSimulationChunks,
+                    onChunkEvents = { chunkEvents ->
+                        dispatchWorldPhysicsEvents(
+                            world = world,
+                            worldSessions = sessionsSnapshot,
+                            events = WorldPhysicsEvents(
+                                droppedItems = chunkEvents,
+                                fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
+                                thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
+                                animals = org.macaroon3145.world.AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
+                            ),
+                            deltaSeconds = deltaSeconds
+                        )
+                    }
                 ) { chunkPos, elapsedNanos ->
                     world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "dropped")
                 }
@@ -4876,8 +4907,34 @@ data class EncodedStackSection(
             animalSourceDirtyWorlds.add(session.worldKey)
         }
         if (!changedChunk && !movedEnough) return
+        if (!hasNearbyPushingTargets(session, nextChunk)) return
         // Wake only the current owner chunk to avoid mirrored pushing work on adjacent chunks.
         markPushingChunksAwake(session.worldKey, nextChunk)
+    }
+
+    private fun hasNearbyPushingTargets(session: PlayerSession, centerChunk: ChunkPos): Boolean {
+        for (other in sessions.values) {
+            if (other.entityId == session.entityId) continue
+            if (other.worldKey != session.worldKey) continue
+            if (other.dead || other.gameMode == GAME_MODE_SPECTATOR) continue
+            val otherChunkX = ChunkStreamingService.chunkXFromBlockX(other.x)
+            val otherChunkZ = ChunkStreamingService.chunkZFromBlockZ(other.z)
+            if (kotlin.math.abs(otherChunkX - centerChunk.x) <= 1 &&
+                kotlin.math.abs(otherChunkZ - centerChunk.z) <= 1
+            ) {
+                return true
+            }
+        }
+
+        val world = WorldManager.world(session.worldKey) ?: return false
+        for (chunkX in (centerChunk.x - 1)..(centerChunk.x + 1)) {
+            for (chunkZ in (centerChunk.z - 1)..(centerChunk.z + 1)) {
+                if (world.animalEntityIdsInChunk(chunkX, chunkZ).isNotEmpty()) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     private fun markPushingChunksAwake(
@@ -5025,18 +5082,14 @@ data class EncodedStackSection(
                     playersByChunk.computeIfAbsent(chunkPos) { ArrayList() }.add(session)
                     playerChunkByEntityId[session.entityId] = chunkPos
                 }
-                if (playersByChunk.isEmpty()) {
-                    pruneIdleWorldChunkTimingState(worldKey, chunksToProcess, pushingChunkLastTickNanos)
-                    continue
-                }
 
                 val animalChunkByEntityId = HashMap<Int, ChunkPos>()
                 val animalsByChunk = HashMap<ChunkPos, MutableList<AnimalSnapshot>>()
-                val playerInfluenceChunks = collectNeighborChunks(
-                    centers = playersByChunk.keys,
+                val pushingInfluenceChunks = collectNeighborChunks(
+                    centers = chunksToProcess,
                     allowed = activeSimulationChunks
                 )
-                for (chunkPos in playerInfluenceChunks) {
+                for (chunkPos in pushingInfluenceChunks) {
                     val animals = world.animalsInChunk(chunkPos.x, chunkPos.z)
                     if (animals.isEmpty()) continue
                     val bucket = animalsByChunk.computeIfAbsent(chunkPos) { ArrayList(animals.size) }
@@ -5055,19 +5108,22 @@ data class EncodedStackSection(
 
                 pruneIdleWorldChunkTimingState(worldKey, chunksToProcess, pushingChunkLastTickNanos)
 
-                val playerImpulseX = ConcurrentHashMap<Int, DoubleAdder>()
-                val playerImpulseZ = ConcurrentHashMap<Int, DoubleAdder>()
-                val animalImpulseX = ConcurrentHashMap<Int, DoubleAdder>()
-                val animalImpulseZ = ConcurrentHashMap<Int, DoubleAdder>()
                 val broadphase = buildPushingBroadphase(
                     playersByChunk = playersByChunk,
                     animalsByChunk = animalsByChunk
                 )
-                val scheduledChunks = playersByChunk.keys.toList()
+                val sessionsByEntityId = HashMap<Int, PlayerSession>(sessionsSnapshot.size)
+                for (session in sessionsSnapshot) {
+                    sessionsByEntityId[session.entityId] = session
+                }
+                val playerOwnerChunks = playersByChunk.keys.toHashSet()
+                val scheduledChunkSet = HashSet<ChunkPos>(playerOwnerChunks.size + animalsByChunk.size)
+                scheduledChunkSet.addAll(playerOwnerChunks)
+                scheduledChunkSet.addAll(animalsByChunk.keys)
+                val scheduledChunks = scheduledChunkSet.toList()
                 if (scheduledChunks.isEmpty()) {
                     continue
                 }
-                val scheduledChunkSet = scheduledChunks.toHashSet()
                 val chunkProcessingFrame = world.beginChunkProcessingFrame(tickSequence)
                 val pushingTasks = ArrayList<CompletableFuture<Unit>>(scheduledChunks.size)
                 for (chunkPos in scheduledChunks) {
@@ -5091,11 +5147,10 @@ data class EncodedStackSection(
                                 animalsByChunk = animalsByChunk,
                                 broadphase = broadphase,
                                 animalChunkByEntityId = animalChunkByEntityId,
+                                playerOwnerChunks = playerOwnerChunks,
                                 scheduledChunks = scheduledChunkSet,
-                                playerImpulseX = playerImpulseX,
-                                playerImpulseZ = playerImpulseZ,
-                                animalImpulseX = animalImpulseX,
-                                animalImpulseZ = animalImpulseZ
+                                sessionsByEntityId = sessionsByEntityId,
+                                world = world
                             )
                         } finally {
                             world.recordChunkProcessingNanos(
@@ -5108,23 +5163,6 @@ data class EncodedStackSection(
                     }
                     pushingTasks.add(future)
                 }
-                CompletableFuture.allOf(*pushingTasks.toTypedArray()).join()
-
-                val playerImpulses = HashMap<Int, Pair<Double, Double>>()
-                for ((entityId, xAdder) in playerImpulseX) {
-                    val x = xAdder.sum()
-                    val z = playerImpulseZ[entityId]?.sum() ?: 0.0
-                    if (x == 0.0 && z == 0.0) continue
-                    playerImpulses[entityId] = x to z
-                }
-                val animalImpulses = HashMap<Int, Pair<Double, Double>>()
-                for ((entityId, xAdder) in animalImpulseX) {
-                    val x = xAdder.sum()
-                    val z = animalImpulseZ[entityId]?.sum() ?: 0.0
-                    if (x == 0.0 && z == 0.0) continue
-                    animalImpulses[entityId] = x to z
-                }
-                applyPushingImmediately(worldKey, playerImpulses, animalImpulses)
                 world.finishChunkProcessingFrame(
                     frame = chunkProcessingFrame,
                     activeChunks = chunksToProcess,
@@ -5143,15 +5181,16 @@ data class EncodedStackSection(
         animalsByChunk: Map<ChunkPos, List<AnimalSnapshot>>,
         broadphase: PushingBroadphase,
         animalChunkByEntityId: Map<Int, ChunkPos>,
+        playerOwnerChunks: Set<ChunkPos>,
         scheduledChunks: Set<ChunkPos>,
-        playerImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
-        playerImpulseZ: ConcurrentHashMap<Int, DoubleAdder>,
-        animalImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
-        animalImpulseZ: ConcurrentHashMap<Int, DoubleAdder>
+        sessionsByEntityId: Map<Int, PlayerSession>,
+        world: org.macaroon3145.world.World
     ) {
         val chunkPlayers = playersByChunk[chunkPos].orEmpty()
         val chunkAnimals = animalsByChunk[chunkPos].orEmpty()
         val processedPlayerPairs = HashSet<Long>()
+        val playerImpulses = HashMap<Int, DoubleArray>()
+        val animalImpulses = HashMap<Int, DoubleArray>()
 
         for (a in chunkPlayers) {
             if (a.dead || a.gameMode == GAME_MODE_SPECTATOR) continue
@@ -5174,8 +5213,8 @@ data class EncodedStackSection(
                     bx = b.x, bz = b.z, br = PLAYER_HITBOX_HALF_WIDTH,
                     deltaSeconds = deltaSeconds
                 ) { pushAX, pushAZ, pushBX, pushBZ ->
-                    addImpulse(playerImpulseX, playerImpulseZ, a.entityId, pushAX, pushAZ)
-                    addImpulse(playerImpulseX, playerImpulseZ, b.entityId, pushBX, pushBZ)
+                    addImpulse(playerImpulses, a.entityId, pushAX, pushAZ)
+                    addImpulse(playerImpulses, b.entityId, pushBX, pushBZ)
                 }
             }
         }
@@ -5188,7 +5227,10 @@ data class EncodedStackSection(
             val candidateAnimals = candidateAnimalsForPlayer(player, broadphase)
             for (animal in candidateAnimals) {
                 val animalChunk = animalChunkByEntityId[animal.entityId] ?: continue
-                if (ownerChunkForPair(playerChunk, animalChunk, scheduledChunks) != chunkPos) continue
+                // Keep player-animal ownership on the player's chunk so adjacent animal-only chunks
+                // being scheduled does not skip this pair when the lexical owner would be elsewhere.
+                if (playerChunk !in playerOwnerChunks) continue
+                if (playerChunk != chunkPos) continue
                 val animalMinY = animal.y
                 val animalMaxY = animal.y + animal.hitboxHeight
                 if (playerMaxY <= animalMinY || playerMinY >= animalMaxY) continue
@@ -5197,7 +5239,7 @@ data class EncodedStackSection(
                     bx = animal.x, bz = animal.z, br = animal.hitboxWidth * 0.5,
                     deltaSeconds = deltaSeconds
                 ) { _, _, pushAX, pushAZ ->
-                    addImpulse(animalImpulseX, animalImpulseZ, animal.entityId, pushAX, pushAZ)
+                    addImpulse(animalImpulses, animal.entityId, pushAX, pushAZ)
                 }
             }
         }
@@ -5209,9 +5251,9 @@ data class EncodedStackSection(
             broadphase = broadphase,
             animalChunkByEntityId = animalChunkByEntityId,
             scheduledChunks = scheduledChunks,
-            animalImpulseX = animalImpulseX,
-            animalImpulseZ = animalImpulseZ
+            animalImpulses = animalImpulses
         )
+        applyPushingChunkImmediate(world, sessionsByEntityId, playerImpulses, animalImpulses)
     }
 
     private data class PushingBroadphase(
@@ -5319,8 +5361,7 @@ data class EncodedStackSection(
         broadphase: PushingBroadphase,
         animalChunkByEntityId: Map<Int, ChunkPos>,
         scheduledChunks: Set<ChunkPos>,
-        animalImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
-        animalImpulseZ: ConcurrentHashMap<Int, DoubleAdder>
+        animalImpulses: MutableMap<Int, DoubleArray>
     ) {
         if (chunkAnimals.isEmpty()) return
         val processedPairs = HashSet<Long>()
@@ -5337,8 +5378,7 @@ data class EncodedStackSection(
                     b = b,
                     animalChunkByEntityId = animalChunkByEntityId,
                     scheduledChunks = scheduledChunks,
-                    animalImpulseX = animalImpulseX,
-                    animalImpulseZ = animalImpulseZ
+                    animalImpulses = animalImpulses
                 )
             }
         }
@@ -5373,8 +5413,7 @@ data class EncodedStackSection(
         b: AnimalSnapshot,
         animalChunkByEntityId: Map<Int, ChunkPos>,
         scheduledChunks: Set<ChunkPos>,
-        animalImpulseX: ConcurrentHashMap<Int, DoubleAdder>,
-        animalImpulseZ: ConcurrentHashMap<Int, DoubleAdder>
+        animalImpulses: MutableMap<Int, DoubleArray>
     ) {
         if (a.entityId == b.entityId) return
         val aChunk = animalChunkByEntityId[a.entityId] ?: return
@@ -5390,8 +5429,8 @@ data class EncodedStackSection(
             bx = b.x, bz = b.z, br = b.hitboxWidth * 0.5,
             deltaSeconds = deltaSeconds
         ) { pushAX, pushAZ, pushBX, pushBZ ->
-            addImpulse(animalImpulseX, animalImpulseZ, a.entityId, pushAX, pushAZ)
-            addImpulse(animalImpulseX, animalImpulseZ, b.entityId, pushBX, pushBZ)
+            addImpulse(animalImpulses, a.entityId, pushAX, pushAZ)
+            addImpulse(animalImpulses, b.entityId, pushBX, pushBZ)
         }
     }
 
@@ -5402,18 +5441,15 @@ data class EncodedStackSection(
     }
 
     private fun addImpulse(
-        mapX: ConcurrentHashMap<Int, DoubleAdder>,
-        mapZ: ConcurrentHashMap<Int, DoubleAdder>,
+        map: MutableMap<Int, DoubleArray>,
         entityId: Int,
         impulseX: Double,
         impulseZ: Double
     ) {
-        if (impulseX != 0.0) {
-            mapX.computeIfAbsent(entityId) { DoubleAdder() }.add(impulseX)
-        }
-        if (impulseZ != 0.0) {
-            mapZ.computeIfAbsent(entityId) { DoubleAdder() }.add(impulseZ)
-        }
+        if (impulseX == 0.0 && impulseZ == 0.0) return
+        val aggregate = map.computeIfAbsent(entityId) { doubleArrayOf(0.0, 0.0) }
+        aggregate[0] += impulseX
+        aggregate[1] += impulseZ
     }
 
     private fun collectNeighborChunks(
@@ -5443,22 +5479,23 @@ data class EncodedStackSection(
         return if (a.x < b.x || (a.x == b.x && a.z <= b.z)) a else b
     }
 
-    private fun applyPushingImmediately(
-        worldKey: String,
-        playerImpulses: Map<Int, Pair<Double, Double>>,
-        animalImpulses: Map<Int, Pair<Double, Double>>
+    private fun applyPushingChunkImmediate(
+        world: org.macaroon3145.world.World,
+        sessionsByEntityId: Map<Int, PlayerSession>,
+        playerImpulses: Map<Int, DoubleArray>,
+        animalImpulses: Map<Int, DoubleArray>
     ) {
         if (playerImpulses.isNotEmpty()) {
-            for ((_, session) in sessions) {
-                if (session.worldKey != worldKey) continue
-                val impulse = playerImpulses[session.entityId] ?: continue
-                applyPlayerPushImpulse(session, impulse.first, impulse.second)
+            for ((entityId, impulse) in playerImpulses) {
+                val session = sessionsByEntityId[entityId] ?: continue
+                synchronized(session) {
+                    applyPlayerPushImpulse(session, impulse[0], impulse[1])
+                }
             }
         }
         if (animalImpulses.isNotEmpty()) {
-            val world = WorldManager.world(worldKey) ?: return
             for ((entityId, impulse) in animalImpulses) {
-                world.addAnimalHorizontalImpulse(entityId, impulse.first, impulse.second)
+                world.addAnimalHorizontalImpulse(entityId, impulse[0], impulse[1])
             }
         }
     }
@@ -7709,10 +7746,12 @@ data class EncodedStackSection(
         damageTypeId: Int,
         hurtSoundId: Int?,
         bigHurtSoundId: Int?,
-        deathMessage: PlayPackets.ChatComponent
+        deathMessage: PlayPackets.ChatComponent,
+        allowCreativeDamage: Boolean = false
     ) {
         if (session.dead || amount <= 0f) return
-        if (session.gameMode == GAME_MODE_SPECTATOR || session.gameMode == GAME_MODE_CREATIVE) return
+        if (session.gameMode == GAME_MODE_SPECTATOR) return
+        if (!allowCreativeDamage && session.gameMode == GAME_MODE_CREATIVE) return
         val effectiveAmount = effectiveDamageAfterPlayerInvulnerability(session, amount)
         if (effectiveAmount <= DAMAGE_EPSILON) return
         val nextHealth = (session.health - effectiveAmount).coerceAtLeast(0f)
@@ -17419,18 +17458,41 @@ data class EncodedStackSection(
             if (!canPlayerPickDroppedItem(collector, snapshot)) continue
             if (!canAbsorbDroppedItem(collector, snapshot.stack)) continue
 
-            val absorbedCount = absorbDroppedItemIntoInventory(
+            val absorbableCount = previewAbsorbDroppedItemCount(
                 session = collector,
-                stack = snapshot.stack,
-                outboundByContext = outboundByContext
+                stack = snapshot.stack
             )
-            if (absorbedCount <= 0) continue
+            if (absorbableCount <= 0) continue
 
             val consumed = world.consumeDroppedItemIfMatches(
                 entityId = snapshot.entityId,
                 expected = snapshot,
-                consumeCount = absorbedCount
+                consumeCount = absorbableCount
             ) ?: continue
+            val consumedCount = consumed.consumedCount
+            if (consumedCount <= 0) continue
+            val resolvedSnapshot = consumed.removed ?: consumed.updated ?: snapshot
+            val absorbedCount = absorbDroppedItemIntoInventory(
+                session = collector,
+                stack = snapshot.stack.copy(count = consumedCount),
+                outboundByContext = outboundByContext
+            )
+            if (absorbedCount <= 0) {
+                rollbackConsumedDroppedItem(
+                    world = world,
+                    consumed = consumed,
+                    rollbackCount = consumedCount
+                )
+                continue
+            }
+            if (absorbedCount < consumedCount) {
+                val rollbackCount = consumedCount - absorbedCount
+                rollbackConsumedDroppedItem(
+                    world = world,
+                    consumed = consumed,
+                    rollbackCount = rollbackCount
+                )
+            }
 
             val resolvedX = consumed.removed?.x ?: consumed.updated?.x ?: snapshot.x
             val resolvedY = consumed.removed?.y ?: consumed.updated?.y ?: snapshot.y
@@ -17439,8 +17501,8 @@ data class EncodedStackSection(
                 DroppedItemPickupResult(
                     entityId = snapshot.entityId,
                     collectorEntityId = collector.entityId,
-                    pickupItemCount = consumed.consumedCount,
-                    showTakeAnimation = consumed.consumedCount > 0,
+                    pickupItemCount = absorbedCount,
+                    showTakeAnimation = absorbedCount > 0,
                     removed = consumed.removed != null,
                     remainingSnapshot = consumed.updated,
                     x = resolvedX,
@@ -17450,6 +17512,58 @@ data class EncodedStackSection(
             )
         }
         return removed
+    }
+
+    private fun rollbackConsumedDroppedItem(
+        world: org.macaroon3145.world.World,
+        consumed: org.macaroon3145.world.DroppedItemConsumeResult,
+        rollbackCount: Int
+    ) {
+        if (rollbackCount <= 0) return
+        val updated = consumed.updated
+        if (updated != null) {
+            val live = world.droppedItemSnapshot(updated.entityId)
+            if (live != null &&
+                live.uuid == updated.uuid &&
+                live.stack.itemId == updated.stack.itemId &&
+                live.stack.count == updated.stack.count &&
+                areContainerStacksMergeCompatible(live.stack, updated.stack)
+            ) {
+                world.setDroppedItemStack(
+                    updated.entityId,
+                    live.stack.copy(count = live.stack.count + rollbackCount)
+                )
+                return
+            }
+            respawnDroppedItemSafely(
+                world = world,
+                preferredEntityId = allocateEntityId(),
+                preferredUuid = null,
+                stack = updated.stack.copy(count = rollbackCount),
+                x = updated.x,
+                y = updated.y,
+                z = updated.z,
+                vx = updated.vx,
+                vy = updated.vy,
+                vz = updated.vz,
+                pickupDelaySeconds = updated.pickupDelaySeconds
+            )
+            return
+        }
+        val removed = consumed.removed ?: return
+        respawnDroppedItemSafely(
+            world = world,
+            preferredEntityId = removed.entityId,
+            preferredUuid = removed.uuid,
+            stack = removed.stack.copy(count = rollbackCount),
+            x = removed.x,
+            y = removed.y,
+            z = removed.z,
+            vx = removed.vx,
+            vy = removed.vy,
+            vz = removed.vz,
+            pickupDelaySeconds = removed.pickupDelaySeconds
+        )
     }
 
     private fun pickupDistanceSquared(session: PlayerSession, snapshot: DroppedItemSnapshot): Double {
@@ -17695,6 +17809,69 @@ data class EncodedStackSection(
         return absorbed
     }
 
+    private fun previewAbsorbDroppedItemCount(
+        session: PlayerSession,
+        stack: ItemStackState
+    ): Int {
+        val normalized = normalizeItemStackState(stack)
+        val itemId = normalized.itemId
+        val itemCount = normalized.count
+        val shulkerContents = normalized.shulkerContents
+        if (itemId < 0 || itemCount <= 0) return 0
+
+        if (shulkerContents != null && chestHasAnyItems(shulkerContents)) {
+            val emptyHotbar = (0..8).firstOrNull { session.hotbarStacks[it].count <= 0 || session.hotbarStacks[it].itemId < 0 }
+            if (emptyHotbar != null) return 1
+            val emptyMain = session.mainInventoryStacks.indices
+                .firstOrNull { session.mainInventoryStacks[it].count <= 0 || session.mainInventoryStacks[it].itemId < 0 }
+                ?: return 0
+            return if (emptyMain >= 0) 1 else 0
+        }
+
+        val maxStackSize = itemMaxStackSize(itemId)
+        var remaining = itemCount
+        val simulatedHotbarCounts = IntArray(9) { session.hotbarStacks[it].count.coerceAtLeast(0) }
+        val simulatedMainCounts = IntArray(session.mainInventoryStacks.size) { session.mainInventoryStacks[it].count.coerceAtLeast(0) }
+
+        for (slot in 0..8) {
+            if (remaining <= 0) break
+            if (session.hotbarStacks[slot].count <= 0 || session.hotbarStacks[slot].itemId != itemId) continue
+            val free = maxStackSize - simulatedHotbarCounts[slot]
+            if (free <= 0) continue
+            val added = minOf(free, remaining)
+            simulatedHotbarCounts[slot] += added
+            remaining -= added
+        }
+
+        for (slot in 0..8) {
+            if (remaining <= 0) break
+            if (session.hotbarStacks[slot].count > 0 && session.hotbarStacks[slot].itemId >= 0) continue
+            val added = minOf(maxStackSize, remaining)
+            simulatedHotbarCounts[slot] = added
+            remaining -= added
+        }
+
+        for (index in session.mainInventoryStacks.indices) {
+            if (remaining <= 0) break
+            if (session.mainInventoryStacks[index].count <= 0 || session.mainInventoryStacks[index].itemId != itemId) continue
+            val free = maxStackSize - simulatedMainCounts[index]
+            if (free <= 0) continue
+            val added = minOf(free, remaining)
+            simulatedMainCounts[index] += added
+            remaining -= added
+        }
+
+        for (index in session.mainInventoryStacks.indices) {
+            if (remaining <= 0) break
+            if (session.mainInventoryStacks[index].count > 0 && session.mainInventoryStacks[index].itemId >= 0) continue
+            val added = minOf(maxStackSize, remaining)
+            simulatedMainCounts[index] = added
+            remaining -= added
+        }
+
+        return itemCount - remaining
+    }
+
     fun swapMainHandWithOffhand(channelId: ChannelId) {
         val session = sessions[channelId] ?: return
         val slot = session.selectedHotbarSlot.coerceIn(0, 8)
@@ -17929,10 +18106,6 @@ data class EncodedStackSection(
         val existing = outboundByContext[ctx]
         if (existing != null) {
             existing.add(packet)
-            return
-        }
-        if (packet.size <= SMALL_ENTITY_PACKET_IMMEDIATE_BYTES) {
-            enqueueChannelFlushPacket(ctx, packet)
             return
         }
         outboundByContext
@@ -22004,6 +22177,9 @@ data class EncodedStackSection(
     private const val BIG_FALL_SOUND_DAMAGE_THRESHOLD = 5.0f
     private const val FALL_DAMAGE_TYPE_ID_FALLBACK = 17
     private const val STARVATION_DAMAGE_TYPE_ID_FALLBACK = FALL_DAMAGE_TYPE_ID_FALLBACK
+    // Vanilla Entity#checkBelowWorld uses (minY - 64). This server world minY is -64.
+    private const val VANILLA_OUT_OF_WORLD_DAMAGE_Y_THRESHOLD = -128.0
+    private const val VANILLA_OUT_OF_WORLD_DAMAGE_AMOUNT = 4.0f
     private const val DIFFICULTY_PEACEFUL = 0
     private const val DIFFICULTY_EASY = 1
     private const val DIFFICULTY_NORMAL = 2
@@ -22428,6 +22604,10 @@ data class EncodedStackSection(
     private val STARVATION_DAMAGE_TYPE_ID: Int by lazy {
         RegistryCodec.entryIndex("minecraft:damage_type", "minecraft:starve")
             ?: STARVATION_DAMAGE_TYPE_ID_FALLBACK
+    }
+    private val OUT_OF_WORLD_DAMAGE_TYPE_ID: Int by lazy {
+        RegistryCodec.entryIndex("minecraft:damage_type", "minecraft:out_of_world")
+            ?: FALL_DAMAGE_TYPE_ID
     }
     private const val BASE_UNARMED_DAMAGE = 1.0f
     private const val BASE_UNARMED_ATTACK_SPEED = 4.0f

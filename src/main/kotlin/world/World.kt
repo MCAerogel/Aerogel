@@ -91,6 +91,7 @@ class World(
     private val pendingFluidTickChanges = ConcurrentLinkedQueue<FluidBlockChange>()
     private val pendingAnimalTickEvents = ConcurrentLinkedQueue<AnimalTickEvents>()
     private val droppedItemLastTickNanos = ConcurrentHashMap<ChunkPos, Long>()
+    private val droppedItemChunkAccumulatorSeconds = ConcurrentHashMap<ChunkPos, Double>()
     private val animalLastTickNanos = ConcurrentHashMap<ChunkPos, Long>()
     private val thrownItemLastTickNanos = ConcurrentHashMap<ChunkPos, Long>()
     private val fallingBlockLastTickNanos = ConcurrentHashMap<ChunkPos, Long>()
@@ -952,21 +953,26 @@ class World(
     ): DroppedItemTickEvents {
         if (!droppedItemSystem.hasEntities()) {
             droppedItemLastTickNanos.clear()
+            droppedItemChunkAccumulatorSeconds.clear()
             return droppedItemSystem.tickOnChunkActors(
                 deltaSeconds = deltaSeconds,
                 activeSimulationChunks = activeSimulationChunks,
                 submitChunkTask = { chunkPos, task -> chunkActorScheduler.submit(chunkPos, task) },
                 chunkDeltaSecondsProvider = { chunkPos ->
-                    consumeChunkElapsedDeltaSeconds(
+                    consumeChunkFixedStepDeltaSeconds(
                         chunkPos = chunkPos,
                         fallbackSeconds = deltaSeconds,
-                        lastTickMap = droppedItemLastTickNanos
+                        lastTickMap = droppedItemLastTickNanos,
+                        accumulatorMap = droppedItemChunkAccumulatorSeconds,
+                        fixedStepSeconds = DROPPED_ITEM_FIXED_STEP_SECONDS,
+                        maxStepsPerTick = DROPPED_ITEM_MAX_STEPS_PER_TICK,
+                        applyCatchupCap = false
                     )
                 },
                 onChunkEvents = onChunkEvents,
                 onDispatchComplete = onDispatchComplete,
                 chunkTimeRecorder = chunkTimeRecorder,
-                awaitCompletion = true
+                awaitCompletion = false
             )
         }
         if (activeSimulationChunks != null) {
@@ -977,24 +983,30 @@ class World(
                 }
             }
             pruneIdleChunkTimingState(droppedItemLastTickNanos, activeEntityChunks)
+            pruneIdleChunkAccumulatorState(droppedItemChunkAccumulatorSeconds, activeEntityChunks)
         } else if (!droppedItemSystem.hasEntities()) {
             droppedItemLastTickNanos.clear()
+            droppedItemChunkAccumulatorSeconds.clear()
         }
         return droppedItemSystem.tickOnChunkActors(
             deltaSeconds = deltaSeconds,
             activeSimulationChunks = activeSimulationChunks,
             submitChunkTask = { chunkPos, task -> chunkActorScheduler.submit(chunkPos, task) },
             chunkDeltaSecondsProvider = { chunkPos ->
-                consumeChunkElapsedDeltaSeconds(
+                consumeChunkFixedStepDeltaSeconds(
                     chunkPos = chunkPos,
                     fallbackSeconds = deltaSeconds,
-                    lastTickMap = droppedItemLastTickNanos
+                    lastTickMap = droppedItemLastTickNanos,
+                    accumulatorMap = droppedItemChunkAccumulatorSeconds,
+                    fixedStepSeconds = DROPPED_ITEM_FIXED_STEP_SECONDS,
+                    maxStepsPerTick = DROPPED_ITEM_MAX_STEPS_PER_TICK,
+                    applyCatchupCap = false
                 )
             },
             onChunkEvents = onChunkEvents,
             onDispatchComplete = onDispatchComplete,
             chunkTimeRecorder = chunkTimeRecorder,
-            awaitCompletion = true
+            awaitCompletion = false
         )
     }
 
@@ -1007,12 +1019,9 @@ class World(
         yaw: Float = 0f,
         pitch: Float = 0f
     ): Boolean {
-        val chunkPos = ChunkPos(kotlin.math.floor(x / 16.0).toInt(), kotlin.math.floor(z / 16.0).toInt())
-        return runOnAnimalChunk(
-            chunkPos = chunkPos,
-            task = { animalSystem.spawn(entityId, kind, x, y, z, yaw, pitch) },
-            enqueuedFromOtherChunkActor = { false }
-        )
+        // Spawn is backed by concurrent collections in AnimalSystem and does not require a chunk-actor join.
+        // Keeping this non-blocking avoids long stalls when callers spawn many entities in a burst.
+        return animalSystem.spawn(entityId, kind, x, y, z, yaw, pitch)
     }
 
     fun hasAnimals(): Boolean {
@@ -1370,7 +1379,8 @@ class World(
     private fun consumeChunkElapsedDeltaSeconds(
         chunkPos: ChunkPos,
         fallbackSeconds: Double,
-        lastTickMap: ConcurrentHashMap<ChunkPos, Long>
+        lastTickMap: ConcurrentHashMap<ChunkPos, Long>,
+        applyCatchupCap: Boolean = true
     ): Double {
         val timeScale = ServerConfig.timeScale
         if (!timeScale.isFinite() || timeScale <= 0.0) return 0.0
@@ -1388,12 +1398,48 @@ class World(
         if (!elapsedSeconds.isFinite() || elapsedSeconds <= 0.0) return 0.0
         val scaledElapsedSeconds = elapsedSeconds * timeScale
         // If a chunk was dormant (e.g., simulation chunk off), avoid a single oversized catch-up tick.
-        if (scaledFallbackSeconds > 0.0 &&
+        if (applyCatchupCap &&
+            scaledFallbackSeconds > 0.0 &&
             scaledElapsedSeconds > scaledFallbackSeconds * MAX_CHUNK_CATCHUP_MULTIPLIER
         ) {
             return scaledFallbackSeconds
         }
         return scaledElapsedSeconds
+    }
+
+    private fun consumeChunkFixedStepDeltaSeconds(
+        chunkPos: ChunkPos,
+        fallbackSeconds: Double,
+        lastTickMap: ConcurrentHashMap<ChunkPos, Long>,
+        accumulatorMap: ConcurrentHashMap<ChunkPos, Double>,
+        fixedStepSeconds: Double,
+        maxStepsPerTick: Int,
+        applyCatchupCap: Boolean = true
+    ): Double {
+        if (!fixedStepSeconds.isFinite() || fixedStepSeconds <= 0.0) return 0.0
+        val elapsedSeconds = consumeChunkElapsedDeltaSeconds(
+            chunkPos = chunkPos,
+            fallbackSeconds = fallbackSeconds,
+            lastTickMap = lastTickMap,
+            applyCatchupCap = applyCatchupCap
+        )
+        if (!elapsedSeconds.isFinite() || elapsedSeconds <= 0.0) return 0.0
+        val previous = accumulatorMap[chunkPos] ?: 0.0
+        val total = (previous + elapsedSeconds).coerceAtLeast(0.0)
+        if (maxStepsPerTick <= 0) {
+            accumulatorMap[chunkPos] = 0.0
+            return total
+        }
+        val rawSteps = (total / fixedStepSeconds).toInt().coerceAtLeast(0)
+        val steps = if (maxStepsPerTick > 0) rawSteps.coerceAtMost(maxStepsPerTick) else rawSteps
+        if (steps <= 0) {
+            accumulatorMap[chunkPos] = total
+            return 0.0
+        }
+        val consumed = steps * fixedStepSeconds
+        val remaining = (total - consumed).coerceAtLeast(0.0)
+        accumulatorMap[chunkPos] = remaining
+        return consumed
     }
 
     private fun tryAcquireChunkTick(
@@ -2035,6 +2081,8 @@ class World(
         private const val MOTION_BLOCKING_NO_LEAVES_HEIGHTMAP_ID = 5
         // Vanilla-like water spread cadence: 5 game ticks (0.25s at 20 TPS) per update step.
         private const val FLUID_TICK_INTERVAL_SECONDS = 0.25
+        private const val DROPPED_ITEM_FIXED_STEP_SECONDS = 1.0 / 20.0
+        private const val DROPPED_ITEM_MAX_STEPS_PER_TICK = 0
         private const val FLUID_SLOPE_SEARCH_MAX = 4
         private const val FALLING_WATER_VISUAL_LEVEL = 8
         private const val FLUID_REMOVE_LEVEL = -1

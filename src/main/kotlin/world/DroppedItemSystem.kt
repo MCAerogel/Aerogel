@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.sqrt
@@ -161,6 +162,7 @@ class DroppedItemSystem(
     private val pendingLaneUnstuckTargets = Array(laneCount) { ConcurrentLinkedQueue<PendingUnstuckTarget>() }
     private val pendingChunkActorTickEvents = ConcurrentLinkedQueue<DroppedItemTickEvents>()
     private val chunkTickInFlight = ConcurrentHashMap<ChunkPos, AtomicBoolean>()
+    private val pendingMergePullImpulses = ConcurrentHashMap<Int, DoubleArray>()
 
     internal fun spawn(
         entityId: Int,
@@ -295,6 +297,7 @@ class DroppedItemSystem(
 
     internal fun remove(entityId: Int): DroppedItemSnapshot? {
         val removed = snapshots.remove(entityId) ?: return null
+        clearPendingMergePull(entityId)
         removeFromChunkIndex(removed.chunkPos, entityId)
         dirtyChunksByLane[laneFor(removed.chunkPos.x, removed.chunkPos.z)].add(removed.chunkPos)
         return removed
@@ -311,6 +314,7 @@ class DroppedItemSystem(
             }
         }
         val removedSnapshot = removed ?: return null
+        clearPendingMergePull(entityId)
         removeFromChunkIndex(removedSnapshot.chunkPos, entityId)
         dirtyChunksByLane[laneFor(removedSnapshot.chunkPos.x, removedSnapshot.chunkPos.z)].add(removedSnapshot.chunkPos)
         return removedSnapshot
@@ -327,6 +331,7 @@ class DroppedItemSystem(
             }
         }
         val removedSnapshot = removed ?: return null
+        clearPendingMergePull(entityId)
         removeFromChunkIndex(removedSnapshot.chunkPos, entityId)
         dirtyChunksByLane[laneFor(removedSnapshot.chunkPos.x, removedSnapshot.chunkPos.z)].add(removedSnapshot.chunkPos)
         return removedSnapshot
@@ -334,19 +339,50 @@ class DroppedItemSystem(
 
     internal fun consumeIfMatches(entityId: Int, expected: DroppedItemSnapshot, consumeCount: Int): DroppedItemConsumeResult? {
         if (consumeCount <= 0) return null
-        val current = snapshots[entityId] ?: return null
-        if (current != expected) return null
-        val clampedConsume = consumeCount.coerceAtMost(current.stack.count)
-        if (clampedConsume <= 0) return null
-        if (clampedConsume >= current.stack.count) {
-            val removed = removeIfMatches(entityId, expected) ?: return null
-            return DroppedItemConsumeResult(consumedCount = removed.stack.count, removed = removed, updated = null)
+        if (!tryLockEntity(entityId)) return null
+        var consumed = 0
+        var removedSnapshot: DroppedItemSnapshot? = null
+        var updatedSnapshot: DroppedItemSnapshot? = null
+
+        try {
+            snapshots.compute(entityId) { _, current ->
+                if (current == null) return@compute null
+                if (current.uuid != expected.uuid) return@compute current
+                if (current.stack.itemId != expected.stack.itemId) return@compute current
+                if (!areStackMetadataEqual(current.stack, expected.stack)) return@compute current
+
+                val clampedConsume = consumeCount.coerceAtMost(current.stack.count)
+                if (clampedConsume <= 0) return@compute current
+                consumed = clampedConsume
+
+                if (clampedConsume >= current.stack.count) {
+                    removedSnapshot = current
+                    null
+                } else {
+                    val remainingCount = current.stack.count - clampedConsume
+                    val updated = current.copy(
+                        stack = copyDroppedItemStackState(current.stack.copy(count = remainingCount))
+                    )
+                    updatedSnapshot = updated
+                    updated
+                }
+            }
+        } finally {
+            unlockEntity(entityId)
         }
-        val remainingCount = current.stack.count - clampedConsume
-        val updated = mutate(entityId) { entity ->
-            entity.stack = copyDroppedItemStackState(current.stack.copy(count = remainingCount))
-        } ?: return null
-        return DroppedItemConsumeResult(consumedCount = clampedConsume, removed = null, updated = updated)
+
+        if (consumed <= 0) return null
+        val removed = removedSnapshot
+        if (removed != null) {
+            clearPendingMergePull(entityId)
+            removeFromChunkIndex(removed.chunkPos, entityId)
+            dirtyChunksByLane[laneFor(removed.chunkPos.x, removed.chunkPos.z)].add(removed.chunkPos)
+            return DroppedItemConsumeResult(consumedCount = consumed, removed = removed, updated = null)
+        }
+
+        val updated = updatedSnapshot ?: return null
+        dirtyChunksByLane[laneFor(updated.chunkPos.x, updated.chunkPos.z)].add(updated.chunkPos)
+        return DroppedItemConsumeResult(consumedCount = consumed, removed = null, updated = updated)
     }
 
     fun hasEntities(): Boolean {
@@ -482,7 +518,7 @@ class DroppedItemSystem(
             onDispatchComplete?.invoke()
         }
         if (scheduled == null || scheduled.isEmpty()) {
-            return if (awaitCompletion) combineTickEvents(ready, mergeNearbyDroppedItems(activeSimulationChunks, deltaSeconds)) else ready
+            return combineTickEvents(ready, mergeNearbyDroppedItems(activeSimulationChunks, deltaSeconds))
         }
         val spawned = ArrayList<DroppedItemSnapshot>(ready.spawned.size)
         val updated = ArrayList<DroppedItemSnapshot>(ready.updated.size)
@@ -497,7 +533,7 @@ class DroppedItemSystem(
             if (events.removed.isNotEmpty()) removed.addAll(events.removed)
         }
         val base = DroppedItemTickEvents(spawned = spawned, updated = updated, removed = removed)
-        return if (awaitCompletion) combineTickEvents(base, mergeNearbyDroppedItems(activeSimulationChunks, deltaSeconds)) else base
+        return combineTickEvents(base, mergeNearbyDroppedItems(activeSimulationChunks, deltaSeconds))
     }
 
     private fun combineTickEvents(base: DroppedItemTickEvents, merged: DroppedItemTickEvents): DroppedItemTickEvents {
@@ -581,6 +617,8 @@ class DroppedItemSystem(
         }
 
         for ((entityId, entity) in chunkState.entities) {
+            if (!tryLockEntity(entityId)) continue
+            try {
             val baselineSnapshot = snapshots[entityId]
             if (baselineSnapshot == null) {
                 chunkState.entities.remove(entityId, entity)
@@ -591,6 +629,7 @@ class DroppedItemSystem(
                 continue
             }
             syncMutableEntityToSnapshot(entity, baselineSnapshot)
+            applyPendingMergePull(entity)
             val oldX = entity.x
             val oldY = entity.y
             val oldZ = entity.z
@@ -690,17 +729,32 @@ class DroppedItemSystem(
                 if (canCommitChunkSnapshot(entityId, entity.uuid, baselineSnapshot)) {
                     snapshots[entityId] = snapshot
                     result.spawned.add(snapshot)
+                } else {
+                    val reconciled = reconcileMotionSnapshotWithLiveState(entityId, entity.uuid, entity)
+                    if (reconciled != null) {
+                        result.spawned.add(reconciled)
+                    }
                 }
             } else if (moved) {
                 val snapshot = entity.snapshot()
                 if (canCommitChunkSnapshot(entityId, entity.uuid, baselineSnapshot)) {
                     snapshots[entityId] = snapshot
                     result.updated.add(snapshot)
+                } else {
+                    val reconciled = reconcileMotionSnapshotWithLiveState(entityId, entity.uuid, entity)
+                    if (reconciled != null) {
+                        result.updated.add(reconciled)
+                    }
                 }
             } else if (pickupDelayChanged) {
                 if (canCommitChunkSnapshot(entityId, entity.uuid, baselineSnapshot)) {
                     snapshots[entityId] = entity.snapshot()
+                } else {
+                    reconcileMotionSnapshotWithLiveState(entityId, entity.uuid, entity)
                 }
+            }
+            } finally {
+                unlockEntity(entityId)
             }
         }
 
@@ -723,6 +777,31 @@ class DroppedItemSystem(
         val current = snapshots[entityId] ?: return false
         if (current.uuid != expectedUuid) return false
         return current == baseline
+    }
+
+    private fun reconcileMotionSnapshotWithLiveState(
+        entityId: Int,
+        expectedUuid: UUID,
+        entity: MutableDroppedItem
+    ): DroppedItemSnapshot? {
+        val current = snapshots[entityId] ?: return null
+        if (current.uuid != expectedUuid) return null
+        val reconciled = current.copy(
+            x = entity.x,
+            y = entity.y,
+            z = entity.z,
+            vx = entity.vx,
+            vy = entity.vy,
+            vz = entity.vz,
+            accelerationX = entity.accelerationX,
+            accelerationY = entity.accelerationY,
+            accelerationZ = entity.accelerationZ,
+            pickupDelaySeconds = entity.pickupDelaySeconds,
+            onGround = entity.onGround,
+            chunkPos = ChunkPos(entity.chunkX, entity.chunkZ)
+        )
+        snapshots[entityId] = reconciled
+        return reconciled
     }
 
     private fun syncMutableEntityToSnapshot(entity: MutableDroppedItem, snapshot: DroppedItemSnapshot) {
@@ -1243,8 +1322,6 @@ class DroppedItemSystem(
                 val tx = applyMergeTransaction(
                     keep = keep,
                     merge = merge,
-                    keepCount = keep.stack.count + transferable,
-                    mergeCount = merge.stack.count - transferable,
                     vx = midpointVx,
                     vy = midpointVy,
                     vz = midpointVz,
@@ -1273,20 +1350,8 @@ class DroppedItemSystem(
             val selfDirZ = (midpointZ - self.z) / distance
             val partnerDirX = (midpointX - partnerLive.x) / distance
             val partnerDirZ = (midpointZ - partnerLive.z) / distance
-            val selfUpdated = updateVelocity(
-                self.entityId,
-                (self.vx + selfDirX * pullStep).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED),
-                self.vy,
-                (self.vz + selfDirZ * pullStep).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED)
-            )
-            val partnerUpdated = updateVelocity(
-                partnerLive.entityId,
-                (partnerLive.vx + partnerDirX * pullStep).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED),
-                partnerLive.vy,
-                (partnerLive.vz + partnerDirZ * pullStep).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED)
-            )
-            if (selfUpdated != null) updated[self.entityId] = selfUpdated
-            if (partnerUpdated != null) updated[partnerLive.entityId] = partnerUpdated
+            enqueueMergePullImpulse(self.entityId, selfDirX * pullStep, selfDirZ * pullStep)
+            enqueueMergePullImpulse(partnerLive.entityId, partnerDirX * pullStep, partnerDirZ * pullStep)
             consumed.add(self.entityId)
             consumed.add(partnerLive.entityId)
         }
@@ -1305,8 +1370,6 @@ class DroppedItemSystem(
     private fun applyMergeTransaction(
         keep: DroppedItemSnapshot,
         merge: DroppedItemSnapshot,
-        keepCount: Int,
-        mergeCount: Int,
         vx: Double,
         vy: Double,
         vz: Double,
@@ -1314,46 +1377,122 @@ class DroppedItemSystem(
         ay: Double,
         az: Double
     ): MergeTxResult? {
-        if (keepCount <= 0 || mergeCount < 0) return null
-        val keepSnapshot = snapshot(keep.entityId) ?: return null
-        val mergeSnapshot = snapshot(merge.entityId) ?: return null
-        if (keepSnapshot.uuid != keep.uuid || mergeSnapshot.uuid != merge.uuid) return null
+        return withPairEntityLocks(keep.entityId, merge.entityId) {
+            val keepSnapshot = snapshot(keep.entityId) ?: return@withPairEntityLocks null
+            val mergeSnapshot = snapshot(merge.entityId) ?: return@withPairEntityLocks null
+            if (keepSnapshot.uuid != keep.uuid || mergeSnapshot.uuid != merge.uuid) return@withPairEntityLocks null
+            if (!canMergeStacks(keepSnapshot, mergeSnapshot)) return@withPairEntityLocks null
+            val maxStackSize = itemMaxStackSize(keepSnapshot.stack.itemId)
+            if (maxStackSize <= 0) return@withPairEntityLocks null
+            val transferable = minOf((maxStackSize - keepSnapshot.stack.count).coerceAtLeast(0), mergeSnapshot.stack.count)
+            if (transferable <= 0) return@withPairEntityLocks null
+            val keepCount = keepSnapshot.stack.count + transferable
+            val mergeCount = mergeSnapshot.stack.count - transferable
 
-        val mergedPickupDelay = minOf(keepSnapshot.pickupDelaySeconds, mergeSnapshot.pickupDelaySeconds)
-        val keepLive = mutateIfUuidMatches(keep.entityId, keep.uuid) { entity ->
-            entity.stack = copyDroppedItemStackState(entity.stack.copy(count = keepCount))
-            entity.vx = vx
-            entity.vy = vy
-            entity.vz = vz
-            if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
-                entity.accelerationX = ax
-                entity.accelerationY = ay
-                entity.accelerationZ = az
+            val mergedPickupDelay = minOf(keepSnapshot.pickupDelaySeconds, mergeSnapshot.pickupDelaySeconds)
+
+            if (mergeCount <= 0) {
+                val keepLive = mutateIfUuidMatches(keep.entityId, keep.uuid) { entity ->
+                    entity.stack = copyDroppedItemStackState(entity.stack.copy(count = keepCount))
+                    entity.vx = vx
+                    entity.vy = vy
+                    entity.vz = vz
+                    if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
+                        entity.accelerationX = ax
+                        entity.accelerationY = ay
+                        entity.accelerationZ = az
+                    }
+                    entity.pickupDelaySeconds = mergedPickupDelay
+                    entity.sleeping = false
+                    entity.restTicks = 0.0
+                } ?: return@withPairEntityLocks null
+                val removed = removeIfUuidMatches(merge.entityId, merge.uuid)
+                if (removed == null) {
+                    restoreSnapshotIfUuid(keepSnapshot)
+                    return@withPairEntityLocks null
+                }
+                return@withPairEntityLocks MergeTxResult(keep = keepLive, merge = null)
             }
-            entity.pickupDelaySeconds = mergedPickupDelay
-            entity.sleeping = false
-            entity.restTicks = 0.0
-        } ?: return null
-
-        if (mergeCount <= 0) {
-            removeIfUuidMatches(merge.entityId, merge.uuid) ?: return null
-            return MergeTxResult(keep = keepLive, merge = null)
+            val mergeLive = mutateIfUuidMatches(merge.entityId, merge.uuid) { entity ->
+                entity.stack = copyDroppedItemStackState(entity.stack.copy(count = mergeCount))
+                entity.vx = vx
+                entity.vy = vy
+                entity.vz = vz
+                if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
+                    entity.accelerationX = ax
+                    entity.accelerationY = ay
+                    entity.accelerationZ = az
+                }
+                entity.pickupDelaySeconds = mergedPickupDelay
+                entity.sleeping = false
+                entity.restTicks = 0.0
+            } ?: return@withPairEntityLocks null
+            val keepLive = mutateIfUuidMatches(keep.entityId, keep.uuid) { entity ->
+                entity.stack = copyDroppedItemStackState(entity.stack.copy(count = keepCount))
+                entity.vx = vx
+                entity.vy = vy
+                entity.vz = vz
+                if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
+                    entity.accelerationX = ax
+                    entity.accelerationY = ay
+                    entity.accelerationZ = az
+                }
+                entity.pickupDelaySeconds = mergedPickupDelay
+                entity.sleeping = false
+                entity.restTicks = 0.0
+            } ?: run {
+                restoreSnapshotIfUuid(mergeSnapshot)
+                return@withPairEntityLocks null
+            }
+            MergeTxResult(keep = keepLive, merge = mergeLive)
         }
-        val mergeLive = mutateIfUuidMatches(merge.entityId, merge.uuid) { entity ->
-            entity.stack = copyDroppedItemStackState(entity.stack.copy(count = mergeCount))
-            entity.vx = vx
-            entity.vy = vy
-            entity.vz = vz
-            if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
-                entity.accelerationX = ax
-                entity.accelerationY = ay
-                entity.accelerationZ = az
-            }
-            entity.pickupDelaySeconds = mergedPickupDelay
+    }
+
+    private fun enqueueMergePullImpulse(entityId: Int, dvx: Double, dvz: Double) {
+        if (!dvx.isFinite() || !dvz.isFinite()) return
+        if (abs(dvx) <= VELOCITY_SNAP_EPSILON && abs(dvz) <= VELOCITY_SNAP_EPSILON) return
+        pendingMergePullImpulses.compute(entityId) { _, current ->
+            val next = current ?: doubleArrayOf(0.0, 0.0)
+            next[0] += dvx
+            next[1] += dvz
+            next
+        }
+    }
+
+    private fun applyPendingMergePull(entity: MutableDroppedItem) {
+        val impulse = pendingMergePullImpulses.remove(entity.entityId) ?: return
+        val dvx = impulse[0]
+        val dvz = impulse[1]
+        if (!dvx.isFinite() || !dvz.isFinite()) return
+        entity.vx = (entity.vx + dvx).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED)
+        entity.vz = (entity.vz + dvz).coerceIn(-MERGE_MAX_PULL_SPEED, MERGE_MAX_PULL_SPEED)
+        entity.sleeping = false
+        entity.restTicks = 0.0
+    }
+
+    private fun clearPendingMergePull(entityId: Int) {
+        pendingMergePullImpulses.remove(entityId)
+    }
+
+    private fun restoreSnapshotIfUuid(snapshot: DroppedItemSnapshot): DroppedItemSnapshot? {
+        return mutateIfUuidMatches(snapshot.entityId, snapshot.uuid) { entity ->
+            entity.stack = copyDroppedItemStackState(snapshot.stack)
+            entity.x = snapshot.x
+            entity.y = snapshot.y
+            entity.z = snapshot.z
+            entity.vx = snapshot.vx
+            entity.vy = snapshot.vy
+            entity.vz = snapshot.vz
+            entity.accelerationX = snapshot.accelerationX
+            entity.accelerationY = snapshot.accelerationY
+            entity.accelerationZ = snapshot.accelerationZ
+            entity.pickupDelaySeconds = snapshot.pickupDelaySeconds
+            entity.onGround = snapshot.onGround
+            entity.chunkX = snapshot.chunkPos.x
+            entity.chunkZ = snapshot.chunkPos.z
             entity.sleeping = false
             entity.restTicks = 0.0
-        } ?: return null
-        return MergeTxResult(keep = keepLive, merge = mergeLive)
+        }
     }
 
     private fun findBestMergePartner(
@@ -1491,6 +1630,41 @@ class DroppedItemSystem(
         return (hash and Int.MAX_VALUE) % laneCount
     }
 
+    private fun lockIndexForEntity(entityId: Int): Int {
+        return (entityId and Int.MAX_VALUE) % ENTITY_LOCK_STRIPES
+    }
+
+    private fun tryLockEntity(entityId: Int): Boolean {
+        return entityLocks[lockIndexForEntity(entityId)].tryLock()
+    }
+
+    private fun unlockEntity(entityId: Int) {
+        entityLocks[lockIndexForEntity(entityId)].unlock()
+    }
+
+    private inline fun <T> withPairEntityLocks(entityA: Int, entityB: Int, action: () -> T?): T? {
+        val first = if (entityA <= entityB) entityA else entityB
+        val second = if (entityA <= entityB) entityB else entityA
+        if (!tryLockEntity(first)) return null
+        if (second == first) {
+            return try {
+                action()
+            } finally {
+                unlockEntity(first)
+            }
+        }
+        if (!tryLockEntity(second)) {
+            unlockEntity(first)
+            return null
+        }
+        return try {
+            action()
+        } finally {
+            unlockEntity(second)
+            unlockEntity(first)
+        }
+    }
+
     private fun tryAcquireChunkTick(chunkPos: ChunkPos): Boolean {
         return chunkTickInFlight.computeIfAbsent(chunkPos) { AtomicBoolean(false) }.compareAndSet(false, true)
     }
@@ -1565,6 +1739,7 @@ class DroppedItemSystem(
         private const val DEFAULT_PICKUP_DELAY_SECONDS = 2.0
         private const val MAX_AGE_TICKS = 6000.0
         private const val DESPAWN_Y = -128.0
+        private const val ENTITY_LOCK_STRIPES = 4096
         private val json = Json { ignoreUnknownKeys = true }
         private val NON_COLLIDING_BLOCK_KEYS = loadBlockTag("dropped_item_non_colliding")
         private val ITEM_ID_BY_KEY = loadItemIdsByKey()
@@ -1575,6 +1750,7 @@ class DroppedItemSystem(
         private val globalWaterStateCache = ConcurrentHashMap<Int, Boolean>()
         private val globalWaterLevelByStateCache = ConcurrentHashMap<Int, Int>()
         private val globalBuoyancyProfileByItemId = ConcurrentHashMap<Int, ItemBuoyancyProfile>()
+        private val entityLocks = Array(ENTITY_LOCK_STRIPES) { ReentrantLock() }
         private val HORIZONTAL_FLOW_DIRECTIONS = arrayOf(
             intArrayOf(-1, 0),
             intArrayOf(1, 0),
