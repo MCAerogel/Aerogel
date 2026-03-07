@@ -1,6 +1,8 @@
 <div align="center">
 
-# Aerogel (KO)
+<img src="https://avatars.githubusercontent.com/u/264545382?s=200&v=4" width="120" height="120" alt="Aerogel logo" style="border-radius: 50%; margin: 30px auto 4px auto; display: block;"/>
+
+<h1 style="margin: 0 0 10px 0;">Aerogel (KO)</h1>
 
 **Kotlin 기반 개발 단계 Minecraft 서버 엔진**
 
@@ -10,6 +12,7 @@
 [![API](https://img.shields.io/badge/API-aerogel--api-2ea44f?style=for-the-badge)](#api-%EB%B0%B0%ED%8F%AC)
 
 [![README EN](https://img.shields.io/badge/README-English-111111?style=for-the-badge)](README.md)
+[![다운로드](https://img.shields.io/badge/다운로드-릴리즈%20사이트-1f883d?style=for-the-badge)](https://mcaerogel.github.io/Aerogel-Web/)
 [![Discord](https://img.shields.io/badge/Discord-%EC%BB%A4%EB%AE%A4%EB%8B%88%ED%8B%B0%20%EC%B0%B8%EC%97%AC-5865f2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/fBBgMXXv8P)
 
 </div>
@@ -38,6 +41,10 @@
   <tr>
     <td align="center">기여</td>
     <td align="center"><a href="#기여-우선-영역">기여 우선 영역</a></td>
+  </tr>
+  <tr>
+    <td align="center">다운로드</td>
+    <td align="center"><a href="https://mcaerogel.github.io/Aerogel-Web/">릴리즈 사이트</a></td>
   </tr>
 </table>
 

@@ -4,6 +4,15 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "src/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - ".github/workflows/release-aerogel.yml"
   workflow_dispatch:
 
 permissions:

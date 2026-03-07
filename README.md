@@ -1,6 +1,8 @@
 <div align="center">
 
-# Aerogel
+<img src="https://avatars.githubusercontent.com/u/264545382?s=200&v=4" width="120" height="120" alt="Aerogel logo" style="border-radius: 50%; margin: 30px auto 4px auto; display: block;"/>
+
+<h1 style="margin: 0 0 10px 0;">Aerogel</h1>
 
 **Development-stage Minecraft server engine in Kotlin**
 
@@ -10,6 +12,7 @@
 [![API](https://img.shields.io/badge/API-aerogel--api-2ea44f?style=for-the-badge)](#api-publishing)
 
 [![README KO](https://img.shields.io/badge/README-%ED%95%9C%EA%B5%AD%EC%96%B4-0a66c2?style=for-the-badge)](README.ko.md)
+[![Downloads](https://img.shields.io/badge/Downloads-Release%20Site-1f883d?style=for-the-badge)](https://mcaerogel.github.io/Aerogel-Web/)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865f2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/fBBgMXXv8P)
 
 </div>
@@ -38,6 +41,10 @@
   <tr>
     <td align="center">Contribute</td>
     <td align="center"><a href="#contribution-focus">Contribution Focus</a></td>
+  </tr>
+  <tr>
+    <td align="center">Downloads</td>
+    <td align="center"><a href="https://mcaerogel.github.io/Aerogel-Web/">Release Site</a></td>
   </tr>
 </table>
 
