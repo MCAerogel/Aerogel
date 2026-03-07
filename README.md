@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://avatars.githubusercontent.com/u/264545382?s=200&v=4" width="120" height="120" alt="Aerogel logo" style="border-radius: 50%; margin: 30px auto 4px auto; display: block;"/>
+<img src="assets/aerogel-logo-round.png" width="120" height="120" alt="Aerogel logo"/>
 
 <h1 style="margin: 0 0 10px 0;">Aerogel</h1>
 
