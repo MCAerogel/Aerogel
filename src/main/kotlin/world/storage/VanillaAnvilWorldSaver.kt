@@ -476,7 +476,10 @@ object VanillaAnvilWorldSaver {
                 val sectionZ = Math.floorMod(chunkPos.z, 32)
                 val locationIndex = sectionX + sectionZ * 32
                 val generated = runCatching { world.buildChunk(chunkPos) }.getOrNull()
-                if (generated != null) {
+                val hasBlockOverrides = world.changedBlocksInChunk(chunkPos.x, chunkPos.z).isNotEmpty()
+                // Chunks with runtime block overrides are written without light arrays to force relight on load.
+                // Do not overwrite in-memory persisted lighting cache from potentially stale generated lighting.
+                if (generated != null && !hasBlockOverrides) {
                     cachePersistedChunkLighting(world.key, chunkPos, generated.toPersistedChunkLighting())
                 }
                 existing[locationIndex] = encodeChunkRecord(world, chunkPos, generated)

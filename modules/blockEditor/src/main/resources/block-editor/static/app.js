@@ -6,6 +6,9 @@ const NODE_LIBRARY = {
   functions: [
     { type: 'FUNCTION_SEND_MESSAGE', title: 'Player.sendMessage', defaultMessage: 'Hello from function' }
   ],
+  operations: [
+    { type: 'MATH_ADD', title: '+' }
+  ],
   variables: [
     { type: 'VAR_TEXT', title: '문자열 변수', defaultValue: 'hello' },
     { type: 'VAR_INTEGER', title: '정수 변수', defaultValue: '0' },
@@ -13,11 +16,12 @@ const NODE_LIBRARY = {
   ]
 };
 
-const typeTitleMap = new Map([...NODE_LIBRARY.events, ...NODE_LIBRARY.functions, ...NODE_LIBRARY.variables].map((it) => [it.type, it.title]));
+const typeTitleMap = new Map([...NODE_LIBRARY.events, ...NODE_LIBRARY.functions, ...NODE_LIBRARY.operations, ...NODE_LIBRARY.variables].map((it) => [it.type, it.title]));
 
 const state = {
   blocks: [],
   links: [],
+  comments: [],
   projectMeta: {
     pluginId: 'aerogel-studio-plugin',
     pluginName: 'Aerogel Studio Plugin',
@@ -28,11 +32,16 @@ const state = {
   selectedWorkspaceId: null,
   currentWorkspaceId: null,
   nextId: 1,
+  nextCommentId: 1,
   selectedId: null,
+  selectedCommentId: null,
   panX: 0,
   panY: 0,
   scale: 1,
   draggingNode: null,
+  draggingComment: null,
+  resizingComment: null,
+  commentDraft: null,
   panning: null,
   spaceDown: false,
   connectionDraft: null,
@@ -44,12 +53,43 @@ const state = {
   workspaceDropAfter: false,
   workspaceMenuTargetId: null,
   mouseWorld: { x: 0, y: 0 },
-  contextMenuWorld: { x: 0, y: 0 }
+  contextMenuWorld: { x: 0, y: 0 },
+  nodeClipboard: null,
+  clipboardPasteCount: 0
 };
 
 const BLOCK_NODE_WIDTH = 260;
 const BLOCK_NODE_ESTIMATED_HEIGHT = 132;
+const GRID_SIZE = 24;
 const WORKSPACE_STORAGE_KEY = 'aerogel.blockEditor.workspaces.v1';
+const PRIVATE_KEY = new URLSearchParams(window.location.search).get('privatekey') || '';
+const HISTORY_LIMIT = 200;
+const historyState = {
+  undo: [],
+  redo: [],
+  applying: false,
+  lastSerialized: ''
+};
+const autosaveState = {
+  timer: null,
+  serverTimer: null,
+  serverInFlight: false,
+  lastServerSerialized: ''
+};
+const realtimeState = {
+  clientId: `c_${Math.random().toString(36).slice(2, 10)}`,
+  eventSource: null,
+  connected: false,
+  lastPublishedSerialized: '',
+  lastPresenceSerialized: '',
+  publishTimer: null,
+  presenceTimer: null,
+  publishInFlight: false,
+  presenceInFlight: false,
+  peers: {},
+  suspended: false
+};
+const SHOW_SELF_PRESENCE_DEBUG = false;
 
 const el = {
   pluginSelectField: document.querySelector('.plugin-select-field'),
@@ -63,7 +103,6 @@ const el = {
   workspaceTreeMenu: document.getElementById('workspaceTreeMenu'),
   addFolderMenuBtn: document.getElementById('addFolderMenuBtn'),
   addWorkspaceMenuBtn: document.getElementById('addWorkspaceMenuBtn'),
-  addCodeMenuBtn: document.getElementById('addCodeMenuBtn'),
   renameWorkspaceMenuBtn: document.getElementById('renameWorkspaceMenuBtn'),
   deleteWorkspaceMenuBtn: document.getElementById('deleteWorkspaceMenuBtn'),
   nameDialog: document.getElementById('nameDialog'),
@@ -79,8 +118,6 @@ const el = {
   saveBtn: document.getElementById('saveBtn'),
   workspace: document.getElementById('workspace'),
   workspaceToolbar: document.getElementById('workspaceToolbar'),
-  codeEditorPane: document.getElementById('codeEditorPane'),
-  standaloneCodeEditor: document.getElementById('standaloneCodeEditor'),
   canvas: document.getElementById('canvas'),
   worldInfo: document.getElementById('worldInfo'),
   contextMenu: document.getElementById('contextMenu')
@@ -91,12 +128,24 @@ function setResult(value) {
   console.info(`[AerogelStudio] ${text}`);
 }
 
+function withPrivateKey(path) {
+  const url = new URL(path, window.location.origin);
+  if (PRIVATE_KEY) {
+    url.searchParams.set('privatekey', PRIVATE_KEY);
+  }
+  return `${url.pathname}${url.search}`;
+}
+
 function isEventType(type) {
   return type === 'EVENT_ON_ENABLE' || type === 'EVENT_ON_PLAYER_JOIN';
 }
 
 function isActionType(type) {
   return type.startsWith('ACTION_') || type.startsWith('FUNCTION_') || type === 'ON_ENABLE_LOG' || type === 'ON_PLAYER_JOIN_MESSAGE' || type === 'ON_PLAYER_JOIN_SET_JOIN_MESSAGE';
+}
+
+function isOperationType(type) {
+  return type === 'MATH_ADD';
 }
 
 function isVariableType(type) {
@@ -112,11 +161,11 @@ function isExecInputType(type) {
 }
 
 function isDataOutputType(type) {
-  return type === 'VAR_TEXT';
+  return type === 'VAR_TEXT' || type === 'VAR_INTEGER' || type === 'VAR_DECIMAL' || type === 'MATH_ADD';
 }
 
 function isDataInputType(type) {
-  return type === 'FUNCTION_SEND_MESSAGE' || type === 'EVENT_ON_PLAYER_JOIN';
+  return type === 'FUNCTION_SEND_MESSAGE' || type === 'EVENT_ON_PLAYER_JOIN' || type === 'MATH_ADD';
 }
 
 function canStartLink(type) {
@@ -131,11 +180,14 @@ function linkKindFromType(type) {
   if (type === 'VAR_TEXT') return 'data-text';
   if (type === 'VAR_INTEGER') return 'data-int';
   if (type === 'VAR_DECIMAL') return 'data-decimal';
+  if (type === 'MATH_ADD') return 'data-any';
   if (isExecOutputType(type)) return 'exec';
   return 'none';
 }
 
-function targetPortClassForLink(kind, toType) {
+function targetPortClassForLink(kind, toType, preferredPortClass = '') {
+  if (preferredPortClass) return preferredPortClass;
+  if (isDataKind(kind) && toType === 'MATH_ADD') return 'in-data-a';
   if (isDataKind(kind) && toType === 'FUNCTION_SEND_MESSAGE') return 'in-data';
   if (isDataKind(kind) && toType === 'EVENT_ON_PLAYER_JOIN') return 'in-data';
   if (kind === 'player' && toType === 'FUNCTION_SEND_MESSAGE') return 'in-player';
@@ -143,9 +195,9 @@ function targetPortClassForLink(kind, toType) {
 }
 
 function canLinkKindToType(kind, toType) {
-  if (kind === 'data-text') return isDataInputType(toType);
-  if (kind === 'data-int' || kind === 'data-decimal') return false;
-  if (kind === 'data') return isDataInputType(toType); // legacy
+  if (kind === 'data-text' || kind === 'data-int' || kind === 'data-decimal' || kind === 'data-any' || kind === 'data') {
+    return isDataInputType(toType);
+  }
   if (kind === 'exec') return isExecInputType(toType);
   if (kind === 'player') return toType === 'FUNCTION_SEND_MESSAGE';
   if (kind === 'context') return false;
@@ -171,6 +223,7 @@ function typeLabelOf(type) {
   if (type === 'VAR_INTEGER') return '소수점 없는 숫자를 저장해 두는 칸';
   if (type === 'VAR_DECIMAL') return '소수점 있는 숫자를 저장해 두는 칸';
   if (type === 'FUNCTION_SEND_MESSAGE') return '플레이어에게 메시지를 보내는 함수';
+  if (type === 'MATH_ADD') return '두 값을 더하거나 이어 붙이는 연산';
   return type;
 }
 
@@ -192,8 +245,39 @@ function createNode(type, x, y) {
   };
   state.blocks.push(node);
   state.selectedId = node.id;
+  commitHistoryState();
   renderCanvas();
   return node;
+}
+
+function createComment(x, y, width, height) {
+  const comment = {
+    id: `c${state.nextCommentId++}`,
+    x: Math.round(x),
+    y: Math.round(y),
+    width: Math.max(180, Math.round(width)),
+    height: Math.max(120, Math.round(height)),
+    title: '그룹 제목',
+    description: '설명'
+  };
+  state.comments.push(comment);
+  state.selectedCommentId = comment.id;
+  state.selectedId = null;
+  commitHistoryState();
+  return comment;
+}
+
+function removeComment(commentId) {
+  const prevSize = state.comments.length;
+  state.comments = state.comments.filter((it) => it.id !== commentId);
+  if (state.selectedCommentId === commentId) state.selectedCommentId = null;
+  if (state.comments.length !== prevSize) {
+    commitHistoryState();
+  }
+}
+
+function snapGrid(value) {
+  return Math.round(value / GRID_SIZE) * GRID_SIZE;
 }
 
 function linkPath(from, to) {
@@ -203,25 +287,121 @@ function linkPath(from, to) {
   return `M ${from.x} ${from.y} C ${c1x} ${from.y}, ${c2x} ${to.y}, ${to.x} ${to.y}`;
 }
 
+function colorForClient(clientId) {
+  let hash = 0;
+  for (let i = 0; i < clientId.length; i += 1) {
+    hash = ((hash << 5) - hash) + clientId.charCodeAt(i);
+    hash |= 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  return `hsl(${hue} 72% 62%)`;
+}
+
 function removeNode(nodeId) {
   state.blocks = state.blocks.filter((it) => it.id !== nodeId);
   state.links = state.links.filter((it) => it.from !== nodeId && it.to !== nodeId);
   if (state.selectedId === nodeId) state.selectedId = null;
+  commitHistoryState();
 }
 
-function hasDuplicateLink(fromId, toId, kind) {
-  return state.links.some((it) => it.from === fromId && it.to === toId && (it.kind || 'exec') === (kind || 'exec'));
+function resolveLinkToPortClass(link, toNode) {
+  if (!toNode) return link.toPortClass || '';
+  const kind = link.kind || linkKindFromType(state.blocks.find((it) => it.id === link.from)?.type || '');
+  return targetPortClassForLink(kind, toNode.type, link.toPortClass || '');
 }
 
-function addLink(fromId, toId, kind, fromPortClass) {
+function disconnectLinksByPort(nodeId, portType, portClass) {
+  if (!nodeId || !portType || !portClass) return;
+  if (portType === 'out') {
+    state.links = state.links.filter((it) => !(it.from === nodeId && (it.fromPortClass || 'out') === portClass));
+    commitHistoryState();
+    return;
+  }
+  state.links = state.links.filter((it) => {
+    if (it.to !== nodeId) return true;
+    const toNode = state.blocks.find((n) => n.id === it.to);
+    return resolveLinkToPortClass(it, toNode) !== portClass;
+  });
+  commitHistoryState();
+}
+
+function disconnectAllLinks(nodeId) {
+  if (!nodeId) return;
+  state.links = state.links.filter((it) => it.from !== nodeId && it.to !== nodeId);
+  commitHistoryState();
+}
+
+function duplicateNode(nodeId) {
+  const source = state.blocks.find((it) => it.id === nodeId);
+  if (!source) return null;
+  const duplicated = {
+    id: `n${state.nextId++}`,
+    type: source.type,
+    x: Math.round(source.x + 24),
+    y: Math.round(source.y + 24),
+    params: cloneJson(source.params || {})
+  };
+  state.blocks.push(duplicated);
+  state.selectedId = duplicated.id;
+  commitHistoryState();
+  return duplicated;
+}
+
+function copySelectedNodeToClipboard() {
+  const source = state.blocks.find((it) => it.id === state.selectedId);
+  if (!source) return false;
+  state.nodeClipboard = {
+    type: source.type,
+    params: cloneJson(source.params || {}),
+    x: source.x,
+    y: source.y
+  };
+  state.clipboardPasteCount = 0;
+  return true;
+}
+
+function pasteNodeFromClipboard() {
+  if (!state.nodeClipboard) return false;
+  const pasted = {
+    id: `n${state.nextId++}`,
+    type: state.nodeClipboard.type,
+    x: Math.round(state.mouseWorld.x),
+    y: Math.round(state.mouseWorld.y),
+    params: cloneJson(state.nodeClipboard.params || {})
+  };
+  state.blocks.push(pasted);
+  state.selectedId = pasted.id;
+  state.clipboardPasteCount = 0;
+  commitHistoryState();
+  return true;
+}
+
+function hasDuplicateLink(fromId, toId, kind, fromPortClass, toPortClass) {
+  return state.links.some((it) => (
+    it.from === fromId
+    && it.to === toId
+    && (it.kind || 'exec') === (kind || 'exec')
+    && (it.fromPortClass || 'out') === (fromPortClass || 'out')
+    && (it.toPortClass || '') === (toPortClass || '')
+  ));
+}
+
+function addLink(fromId, toId, kind, fromPortClass, toPortClass) {
   if (!fromId || !toId || fromId === toId) return;
   const fromNode = state.blocks.find((it) => it.id === fromId);
   const toNode = state.blocks.find((it) => it.id === toId);
   if (!fromNode || !toNode) return;
   const resolvedKind = kind || linkKindFromType(fromNode.type);
   if (!canLinkKindToType(resolvedKind, toNode.type)) return;
-  if (hasDuplicateLink(fromId, toId, resolvedKind)) return;
-  state.links.push({ from: fromId, to: toId, kind: resolvedKind, fromPortClass: fromPortClass || 'out' });
+  if (hasDuplicateLink(fromId, toId, resolvedKind, fromPortClass, toPortClass)) return;
+  state.links.push({
+    from: fromId,
+    to: toId,
+    kind: resolvedKind,
+    fromPortClass: fromPortClass || 'out',
+    toPortClass: toPortClass || ''
+  });
+  commitHistoryState();
 }
 
 function getPortCenterWorld(nodeId, portType) {
@@ -250,14 +430,15 @@ function resolveLinkTargetFromClient(clientX, clientY) {
     const targetId = inputPort.dataset.nodeId;
     const targetNode = state.blocks.find((it) => it.id === targetId);
     const accept = inputPort.dataset.accept || 'exec';
+    const targetPortClass = inputPort.dataset.portClass || (
+      accept === 'data' ? 'in-data' : (accept === 'player' ? 'in-player' : 'in-exec')
+    );
     const acceptOk = (sourceKind === 'exec' && accept === 'exec')
       || (isDataKind(sourceKind) && accept === 'data')
       || (sourceKind === 'player' && accept === 'player');
     if (!acceptOk) return null;
     if (!(targetNode && canLinkKindToType(sourceKind, targetNode.type))) return null;
-    if (accept === 'data') return { id: targetId, port: 'in-data' };
-    if (accept === 'player') return { id: targetId, port: 'in-player' };
-    return { id: targetId, port: 'in-exec' };
+    return { id: targetId, port: targetPortClass };
   }
 
   const nodeElement = hovered instanceof Element ? hovered.closest('.block-node') : null;
@@ -310,7 +491,7 @@ function renderLinksLayer() {
     if (!fromNode || !toNode) continue;
     const kind = link.kind || linkKindFromType(fromNode.type);
     const from = getPortCenterWorld(link.from, link.fromPortClass || 'out');
-    const to = getPortCenterWorld(link.to, targetPortClassForLink(kind, toNode.type));
+    const to = getPortCenterWorld(link.to, targetPortClassForLink(kind, toNode.type, link.toPortClass || ''));
     if (!from || !to) continue;
     const d = linkPath(from, to);
 
@@ -360,6 +541,114 @@ function updateDraftPathOnly() {
   if (draftFront instanceof SVGPathElement) draftFront.setAttribute('d', d);
 }
 
+function renderComment(comment) {
+  const box = document.createElement('div');
+  box.className = `comment-box${state.selectedCommentId === comment.id ? ' selected' : ''}`;
+  box.style.left = `${comment.x}px`;
+  box.style.top = `${comment.y}px`;
+  box.style.width = `${comment.width}px`;
+  box.style.height = `${comment.height}px`;
+  box.dataset.id = comment.id;
+
+  const head = document.createElement('div');
+  head.className = 'comment-head';
+
+  const title = document.createElement('input');
+  title.type = 'text';
+  title.className = 'comment-title-input';
+  title.value = comment.title || '';
+  title.placeholder = '그룹 제목';
+  title.addEventListener('input', () => {
+    comment.title = title.value;
+    scheduleCollaborativePublish(false);
+  });
+  title.addEventListener('blur', () => commitHistoryState());
+  head.appendChild(title);
+
+  const description = document.createElement('textarea');
+  description.className = 'comment-description-input';
+  description.value = comment.description || '';
+  description.placeholder = '설명';
+  description.style.overflow = 'hidden';
+  description.style.resize = 'none';
+  const resizeDescription = () => {
+    description.style.height = 'auto';
+    description.style.height = `${description.scrollHeight}px`;
+  };
+  requestAnimationFrame(resizeDescription);
+  description.addEventListener('input', () => {
+    comment.description = description.value;
+    resizeDescription();
+    scheduleCollaborativePublish(false);
+  });
+  description.addEventListener('blur', () => commitHistoryState());
+  head.appendChild(description);
+
+  box.appendChild(head);
+
+  box.addEventListener('mousedown', (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('input, textarea')) return;
+    state.selectedCommentId = comment.id;
+    state.selectedId = null;
+    renderCanvas();
+    schedulePresencePublish(true);
+  });
+
+  const beginCommentDrag = (event) => {
+    if (event.button !== 0) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('input, textarea')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    state.selectedCommentId = comment.id;
+    state.selectedId = null;
+    state.draggingComment = {
+      id: comment.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      commentX: comment.x,
+      commentY: comment.y,
+      moved: false
+    };
+    document.body.style.userSelect = 'none';
+    renderCanvas();
+    schedulePresencePublish(true);
+  };
+  head.addEventListener('mousedown', beginCommentDrag);
+
+  const resizeEdges = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'];
+  for (const edge of resizeEdges) {
+    const handle = document.createElement('div');
+    handle.className = `comment-resize-handle ${edge}`;
+    handle.dataset.edge = edge;
+    handle.addEventListener('mousedown', (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      state.selectedCommentId = comment.id;
+      state.selectedId = null;
+      state.resizingComment = {
+        id: comment.id,
+        edge,
+        startX: event.clientX,
+        startY: event.clientY,
+        x: comment.x,
+        y: comment.y,
+        width: comment.width,
+        height: comment.height,
+        moved: false
+      };
+      document.body.style.userSelect = 'none';
+      renderCanvas();
+      schedulePresencePublish(true);
+    });
+    box.appendChild(handle);
+  }
+
+  el.canvas.appendChild(box);
+}
+
 function renderNode(node) {
   const hasIncomingExec = state.links.some((it) => it.to === node.id && ((it.kind || 'exec') === 'exec'));
   const hasIncomingData = state.links.some((it) => it.to === node.id && isDataKind(it.kind || 'exec'));
@@ -372,7 +661,9 @@ function renderNode(node) {
     return linkKind === kind;
   });
   const nodeEl = document.createElement('div');
-  const roleClass = isEventType(node.type) ? 'event' : 'action';
+  const roleClass = isVariableType(node.type)
+    ? 'variable'
+    : (isEventType(node.type) ? 'event' : (isOperationType(node.type) ? 'operation' : 'function'));
   const sourceId = state.connectionDraft?.from || '';
   const sourceType = sourceId ? (state.blocks.find((it) => it.id === sourceId)?.type || '') : '';
   const sourceKind = state.connectionDraft?.kind || linkKindFromType(sourceType);
@@ -427,6 +718,7 @@ function renderNode(node) {
     valueInput.addEventListener('input', () => {
       node.params = node.params || {};
       node.params.value = valueInput.value;
+      scheduleCollaborativePublish(false);
     });
 
     body.appendChild(valueLabel);
@@ -453,6 +745,7 @@ function renderNode(node) {
     inData.title = 'message 입력';
     inData.dataset.portType = 'in';
     inData.dataset.accept = 'data';
+    inData.dataset.portClass = 'in-data';
     inData.dataset.nodeId = node.id;
     if (isCandidateTarget && isDataKind(sourceKind)) inData.classList.add('candidate');
 
@@ -475,6 +768,7 @@ function renderNode(node) {
       inPort.title = `${label} 입력`;
       inPort.dataset.portType = 'in';
       inPort.dataset.accept = accept;
+      inPort.dataset.portClass = extraClass;
       inPort.dataset.nodeId = node.id;
       if (isCandidateTarget) {
         if (accept === 'exec' && sourceKind === 'exec') inPort.classList.add('candidate');
@@ -494,6 +788,29 @@ function renderNode(node) {
     appendInPort('실행', 'exec', 'in-exec', hasIncomingExec);
     appendInPort('player', 'player', 'in-player', hasIncomingPlayer);
     appendInPort('message', 'data', 'in-data', hasIncomingData);
+  } else if (node.type === 'MATH_ADD') {
+    leftPinGroup.classList.add('stack');
+    const appendAddInput = (label, portClass) => {
+      const connected = state.links.some((it) => it.to === node.id && isDataKind(it.kind || 'exec') && (it.toPortClass || '') === portClass);
+      const inItem = document.createElement('div');
+      inItem.className = 'pin-in-item';
+      const inPort = document.createElement('div');
+      inPort.className = `port in ${portClass}${connected ? ' connected' : ''}`;
+      inPort.title = `${label} 입력`;
+      inPort.dataset.portType = 'in';
+      inPort.dataset.accept = 'data';
+      inPort.dataset.portClass = portClass;
+      inPort.dataset.nodeId = node.id;
+      if (isCandidateTarget && isDataKind(sourceKind)) inPort.classList.add('candidate');
+      const inLabel = document.createElement('div');
+      inLabel.className = 'pin-label';
+      inLabel.textContent = label;
+      inItem.appendChild(inPort);
+      inItem.appendChild(inLabel);
+      leftPinGroup.appendChild(inItem);
+    };
+    appendAddInput('A', 'in-data-a');
+    appendAddInput('B', 'in-data-b');
   } else if (!isEventType(node.type)) {
     const inPort = document.createElement('div');
     const outlinedInput = state.connectionDraft && state.linkingActive && (state.connectionDraft.previousTargets || []).includes(node.id);
@@ -501,6 +818,7 @@ function renderNode(node) {
     inPort.title = '실행 입력';
     inPort.dataset.portType = 'in';
     inPort.dataset.accept = 'exec';
+    inPort.dataset.portClass = 'in-exec';
     inPort.dataset.nodeId = node.id;
     if (isCandidateTarget && sourceKind === 'exec') inPort.classList.add('candidate');
     leftPinGroup.appendChild(inPort);
@@ -532,6 +850,7 @@ function renderNode(node) {
     outPort.dataset.portType = 'out';
     outPort.dataset.nodeId = node.id;
     outPort.dataset.kind = kind;
+    outPort.dataset.portClass = outPortClass;
     outPort.addEventListener('mousedown', (event) => {
       if (event.button !== 0) return;
       event.stopPropagation();
@@ -546,6 +865,7 @@ function renderNode(node) {
       };
       state.linkingActive = true;
       renderCanvas();
+      schedulePresencePublish(true);
     });
     const outLabel = document.createElement('div');
     outLabel.className = 'pin-label';
@@ -571,6 +891,8 @@ function renderNode(node) {
     appendOutPort('값', 'data-int');
   } else if (node.type === 'VAR_DECIMAL') {
     appendOutPort('값', 'data-decimal');
+  } else if (node.type === 'MATH_ADD') {
+    appendOutPort('값', 'data-any');
   } else {
     appendOutPort('다음', 'exec');
   }
@@ -582,19 +904,27 @@ function renderNode(node) {
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest('input, textarea, select, button')) return;
     state.selectedId = node.id;
+    state.selectedCommentId = null;
     hideContextMenu();
     renderCanvas();
+    schedulePresencePublish(true);
   });
 
   head.addEventListener('mousedown', (event) => {
     if (event.button !== 0) return;
     event.stopPropagation();
+    state.selectedId = node.id;
+    state.selectedCommentId = null;
+    hideContextMenu();
+    renderCanvas();
+    schedulePresencePublish(true);
     state.draggingNode = {
       id: node.id,
       startX: event.clientX,
       startY: event.clientY,
       nodeX: node.x,
-      nodeY: node.y
+      nodeY: node.y,
+      moved: false
     };
     document.body.style.userSelect = 'none';
   });
@@ -632,6 +962,86 @@ function getScaleBounds() {
   return { min: dynamicMin, max };
 }
 
+function renderRemotePresenceLayer() {
+  const staleBefore = Date.now() - 6000;
+  const activePeers = Object.values(realtimeState.peers).filter((peer) => peer && peer.lastSeen >= staleBefore);
+  for (const [clientId, peer] of Object.entries(realtimeState.peers)) {
+    if (!peer || peer.lastSeen < staleBefore) delete realtimeState.peers[clientId];
+  }
+  if (SHOW_SELF_PRESENCE_DEBUG) {
+    activePeers.push({
+      clientId: realtimeState.clientId,
+      color: '#ffffff',
+      presence: buildLocalPresence(),
+      lastSeen: Date.now()
+    });
+  }
+  const oldLayer = el.canvas.querySelector('.remote-presence-layer');
+  if (oldLayer) oldLayer.remove();
+  if (!activePeers.length) return;
+
+  const layer = document.createElement('div');
+  layer.className = 'remote-presence-layer';
+
+  for (const peer of activePeers) {
+    const p = peer.presence || {};
+    const color = peer.color || '#d4d8e0';
+    const pointer = p.pointer;
+
+    if (p.linking && p.linking.from) {
+      const from = p.linking.from;
+      const to = p.linking.to || pointer;
+      if (from && to) {
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('class', 'remote-link-preview');
+        svg.setAttribute('width', '100%');
+        svg.setAttribute('height', '100%');
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', linkPath(from, to));
+        path.setAttribute('stroke', color);
+        svg.appendChild(path);
+        layer.appendChild(svg);
+      }
+    }
+    if (p.commentDraft) {
+      const draft = p.commentDraft;
+      const x = Math.min(draft.startX || 0, draft.currentX || 0);
+      const y = Math.min(draft.startY || 0, draft.currentY || 0);
+      const width = Math.abs((draft.currentX || 0) - (draft.startX || 0));
+      const height = Math.abs((draft.currentY || 0) - (draft.startY || 0));
+      if (width > 1 && height > 1) {
+        const box = document.createElement('div');
+        box.className = 'remote-comment-draft';
+        box.style.left = `${Math.round(x)}px`;
+        box.style.top = `${Math.round(y)}px`;
+        box.style.width = `${Math.round(width)}px`;
+        box.style.height = `${Math.round(height)}px`;
+        box.style.setProperty('--remote-color', color);
+        layer.appendChild(box);
+      }
+    }
+    if (pointer) {
+      const cursor = document.createElement('div');
+      cursor.className = 'remote-cursor';
+      cursor.style.left = `${Math.round(pointer.x)}px`;
+      cursor.style.top = `${Math.round(pointer.y)}px`;
+      cursor.style.setProperty('--cursor-color', color);
+
+      const icon = document.createElement('div');
+      icon.className = 'remote-cursor-icon';
+      icon.innerHTML = `
+        <svg viewBox="-2 -2 28 28" aria-hidden="true">
+          <path d="M6.2 2.8c-.8-.5-1.8.1-1.8 1.1v16.6c0 1 .9 1.6 1.7 1.1l4.6-2.8 2.3 4.8c.3.7 1.1 1 1.8.7l1.2-.5c.7-.3 1.1-1.1.8-1.8l-2.3-4.8h5.4c1 0 1.4-1.3.6-1.9L6.2 2.8z"></path>
+        </svg>
+      `;
+      cursor.appendChild(icon);
+      layer.appendChild(cursor);
+    }
+  }
+
+  el.canvas.appendChild(layer);
+}
+
 function renderCanvas() {
   const bounds = getScaleBounds();
   if (state.scale > bounds.max) state.scale = bounds.max;
@@ -641,12 +1051,42 @@ function renderCanvas() {
   el.workspace.style.backgroundSize = `${24 * state.scale}px ${24 * state.scale}px, ${24 * state.scale}px ${24 * state.scale}px, auto`;
 
   el.canvas.innerHTML = '';
+  for (const comment of state.comments) {
+    renderComment(comment);
+  }
   for (const block of state.blocks) {
     renderNode(block);
   }
+  if (state.commentDraft) {
+    const draft = state.commentDraft;
+    const x = Math.min(draft.startX, draft.currentX);
+    const y = Math.min(draft.startY, draft.currentY);
+    const width = Math.abs(draft.currentX - draft.startX);
+    const height = Math.abs(draft.currentY - draft.startY);
+    const draftEl = document.createElement('div');
+    draftEl.className = 'comment-box draft';
+    draftEl.style.left = `${x}px`;
+    draftEl.style.top = `${y}px`;
+    draftEl.style.width = `${Math.max(1, width)}px`;
+    draftEl.style.height = `${Math.max(1, height)}px`;
+    el.canvas.appendChild(draftEl);
+  }
   renderLinksLayer();
+  renderRemotePresenceLayer();
 
   el.worldInfo.textContent = `x: ${Math.round(state.panX)}, y: ${Math.round(state.panY)}, 배율: ${(state.scale * 100).toFixed(0)}%`;
+}
+
+let relayoutRenderScheduled = false;
+function scheduleRelayoutRender() {
+  if (relayoutRenderScheduled) return;
+  relayoutRenderScheduled = true;
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      relayoutRenderScheduled = false;
+      renderCanvas();
+    });
+  });
 }
 
 function beginPan(event) {
@@ -695,11 +1135,13 @@ function showContextMenu(clientX, clientY, options = {}) {
     ? [
       ...NODE_LIBRARY.events.map((it) => ({ ...it, group: '이벤트', groupKey: 'event' })),
       ...NODE_LIBRARY.functions.map((it) => ({ ...it, group: '함수', groupKey: 'function' })),
+      ...NODE_LIBRARY.operations.map((it) => ({ ...it, group: '연산', groupKey: 'operation' })),
       ...NODE_LIBRARY.variables.map((it) => ({ ...it, group: '변수', groupKey: 'variable' }))
     ].filter((it) => canLinkKindToType(connectKind || linkKindFromType(connectFromType), it.type))
     : [
       ...NODE_LIBRARY.events.map((it) => ({ ...it, group: '이벤트', groupKey: 'event' })),
       ...NODE_LIBRARY.functions.map((it) => ({ ...it, group: '함수', groupKey: 'function' })),
+      ...NODE_LIBRARY.operations.map((it) => ({ ...it, group: '연산', groupKey: 'operation' })),
       ...NODE_LIBRARY.variables.map((it) => ({ ...it, group: '변수', groupKey: 'variable' }))
     ];
 
@@ -713,7 +1155,7 @@ function showContextMenu(clientX, clientY, options = {}) {
         || it.groupKey.toLowerCase().includes(q);
     });
 
-    const groups = ['이벤트', '함수', '변수'];
+    const groups = ['이벤트', '함수', '연산', '변수'];
     for (const group of groups) {
       const items = filtered.filter((it) => it.group === group);
       if (!items.length) continue;
@@ -730,7 +1172,13 @@ function showContextMenu(clientX, clientY, options = {}) {
         button.addEventListener('click', () => {
           const created = createNode(item.type, state.contextMenuWorld.x, state.contextMenuWorld.y);
           if (connectFromId && created) {
-            addLink(connectFromId, created.id, connectKind || linkKindFromType(connectFromType), connectPortClass);
+            addLink(
+              connectFromId,
+              created.id,
+              connectKind || linkKindFromType(connectFromType),
+              connectPortClass,
+              targetPortClassForLink(connectKind || linkKindFromType(connectFromType), created.type)
+            );
             renderCanvas();
           }
           hideContextMenu();
@@ -761,8 +1209,30 @@ function showNodeContextMenu(clientX, clientY, nodeId) {
 
   const title = document.createElement('div');
   title.className = 'context-title';
-  title.textContent = 'Node';
+  title.textContent = '노드';
   el.contextMenu.appendChild(title);
+
+  const disconnectAllBtn = document.createElement('button');
+  disconnectAllBtn.type = 'button';
+  disconnectAllBtn.className = 'context-item';
+  disconnectAllBtn.textContent = '모든 연결 끊기';
+  disconnectAllBtn.addEventListener('click', () => {
+    disconnectAllLinks(nodeId);
+    hideContextMenu();
+    renderCanvas();
+  });
+  el.contextMenu.appendChild(disconnectAllBtn);
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'context-item';
+  copyBtn.textContent = '복사';
+  copyBtn.addEventListener('click', () => {
+    duplicateNode(nodeId);
+    hideContextMenu();
+    renderCanvas();
+  });
+  el.contextMenu.appendChild(copyBtn);
 
   const deleteBtn = document.createElement('button');
   deleteBtn.type = 'button';
@@ -774,6 +1244,56 @@ function showNodeContextMenu(clientX, clientY, nodeId) {
     renderCanvas();
   });
   el.contextMenu.appendChild(deleteBtn);
+
+  const rect = el.workspace.getBoundingClientRect();
+  el.contextMenu.style.left = `${Math.max(8, Math.min(rect.width - 236, clientX - rect.left))}px`;
+  el.contextMenu.style.top = `${Math.max(8, Math.min(rect.height - 232, clientY - rect.top))}px`;
+  el.contextMenu.classList.remove('hidden');
+}
+
+function showCommentContextMenu(clientX, clientY, commentId) {
+  el.contextMenu.innerHTML = '';
+
+  const title = document.createElement('div');
+  title.className = 'context-title';
+  title.textContent = '그룹';
+  el.contextMenu.appendChild(title);
+
+  const deleteBtn = document.createElement('button');
+  deleteBtn.type = 'button';
+  deleteBtn.className = 'context-item';
+  deleteBtn.textContent = '삭제';
+  deleteBtn.addEventListener('click', () => {
+    removeComment(commentId);
+    hideContextMenu();
+    renderCanvas();
+  });
+  el.contextMenu.appendChild(deleteBtn);
+
+  const rect = el.workspace.getBoundingClientRect();
+  el.contextMenu.style.left = `${Math.max(8, Math.min(rect.width - 236, clientX - rect.left))}px`;
+  el.contextMenu.style.top = `${Math.max(8, Math.min(rect.height - 140, clientY - rect.top))}px`;
+  el.contextMenu.classList.remove('hidden');
+}
+
+function showPortContextMenu(clientX, clientY, nodeId, portType, portClass) {
+  el.contextMenu.innerHTML = '';
+
+  const title = document.createElement('div');
+  title.className = 'context-title';
+  title.textContent = '포트';
+  el.contextMenu.appendChild(title);
+
+  const disconnectBtn = document.createElement('button');
+  disconnectBtn.type = 'button';
+  disconnectBtn.className = 'context-item';
+  disconnectBtn.textContent = '모든 연결 끊기';
+  disconnectBtn.addEventListener('click', () => {
+    disconnectLinksByPort(nodeId, portType, portClass);
+    hideContextMenu();
+    renderCanvas();
+  });
+  el.contextMenu.appendChild(disconnectBtn);
 
   const rect = el.workspace.getBoundingClientRect();
   el.contextMenu.style.left = `${Math.max(8, Math.min(rect.width - 236, clientX - rect.left))}px`;
@@ -906,30 +1426,486 @@ function makeWorkspaceId(prefix) {
   return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
 }
 
-function saveWorkspaceState() {
-  const payload = {
+function buildWorkspacePersistencePayload() {
+  return {
     items: state.workspaceItems,
     snapshots: state.workspaceSnapshots,
     selectedWorkspaceId: state.selectedWorkspaceId,
-    currentWorkspaceId: state.currentWorkspaceId
+    currentWorkspaceId: state.currentWorkspaceId,
+    projectMeta: state.projectMeta
   };
-  localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(payload));
+}
+
+function saveWorkspaceState() {
+  // Local persistence disabled: draft is persisted on server.
+}
+
+function persistWorkspaceStateNow() {
+  if (historyState.applying) return;
+  snapshotCurrentWorkspace();
+  saveWorkspaceState();
+}
+
+async function saveServerDraftNow() {
+  if (autosaveState.serverInFlight || historyState.applying) return;
+  const payload = buildWorkspacePersistencePayload();
+  const serialized = JSON.stringify(payload);
+  if (!serialized || serialized === autosaveState.lastServerSerialized) return;
+  autosaveState.serverInFlight = true;
+  try {
+    const response = await fetch(withPrivateKey('/api/block-editor/draft'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: serialized
+    });
+    if (response.ok) autosaveState.lastServerSerialized = serialized;
+  } catch {
+    // ignore transient network errors
+  } finally {
+    autosaveState.serverInFlight = false;
+  }
+}
+
+function scheduleServerDraftPersist(immediate = false) {
+  if (immediate) {
+    if (autosaveState.serverTimer) {
+      clearTimeout(autosaveState.serverTimer);
+      autosaveState.serverTimer = null;
+    }
+    saveServerDraftNow();
+    return;
+  }
+  if (autosaveState.serverTimer) return;
+  autosaveState.serverTimer = setTimeout(() => {
+    autosaveState.serverTimer = null;
+    saveServerDraftNow();
+  }, 120);
+}
+
+function scheduleWorkspacePersist(immediate = false) {
+  if (immediate) {
+    if (autosaveState.timer) {
+      clearTimeout(autosaveState.timer);
+      autosaveState.timer = null;
+    }
+    persistWorkspaceStateNow();
+    scheduleServerDraftPersist(true);
+    return;
+  }
+  if (autosaveState.timer) return;
+  autosaveState.timer = setTimeout(() => {
+    autosaveState.timer = null;
+    persistWorkspaceStateNow();
+    scheduleServerDraftPersist(false);
+  }, 50);
 }
 
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function captureEditorState() {
+  snapshotCurrentWorkspace();
+  return {
+    projectMeta: cloneJson(state.projectMeta),
+    workspaceItems: cloneJson(state.workspaceItems),
+    workspaceSnapshots: cloneJson(state.workspaceSnapshots),
+    selectedWorkspaceId: state.selectedWorkspaceId,
+    currentWorkspaceId: state.currentWorkspaceId,
+    nodeClipboard: cloneJson(state.nodeClipboard),
+    selectedCommentId: state.selectedCommentId
+  };
+}
+
+function applyCapturedEditorState(serialized) {
+  let parsed;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    return;
+  }
+  historyState.applying = true;
+  try {
+    state.projectMeta = parsed?.projectMeta && typeof parsed.projectMeta === 'object'
+      ? cloneJson(parsed.projectMeta)
+      : { pluginId: 'aerogel-studio-plugin', pluginName: 'Aerogel Studio Plugin', version: '1.0.0' };
+    state.workspaceItems = Array.isArray(parsed?.workspaceItems) ? cloneJson(parsed.workspaceItems) : [];
+    state.workspaceSnapshots = parsed?.workspaceSnapshots && typeof parsed.workspaceSnapshots === 'object'
+      ? cloneJson(parsed.workspaceSnapshots)
+      : {};
+    state.selectedWorkspaceId = typeof parsed?.selectedWorkspaceId === 'string' ? parsed.selectedWorkspaceId : null;
+    state.currentWorkspaceId = typeof parsed?.currentWorkspaceId === 'string' ? parsed.currentWorkspaceId : null;
+    state.nodeClipboard = parsed?.nodeClipboard ? cloneJson(parsed.nodeClipboard) : null;
+    state.selectedCommentId = typeof parsed?.selectedCommentId === 'string' ? parsed.selectedCommentId : null;
+    state.clipboardPasteCount = 0;
+
+    ensureWorkspaceDefaults();
+    normalizeAllWorkspaceOrders();
+    if (!getWorkspaceById(state.selectedWorkspaceId)) {
+      state.selectedWorkspaceId = state.workspaceItems.find((it) => it.kind === 'workspace')?.id || null;
+    }
+    if (!getWorkspaceById(state.currentWorkspaceId)) {
+      state.currentWorkspaceId = state.selectedWorkspaceId;
+    }
+    applyWorkspaceSnapshot(state.currentWorkspaceId || state.selectedWorkspaceId);
+    renderWorkspaceTree();
+    showCanvasView();
+    saveWorkspaceState();
+  } finally {
+    historyState.applying = false;
+  }
+}
+
+function commitHistoryState(clearRedo = true) {
+  if (historyState.applying) return;
+  const serialized = JSON.stringify(captureEditorState());
+  if (serialized === historyState.lastSerialized) return;
+  historyState.undo.push(serialized);
+  if (historyState.undo.length > HISTORY_LIMIT) historyState.undo.shift();
+  historyState.lastSerialized = serialized;
+  if (clearRedo) historyState.redo = [];
+  scheduleWorkspacePersist(true);
+  scheduleCollaborativePublish(true);
+}
+
+function undoHistory() {
+  if (historyState.undo.length <= 1) return;
+  const currentSerialized = historyState.undo.pop();
+  if (currentSerialized) historyState.redo.push(currentSerialized);
+  const prevSerialized = historyState.undo[historyState.undo.length - 1];
+  if (!prevSerialized) return;
+  applyCapturedEditorState(prevSerialized);
+  historyState.lastSerialized = prevSerialized;
+}
+
+function redoHistory() {
+  if (!historyState.redo.length) return;
+  const nextSerialized = historyState.redo.pop();
+  if (!nextSerialized) return;
+  applyCapturedEditorState(nextSerialized);
+  historyState.undo.push(nextSerialized);
+  if (historyState.undo.length > HISTORY_LIMIT) historyState.undo.shift();
+  historyState.lastSerialized = nextSerialized;
+}
+
+function captureCollaborativeState() {
+  snapshotCurrentWorkspace();
+  const snapshots = {};
+  for (const [workspaceId, snapshot] of Object.entries(state.workspaceSnapshots || {})) {
+    if (!snapshot || typeof snapshot !== 'object') continue;
+    snapshots[workspaceId] = {
+      comments: Array.isArray(snapshot.comments) ? cloneJson(snapshot.comments) : [],
+      blocks: Array.isArray(snapshot.blocks) ? cloneJson(snapshot.blocks) : [],
+      links: Array.isArray(snapshot.links) ? cloneJson(snapshot.links) : [],
+      nextId: Number.isFinite(snapshot.nextId) ? snapshot.nextId : 1,
+      nextCommentId: Number.isFinite(snapshot.nextCommentId) ? snapshot.nextCommentId : 1
+    };
+  }
+  return {
+    projectMeta: cloneJson(state.projectMeta),
+    workspaceItems: cloneJson(state.workspaceItems),
+    workspaceSnapshots: snapshots
+  };
+}
+
+function applyCollaborativeStateFromRemote(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const incomingItems = Array.isArray(payload.workspaceItems) ? payload.workspaceItems : null;
+  const incomingSnapshots = payload.workspaceSnapshots && typeof payload.workspaceSnapshots === 'object'
+    ? payload.workspaceSnapshots
+    : null;
+  if (!incomingItems || !incomingSnapshots) return;
+
+  realtimeState.suspended = true;
+  historyState.applying = true;
+  try {
+    const localConnectionDraft = state.connectionDraft && state.linkingActive
+      ? cloneJson(state.connectionDraft)
+      : null;
+    const currentWsId = state.currentWorkspaceId;
+    const localCurrentSnapshot = currentWsId ? state.workspaceSnapshots[currentWsId] : null;
+    const localPanX = Number.isFinite(localCurrentSnapshot?.panX) ? localCurrentSnapshot.panX : state.panX;
+    const localPanY = Number.isFinite(localCurrentSnapshot?.panY) ? localCurrentSnapshot.panY : state.panY;
+    const localScale = Number.isFinite(localCurrentSnapshot?.scale) ? localCurrentSnapshot.scale : state.scale;
+
+    if (payload.projectMeta && typeof payload.projectMeta === 'object') {
+      state.projectMeta = cloneJson(payload.projectMeta);
+    }
+    state.workspaceItems = cloneJson(incomingItems);
+
+    const nextSnapshots = {};
+    for (const [workspaceId, incomingSnapshot] of Object.entries(incomingSnapshots)) {
+      const localSnapshot = state.workspaceSnapshots[workspaceId];
+      nextSnapshots[workspaceId] = {
+        comments: Array.isArray(incomingSnapshot?.comments) ? cloneJson(incomingSnapshot.comments) : [],
+        blocks: Array.isArray(incomingSnapshot?.blocks) ? cloneJson(incomingSnapshot.blocks) : [],
+        links: Array.isArray(incomingSnapshot?.links) ? cloneJson(incomingSnapshot.links) : [],
+        panX: Number.isFinite(localSnapshot?.panX) ? localSnapshot.panX : 0,
+        panY: Number.isFinite(localSnapshot?.panY) ? localSnapshot.panY : 0,
+        scale: Number.isFinite(localSnapshot?.scale) ? localSnapshot.scale : 1,
+        nextId: Number.isFinite(incomingSnapshot?.nextId) ? incomingSnapshot.nextId : 1,
+        nextCommentId: Number.isFinite(incomingSnapshot?.nextCommentId) ? incomingSnapshot.nextCommentId : 1
+      };
+    }
+    state.workspaceSnapshots = nextSnapshots;
+
+    ensureWorkspaceDefaults();
+    normalizeAllWorkspaceOrders();
+    if (!getWorkspaceById(state.selectedWorkspaceId)) {
+      state.selectedWorkspaceId = state.workspaceItems.find((it) => it.kind === 'workspace')?.id || null;
+    }
+    if (!getWorkspaceById(state.currentWorkspaceId)) {
+      state.currentWorkspaceId = state.selectedWorkspaceId;
+    }
+
+    applyWorkspaceSnapshot(state.currentWorkspaceId || state.selectedWorkspaceId);
+    state.panX = localPanX;
+    state.panY = localPanY;
+    state.scale = localScale;
+    state.connectionDraft = null;
+    state.linkingActive = false;
+    if (localConnectionDraft && typeof localConnectionDraft.from === 'string') {
+      const fromNode = state.blocks.find((it) => it.id === localConnectionDraft.from);
+      if (fromNode) {
+        const restoredKind = localConnectionDraft.kind || linkKindFromType(fromNode.type);
+        const restoredFromPortClass = localConnectionDraft.fromPortClass || `out-${restoredKind}`;
+        let restoredSnapTargetId = localConnectionDraft.snapTargetId || null;
+        let restoredSnapTargetPort = localConnectionDraft.snapTargetPort || null;
+        if (restoredSnapTargetId) {
+          const targetNode = state.blocks.find((it) => it.id === restoredSnapTargetId);
+          if (!targetNode || !canLinkKindToType(restoredKind, targetNode.type)) {
+            restoredSnapTargetId = null;
+            restoredSnapTargetPort = null;
+          }
+        }
+        state.connectionDraft = {
+          from: localConnectionDraft.from,
+          kind: restoredKind,
+          fromPortClass: restoredFromPortClass,
+          previousTargets: Array.isArray(localConnectionDraft.previousTargets)
+            ? localConnectionDraft.previousTargets.filter((id) => state.blocks.some((it) => it.id === id))
+            : [],
+          snapTargetId: restoredSnapTargetId,
+          snapTargetPort: restoredSnapTargetPort
+        };
+        state.linkingActive = true;
+      }
+    }
+    state.draggingNode = null;
+    state.draggingComment = null;
+    state.resizingComment = null;
+    state.commentDraft = null;
+    renderWorkspaceTree();
+    renderCanvas();
+    saveWorkspaceState();
+    historyState.lastSerialized = JSON.stringify(captureEditorState());
+  } finally {
+    historyState.applying = false;
+    realtimeState.suspended = false;
+  }
+}
+
+async function publishCollaborativeStateNow() {
+  if (realtimeState.suspended || !realtimeState.connected || realtimeState.publishInFlight) return;
+  const collabState = captureCollaborativeState();
+  const serialized = JSON.stringify(collabState);
+  if (!serialized || serialized === realtimeState.lastPublishedSerialized) return;
+  realtimeState.publishInFlight = true;
+  try {
+    const response = await fetch(withPrivateKey('/api/block-editor/realtime/publish'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientId: realtimeState.clientId,
+        type: 'state',
+        payload: collabState
+      })
+    });
+    if (response.ok) {
+      realtimeState.lastPublishedSerialized = serialized;
+    }
+  } catch {
+    // ignore transient realtime failures
+  } finally {
+    realtimeState.publishInFlight = false;
+  }
+}
+
+function scheduleCollaborativePublish(immediate = false) {
+  scheduleWorkspacePersist(immediate);
+  if (realtimeState.suspended) return;
+  if (immediate) {
+    if (realtimeState.publishTimer) {
+      clearTimeout(realtimeState.publishTimer);
+      realtimeState.publishTimer = null;
+    }
+    publishCollaborativeStateNow();
+    return;
+  }
+  if (realtimeState.publishTimer) return;
+  realtimeState.publishTimer = setTimeout(() => {
+    realtimeState.publishTimer = null;
+    publishCollaborativeStateNow();
+  }, 24);
+}
+
+function buildLocalPresence() {
+  const pointer = {
+    x: Number.isFinite(state.mouseWorld.x) ? state.mouseWorld.x : 0,
+    y: Number.isFinite(state.mouseWorld.y) ? state.mouseWorld.y : 0
+  };
+  const draggingNode = state.draggingNode
+    ? (() => {
+      const block = state.blocks.find((it) => it.id === state.draggingNode.id);
+      if (!block) return null;
+      return { id: block.id, x: block.x, y: block.y };
+    })()
+    : null;
+  const draggingComment = state.draggingComment
+    ? (() => {
+      const comment = state.comments.find((it) => it.id === state.draggingComment.id);
+      if (!comment) return null;
+      return { id: comment.id, x: comment.x, y: comment.y, width: comment.width, height: comment.height };
+    })()
+    : null;
+  const resizingComment = state.resizingComment
+    ? (() => {
+      const comment = state.comments.find((it) => it.id === state.resizingComment.id);
+      if (!comment) return null;
+      return { id: comment.id, x: comment.x, y: comment.y, width: comment.width, height: comment.height };
+    })()
+    : null;
+  const linking = state.connectionDraft && state.linkingActive
+    ? (() => {
+      const from = getPortCenterWorld(state.connectionDraft.from, state.connectionDraft.fromPortClass || 'out');
+      const to = state.connectionDraft.snapTargetId
+        ? (getPortCenterWorld(state.connectionDraft.snapTargetId, state.connectionDraft.snapTargetPort || 'in-exec') || state.mouseWorld)
+        : state.mouseWorld;
+      return {
+        from: from || pointer,
+        to: to || pointer,
+        kind: state.connectionDraft.kind || 'exec'
+      };
+    })()
+    : null;
+  const commentDraft = state.commentDraft
+    ? {
+      startX: state.commentDraft.startX,
+      startY: state.commentDraft.startY,
+      currentX: state.commentDraft.currentX,
+      currentY: state.commentDraft.currentY
+    }
+    : null;
+
+  return {
+    pointer,
+    selectedNodeId: state.selectedId || null,
+    selectedCommentId: state.selectedCommentId || null,
+    draggingNode,
+    draggingComment,
+    resizingComment,
+    linking,
+    commentDraft
+  };
+}
+
+async function publishPresenceNow() {
+  if (realtimeState.suspended || !realtimeState.connected || realtimeState.presenceInFlight) return;
+  const presence = buildLocalPresence();
+  const serialized = JSON.stringify(presence);
+  if (!serialized || serialized === realtimeState.lastPresenceSerialized) return;
+  realtimeState.presenceInFlight = true;
+  try {
+    const response = await fetch(withPrivateKey('/api/block-editor/realtime/publish'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientId: realtimeState.clientId,
+        type: 'presence',
+        payload: presence
+      })
+    });
+    if (response.ok) realtimeState.lastPresenceSerialized = serialized;
+  } catch {
+    // ignore
+  } finally {
+    realtimeState.presenceInFlight = false;
+  }
+}
+
+function schedulePresencePublish(immediate = false) {
+  if (realtimeState.suspended) return;
+  if (immediate) {
+    if (realtimeState.presenceTimer) {
+      clearTimeout(realtimeState.presenceTimer);
+      realtimeState.presenceTimer = null;
+    }
+    publishPresenceNow();
+    return;
+  }
+  if (realtimeState.presenceTimer) return;
+  realtimeState.presenceTimer = setTimeout(() => {
+    realtimeState.presenceTimer = null;
+    publishPresenceNow();
+  }, 16);
+}
+
+function connectCollaborativeRealtime() {
+  if (realtimeState.eventSource) return;
+  const streamUrl = withPrivateKey(`/api/block-editor/realtime/stream?clientId=${encodeURIComponent(realtimeState.clientId)}`);
+  const es = new EventSource(streamUrl);
+  realtimeState.eventSource = es;
+  es.onopen = () => {
+    realtimeState.connected = true;
+    scheduleCollaborativePublish(true);
+    schedulePresencePublish(true);
+  };
+  es.onerror = () => {
+    realtimeState.connected = false;
+  };
+  es.onmessage = (event) => {
+    if (!event?.data) return;
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    const sender = typeof payload?.clientId === 'string' ? payload.clientId : '';
+    const type = typeof payload?.type === 'string' ? payload.type : 'state';
+    const body = payload?.payload ?? payload?.state;
+    if (!body || sender === realtimeState.clientId) return;
+    if (type === 'state') {
+      const incomingSerialized = JSON.stringify(body);
+      const localSerialized = JSON.stringify(captureCollaborativeState());
+      if (incomingSerialized === localSerialized) return;
+      applyCollaborativeStateFromRemote(body);
+      return;
+    }
+    if (type === 'presence') {
+      realtimeState.peers[sender] = {
+        clientId: sender,
+        color: colorForClient(sender),
+        presence: body,
+        lastSeen: Date.now()
+      };
+      renderRemotePresenceLayer();
+    }
+  };
+}
+
 function snapshotCurrentWorkspace() {
   const current = state.currentWorkspaceId ? getWorkspaceById(state.currentWorkspaceId) : null;
   if (!current || current.kind !== 'workspace') return;
   state.workspaceSnapshots[current.id] = {
+    comments: cloneJson(state.comments),
     blocks: cloneJson(state.blocks),
     links: cloneJson(state.links),
     panX: state.panX,
     panY: state.panY,
     scale: state.scale,
-    nextId: state.nextId
+    nextId: state.nextId,
+    nextCommentId: state.nextCommentId
   };
 }
 
@@ -939,10 +1915,13 @@ function applyWorkspaceSnapshot(workspaceId) {
   state.currentWorkspaceId = workspaceId;
   const snapshot = state.workspaceSnapshots[workspaceId];
   if (!snapshot) {
+    state.comments = [];
     state.blocks = [];
     state.links = [];
     state.nextId = 1;
+    state.nextCommentId = 1;
     state.selectedId = null;
+    state.selectedCommentId = null;
     state.panX = 0;
     state.panY = 0;
     state.scale = 1;
@@ -950,13 +1929,21 @@ function applyWorkspaceSnapshot(workspaceId) {
     renderCanvas();
     return;
   }
+  state.comments = Array.isArray(snapshot.comments) ? cloneJson(snapshot.comments) : [];
   state.blocks = Array.isArray(snapshot.blocks) ? cloneJson(snapshot.blocks) : [];
   state.links = Array.isArray(snapshot.links) ? cloneJson(snapshot.links) : [];
   state.nextId = Number.isFinite(snapshot.nextId) ? snapshot.nextId : (state.blocks.reduce((acc, it) => {
     const numeric = Number(String(it.id).replace(/^n/, ''));
     return Number.isFinite(numeric) ? Math.max(acc, numeric + 1) : acc;
   }, 1));
-  state.selectedId = state.blocks[0]?.id ?? null;
+  state.nextCommentId = Number.isFinite(snapshot.nextCommentId)
+    ? snapshot.nextCommentId
+    : (state.comments.reduce((acc, it) => {
+      const numeric = Number(String(it.id).replace(/^c/, ''));
+      return Number.isFinite(numeric) ? Math.max(acc, numeric + 1) : acc;
+    }, 1));
+  state.selectedId = null;
+  state.selectedCommentId = null;
   state.panX = Number.isFinite(snapshot.panX) ? snapshot.panX : 0;
   state.panY = Number.isFinite(snapshot.panY) ? snapshot.panY : 0;
   state.scale = Number.isFinite(snapshot.scale) ? snapshot.scale : 1;
@@ -973,103 +1960,10 @@ function selectWorkspace(workspaceId) {
   renderWorkspaceTree();
 }
 
-let standaloneCodeEditor = null;
-let codeEditorBindingId = null;
-let syncingCodeEditor = false;
-let monacoReadyPromise = null;
-
-function ensureMonacoReady() {
-  if (window.monaco?.editor) return Promise.resolve(window.monaco);
-  if (monacoReadyPromise) return monacoReadyPromise;
-  monacoReadyPromise = new Promise((resolve, reject) => {
-    if (!window.require) {
-      reject(new Error('Monaco loader not found'));
-      return;
-    }
-    window.require.config({
-      paths: {
-        vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs'
-      }
-    });
-    window.require(['vs/editor/editor.main'], () => {
-      if (window.monaco?.editor) resolve(window.monaco);
-      else reject(new Error('Monaco init failed'));
-    }, reject);
-  });
-  return monacoReadyPromise;
-}
-
-async function ensureStandaloneCodeEditor() {
-  if (standaloneCodeEditor) return standaloneCodeEditor;
-  const monaco = await ensureMonacoReady();
-  const hasKotlin = monaco.languages.getLanguages().some((it) => it.id === 'kotlin');
-  monaco.editor.defineTheme('aerogel-dark', {
-    base: 'vs-dark',
-    inherit: true,
-    rules: [
-      { token: '', foreground: 'D8DADF' },
-      { token: 'comment', foreground: '7F848E' },
-      { token: 'keyword', foreground: 'C9AB6B' },
-      { token: 'string', foreground: 'A8C28F' },
-      { token: 'number', foreground: 'C79C8A' },
-      { token: 'type.identifier', foreground: 'B8BCC8' },
-      { token: 'delimiter', foreground: '9096A2' }
-    ],
-    colors: {
-      'editor.background': '#111216',
-      'editor.foreground': '#D8DADF',
-      'editorLineNumber.foreground': '#5D6370',
-      'editorLineNumber.activeForeground': '#9BA2B1',
-      'editorCursor.foreground': '#D9DCE2',
-      'editor.selectionBackground': '#2B303A',
-      'editor.inactiveSelectionBackground': '#222730',
-      'editorIndentGuide.background1': '#2A2F39',
-      'editorIndentGuide.activeBackground1': '#424A58',
-      'editorGutter.background': '#111216'
-    }
-  });
-  standaloneCodeEditor = monaco.editor.create(el.standaloneCodeEditor, {
-    value: '',
-    language: hasKotlin ? 'kotlin' : 'java',
-    theme: 'aerogel-dark',
-    minimap: { enabled: false },
-    automaticLayout: true,
-    fontSize: 13,
-    mouseWheelZoom: true,
-    lineNumbers: 'on',
-    wordWrap: 'on',
-    scrollBeyondLastLine: false
-  });
-  standaloneCodeEditor.onDidChangeModelContent(() => {
-    if (syncingCodeEditor) return;
-    if (!codeEditorBindingId) return;
-    const item = getWorkspaceById(codeEditorBindingId);
-    if (!item || item.kind !== 'code') return;
-    item.code = standaloneCodeEditor.getValue();
-    saveWorkspaceState();
-  });
-  return standaloneCodeEditor;
-}
-
 function showCanvasView() {
   el.workspaceToolbar.classList.remove('hidden');
   el.workspace.classList.remove('hidden');
-  el.codeEditorPane.classList.add('hidden');
   renderCanvas();
-}
-
-async function showCodeEditorView(codeId) {
-  const item = getWorkspaceById(codeId);
-  if (!item || item.kind !== 'code') return;
-  const editor = await ensureStandaloneCodeEditor();
-  codeEditorBindingId = codeId;
-  el.workspaceToolbar.classList.add('hidden');
-  el.workspace.classList.add('hidden');
-  el.codeEditorPane.classList.remove('hidden');
-  syncingCodeEditor = true;
-  editor.setValue(item.code || "// Kotlin 코드 작성\n");
-  syncingCodeEditor = false;
-  editor.layout();
 }
 
 function normalizeWorkspacePluginId(raw, fallbackId) {
@@ -1097,8 +1991,6 @@ function normalizeWorkspaceOrders(parentId, kind) {
   const siblings = state.workspaceItems
     .filter((it) => {
       if ((it.parentId || null) !== (parentId || null)) return false;
-      if (kind === 'folder') return it.kind === 'folder';
-      if (isLeafWorkspaceKind(kind)) return isLeafWorkspaceKind(it.kind);
       return it.kind === kind;
     })
     .sort((a, b) => {
@@ -1120,22 +2012,9 @@ function normalizeAllWorkspaceOrders() {
   }
 }
 
-function workspaceKindRank(kind) {
-  if (kind === 'folder') return 0;
-  if (kind === 'workspace') return 1;
-  if (kind === 'code') return 2;
-  return 3;
-}
-
-function isLeafWorkspaceKind(kind) {
-  return kind === 'workspace' || kind === 'code';
-}
-
 function nextWorkspaceOrder(parentId, kind) {
   const siblings = state.workspaceItems.filter((it) => {
     if ((it.parentId || null) !== (parentId || null)) return false;
-    if (kind === 'folder') return it.kind === 'folder';
-    if (isLeafWorkspaceKind(kind)) return isLeafWorkspaceKind(it.kind);
     return it.kind === kind;
   });
   if (!siblings.length) return 1;
@@ -1216,12 +2095,7 @@ function renderWorkspaceTree() {
       row.appendChild(indent);
 
       const toggle = document.createElement('span');
-      if (item.kind === 'code') {
-        toggle.className = 'workspace-code-icon';
-        toggle.style.background = 'url("/static/code-item.svg") no-repeat center / 12px 12px';
-      } else {
-        toggle.className = isFolder ? 'workspace-toggle' : 'workspace-dot';
-      }
+      toggle.className = isFolder ? 'workspace-toggle' : 'workspace-dot';
       toggle.dataset.role = isFolder ? 'toggle' : 'dot';
       row.appendChild(toggle);
 
@@ -1259,30 +2133,42 @@ function ensureWorkspaceDefaults() {
 }
 
 function loadWorkspaceState() {
+  state.workspaceItems = [];
+  state.workspaceSnapshots = {};
+  state.selectedWorkspaceId = null;
+  state.currentWorkspaceId = null;
+  ensureWorkspaceDefaults();
+  normalizeAllWorkspaceOrders();
+}
+
+async function loadServerDraft() {
   try {
-    const raw = localStorage.getItem(WORKSPACE_STORAGE_KEY);
-  if (!raw) {
-      state.workspaceItems = [];
-      state.workspaceSnapshots = {};
-      state.selectedWorkspaceId = null;
-      ensureWorkspaceDefaults();
-      saveWorkspaceState();
-      return;
+    const response = await fetch(withPrivateKey('/api/block-editor/draft'));
+    if (!response.ok) return false;
+    const data = await response.json();
+    if (!data?.ok || !data?.draft || typeof data.draft !== 'object') return false;
+    autosaveState.lastServerSerialized = JSON.stringify(data.draft);
+    const parsed = data.draft;
+    if (parsed?.projectMeta && typeof parsed.projectMeta === 'object') {
+      state.projectMeta = {
+        pluginId: String(parsed.projectMeta.pluginId || state.projectMeta.pluginId || 'aerogel-studio-plugin'),
+        pluginName: String(parsed.projectMeta.pluginName || state.projectMeta.pluginName || 'Aerogel Studio Plugin'),
+        version: String(parsed.projectMeta.version || state.projectMeta.version || '1.0.0')
+      };
     }
-    const parsed = JSON.parse(raw);
     const items = Array.isArray(parsed.items) ? parsed.items : [];
     const snapshots = parsed && typeof parsed.snapshots === 'object' && parsed.snapshots
       ? parsed.snapshots
       : {};
     state.workspaceItems = items
-      .filter((it) => it && (it.kind === 'folder' || it.kind === 'workspace' || it.kind === 'code') && typeof it.name === 'string')
+      .filter((it) => it && (it.kind === 'folder' || it.kind === 'workspace') && typeof it.name === 'string')
       .map((it) => ({
         id: typeof it.id === 'string'
           ? it.id
-          : makeWorkspaceId(it.kind === 'folder' ? 'fld' : (it.kind === 'code' ? 'cd' : 'ws')),
+          : makeWorkspaceId(it.kind === 'folder' ? 'fld' : 'ws'),
         kind: it.kind,
         parentId: typeof it.parentId === 'string' ? it.parentId : null,
-        name: it.name.trim() || (it.kind === 'folder' ? '새 폴더' : (it.kind === 'code' ? '새 코드' : '새 작업 공간')),
+        name: it.name.trim() || (it.kind === 'folder' ? '새 폴더' : '새 작업 공간'),
         expanded: it.kind === 'folder' ? it.expanded !== false : undefined,
         order: Number.isFinite(it.order) ? it.order : 0
       }));
@@ -1292,12 +2178,14 @@ function loadWorkspaceState() {
     for (const [id, snapshot] of Object.entries(snapshots)) {
       if (!snapshot || typeof snapshot !== 'object') continue;
       state.workspaceSnapshots[id] = {
+        comments: Array.isArray(snapshot.comments) ? snapshot.comments : [],
         blocks: Array.isArray(snapshot.blocks) ? snapshot.blocks : [],
         links: Array.isArray(snapshot.links) ? snapshot.links : [],
         panX: Number.isFinite(snapshot.panX) ? snapshot.panX : 0,
         panY: Number.isFinite(snapshot.panY) ? snapshot.panY : 0,
         scale: Number.isFinite(snapshot.scale) ? snapshot.scale : 1,
-        nextId: Number.isFinite(snapshot.nextId) ? snapshot.nextId : 1
+        nextId: Number.isFinite(snapshot.nextId) ? snapshot.nextId : 1,
+        nextCommentId: Number.isFinite(snapshot.nextCommentId) ? snapshot.nextCommentId : 1
       };
     }
     if (!getWorkspaceById(state.selectedWorkspaceId)) {
@@ -1312,13 +2200,9 @@ function loadWorkspaceState() {
     state.workspaceSnapshots = Object.fromEntries(
       Object.entries(state.workspaceSnapshots).filter(([id]) => validWorkspaceIds.has(id))
     );
-  } catch (error) {
-    state.workspaceItems = [];
-    state.workspaceSnapshots = {};
-    state.selectedWorkspaceId = null;
-    state.currentWorkspaceId = null;
-    ensureWorkspaceDefaults();
-    normalizeAllWorkspaceOrders();
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1326,12 +2210,12 @@ async function addWorkspaceItem(kind) {
   const selected = state.selectedWorkspaceId ? getWorkspaceById(state.selectedWorkspaceId) : null;
   const parentId = selected?.kind === 'folder' ? selected.id : (selected?.parentId || null);
   const name = await requestNameDialog(
-    kind === 'folder' ? '폴더 이름 입력' : (kind === 'code' ? '코드 이름 입력' : '작업 공간 이름 입력'),
-    kind === 'folder' ? '예: 콘텐츠' : (kind === 'code' ? '예: 경제 시스템 코드' : '예: 기본 시스템')
+    kind === 'folder' ? '폴더 이름 입력' : '작업 공간 이름 입력',
+    kind === 'folder' ? '예: 콘텐츠' : '예: 기본 시스템'
   );
   if (!name || !name.trim()) return;
 
-  const id = makeWorkspaceId(kind === 'folder' ? 'fld' : (kind === 'code' ? 'cd' : 'ws'));
+  const id = makeWorkspaceId(kind === 'folder' ? 'fld' : 'ws');
   const item = {
     id,
     kind,
@@ -1339,30 +2223,26 @@ async function addWorkspaceItem(kind) {
     name: name.trim(),
     order: nextWorkspaceOrder(parentId, kind)
   };
-  if (kind === 'code') item.code = "// Kotlin 코드 작성\n";
   if (kind === 'folder') item.expanded = true;
   state.workspaceItems.push(item);
   if (kind === 'workspace') {
     state.workspaceSnapshots[id] = {
+      comments: [],
       blocks: [],
       links: [],
       panX: 0,
       panY: 0,
       scale: 1,
-      nextId: 1
+      nextId: 1,
+      nextCommentId: 1
     };
     selectWorkspace(id);
-    return;
-  } else if (kind === 'code') {
-    snapshotCurrentWorkspace();
-    state.selectedWorkspaceId = id;
-    saveWorkspaceState();
-    renderWorkspaceTree();
-    showCodeEditorView(id).catch((error) => setResult(String(error)));
+    commitHistoryState();
     return;
   }
   saveWorkspaceState();
   renderWorkspaceTree();
+  commitHistoryState();
 }
 
 function isFolderDescendant(folderId, potentialAncestorId) {
@@ -1390,14 +2270,14 @@ function moveItemToFolder(itemId, folderId) {
   normalizeWorkspaceOrders(item.parentId || null, item.kind);
   saveWorkspaceState();
   renderWorkspaceTree();
+  commitHistoryState();
 }
 
 function moveItemRelative(itemId, targetItemId, placeAfter) {
   const item = getWorkspaceById(itemId);
   const target = getWorkspaceById(targetItemId);
   if (!item || !target) return;
-  const sameGroup = (item.kind === 'folder' && target.kind === 'folder')
-    || (isLeafWorkspaceKind(item.kind) && isLeafWorkspaceKind(target.kind));
+  const sameGroup = item.kind === target.kind;
   if (!sameGroup) return;
   if (item.id === target.id) return;
   if (item.kind === 'folder' && isFolderDescendant(target.id, item.id)) return;
@@ -1410,6 +2290,7 @@ function moveItemRelative(itemId, targetItemId, placeAfter) {
   normalizeWorkspaceOrders(newParentId, item.kind);
   saveWorkspaceState();
   renderWorkspaceTree();
+  commitHistoryState();
 }
 
 async function removeWorkspaceItem(itemId) {
@@ -1473,13 +2354,14 @@ async function removeWorkspaceItem(itemId) {
   }
   saveWorkspaceState();
   renderWorkspaceTree();
+  commitHistoryState();
 }
 
 async function renameWorkspaceItem(itemId) {
   const item = getWorkspaceById(itemId);
   if (!item) return;
   const nextName = await requestNameDialog(
-    item.kind === 'folder' ? '폴더 이름 변경' : (item.kind === 'code' ? '코드 이름 변경' : '작업 공간 이름 변경'),
+    item.kind === 'folder' ? '폴더 이름 변경' : '작업 공간 이름 변경',
     '새 이름 입력',
     item.name
   );
@@ -1487,10 +2369,11 @@ async function renameWorkspaceItem(itemId) {
   item.name = nextName.trim();
   saveWorkspaceState();
   renderWorkspaceTree();
+  commitHistoryState();
 }
 
 async function refreshPluginList() {
-  const response = await fetch('/api/block-editor/plugins');
+  const response = await fetch(withPrivateKey('/api/block-editor/plugins'));
   const data = await response.json();
   if (!data.ok) {
     setResult(data);
@@ -1527,7 +2410,7 @@ async function loadSelectedPlugin() {
     return;
   }
 
-  const response = await fetch(`/api/block-editor/load?jar=${encodeURIComponent(jar)}`);
+  const response = await fetch(withPrivateKey(`/api/block-editor/load?jar=${encodeURIComponent(jar)}`));
   const data = await response.json();
   if (!data.ok) {
     setResult(data);
@@ -1561,7 +2444,8 @@ async function loadSelectedPlugin() {
       from: it.from,
       to: it.to,
       kind: typeof it.kind === 'string' ? it.kind : undefined,
-      fromPortClass: typeof it.fromPortClass === 'string' ? it.fromPortClass : undefined
+      fromPortClass: typeof it.fromPortClass === 'string' ? it.fromPortClass : undefined,
+      toPortClass: typeof it.toPortClass === 'string' ? it.toPortClass : undefined
     }));
 
   state.nextId = state.blocks.reduce((acc, it) => {
@@ -1569,7 +2453,10 @@ async function loadSelectedPlugin() {
     return Number.isFinite(numeric) ? Math.max(acc, numeric + 1) : acc;
   }, 1);
 
-  state.selectedId = state.blocks[0]?.id ?? null;
+  state.selectedId = null;
+  state.comments = [];
+  state.nextCommentId = 1;
+  state.selectedCommentId = null;
   state.panX = 0;
   state.panY = 0;
   state.scale = 1;
@@ -1578,6 +2465,7 @@ async function loadSelectedPlugin() {
   snapshotCurrentWorkspace();
   saveWorkspaceState();
   renderCanvas();
+  commitHistoryState();
   setResult({ ok: true, loadedFrom: jar, blockCount: state.blocks.length, linkCount: state.links.length });
 }
 
@@ -1602,12 +2490,13 @@ async function saveProject() {
       from: link.from,
       to: link.to,
       kind: link.kind,
-      fromPortClass: link.fromPortClass
+      fromPortClass: link.fromPortClass,
+      toPortClass: link.toPortClass
     }))
   };
 
   setResult('저장 중...');
-  const response = await fetch('/api/block-editor/save', {
+  const response = await fetch(withPrivateKey('/api/block-editor/save'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -1659,10 +2548,6 @@ function installEvents() {
     closeWorkspaceTreeMenu();
     await addWorkspaceItem('workspace');
   });
-  el.addCodeMenuBtn.addEventListener('click', async () => {
-    closeWorkspaceTreeMenu();
-    await addWorkspaceItem('code');
-  });
   el.renameWorkspaceMenuBtn.addEventListener('click', async () => {
     const targetId = state.workspaceMenuTargetId;
     closeWorkspaceTreeMenu();
@@ -1694,12 +2579,6 @@ function installEvents() {
     if (item.kind === 'workspace') {
       selectWorkspace(item.id);
       showCanvasView();
-    } else {
-      snapshotCurrentWorkspace();
-      state.selectedWorkspaceId = item.id;
-      saveWorkspaceState();
-      renderWorkspaceTree();
-      showCodeEditorView(item.id).catch((error) => setResult(String(error)));
     }
   });
   el.workspaceTree.addEventListener('dragstart', (event) => {
@@ -1743,10 +2622,7 @@ function installEvents() {
     } else if (
       targetId
       && targetId !== state.draggingItemId
-      && (
-        targetKind === state.draggingItemKind
-        || (isLeafWorkspaceKind(targetKind) && isLeafWorkspaceKind(state.draggingItemKind))
-      )
+      && targetKind === state.draggingItemKind
     ) {
       nextItemId = targetId;
       const rect = target.getBoundingClientRect();
@@ -1805,12 +2681,6 @@ function installEvents() {
       if (item?.kind === 'workspace') {
         selectWorkspace(targetId);
         showCanvasView();
-      } else {
-        snapshotCurrentWorkspace();
-        state.selectedWorkspaceId = targetId;
-        saveWorkspaceState();
-        renderWorkspaceTree();
-        if (item?.kind === 'code') showCodeEditorView(targetId).catch((error) => setResult(String(error)));
       }
     }
     showWorkspaceTreeMenu(event.clientX, event.clientY, targetId);
@@ -1819,11 +2689,44 @@ function installEvents() {
   document.addEventListener('mousedown', (event) => {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (!el.contextMenu.contains(target)) hideContextMenu();
     if (!el.pluginSelectField.contains(target)) closePluginSelectMenu();
     if (!el.workspaceTreeMenu.contains(target)) closeWorkspaceTreeMenu();
   });
 
   document.addEventListener('keydown', (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const typing = !!target?.closest('input, textarea, [contenteditable="true"]');
+    const withCtrl = event.ctrlKey || event.metaKey;
+    const key = event.key.toLowerCase();
+
+    if (!typing && withCtrl && key === 'z' && !event.shiftKey) {
+      event.preventDefault();
+      undoHistory();
+      return;
+    }
+    if (!typing && withCtrl && (key === 'y' || (key === 'z' && event.shiftKey))) {
+      event.preventDefault();
+      redoHistory();
+      return;
+    }
+
+    if (!typing && withCtrl && key === 'c') {
+      if (copySelectedNodeToClipboard()) {
+        event.preventDefault();
+        setResult('노드 복사됨');
+      }
+      return;
+    }
+    if (!typing && withCtrl && key === 'v') {
+      if (pasteNodeFromClipboard()) {
+        event.preventDefault();
+        renderCanvas();
+        setResult('노드 붙여넣기됨');
+      }
+      return;
+    }
+
     if (event.code === 'Space') {
       state.spaceDown = true;
       el.workspace.style.cursor = 'grab';
@@ -1834,6 +2737,7 @@ function installEvents() {
       closePluginSelectMenu();
       closeWorkspaceTreeMenu();
       renderCanvas();
+      schedulePresencePublish(true);
     }
   });
 
@@ -1849,7 +2753,26 @@ function installEvents() {
     const emptyArea = event.target === el.workspace || event.target === el.canvas;
     if (emptyArea && isLeftButton) {
       event.preventDefault();
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
+      state.selectedId = null;
+      state.selectedCommentId = null;
       hideContextMenu();
+      renderCanvas();
+      schedulePresencePublish(true);
+      if (event.shiftKey) {
+        const world = toWorldPosition(event.clientX, event.clientY);
+        const startX = (event.ctrlKey ? snapGrid(world.x) : world.x);
+        const startY = (event.ctrlKey ? snapGrid(world.y) : world.y);
+        state.commentDraft = {
+          startX,
+          startY,
+          currentX: startX,
+          currentY: startY
+        };
+        return;
+      }
       beginPan(event);
       el.workspace.style.cursor = 'grabbing';
     }
@@ -1860,6 +2783,24 @@ function installEvents() {
     if (!targetElement || !el.workspace.contains(targetElement)) return;
 
     event.preventDefault();
+    const commentEl = targetElement.closest('.comment-box');
+    if (commentEl instanceof HTMLElement && commentEl.dataset.id) {
+      state.selectedCommentId = commentEl.dataset.id;
+      state.selectedId = null;
+      showCommentContextMenu(event.clientX, event.clientY, commentEl.dataset.id);
+      renderCanvas();
+      return;
+    }
+    const portEl = targetElement.closest('.port');
+    if (portEl instanceof HTMLElement) {
+      const nodeId = portEl.dataset.nodeId || '';
+      const portType = portEl.dataset.portType || '';
+      const portClass = portEl.dataset.portClass || '';
+      if (nodeId && portType && portClass) {
+        showPortContextMenu(event.clientX, event.clientY, nodeId, portType, portClass);
+        return;
+      }
+    }
     const nodeEl = targetElement.closest('.block-node');
     const inContextMenu = !!targetElement.closest('.context-menu');
     const emptyArea = !nodeEl && !inContextMenu;
@@ -1876,13 +2817,123 @@ function installEvents() {
 
   document.addEventListener('mousemove', (event) => {
     state.mouseWorld = toWorldPosition(event.clientX, event.clientY);
+    schedulePresencePublish(false);
+    renderRemotePresenceLayer();
+
+    if (state.commentDraft) {
+      const world = toWorldPosition(event.clientX, event.clientY);
+      const snap = event.ctrlKey;
+      state.commentDraft.currentX = snap ? snapGrid(world.x) : world.x;
+      state.commentDraft.currentY = snap ? snapGrid(world.y) : world.y;
+      renderCanvas();
+      scheduleCollaborativePublish(false);
+      return;
+    }
+
+    if (state.resizingComment) {
+      const comment = state.comments.find((it) => it.id === state.resizingComment.id);
+      if (comment) {
+        const r = state.resizingComment;
+        const dx = (event.clientX - r.startX) / state.scale;
+        const dy = (event.clientY - r.startY) / state.scale;
+        let x = r.x;
+        let y = r.y;
+        let width = r.width;
+        let height = r.height;
+        const minW = 180;
+        const minH = 120;
+        const edge = r.edge;
+
+        if (edge.includes('e')) {
+          width = Math.max(minW, r.width + dx);
+        }
+        if (edge.includes('s')) {
+          height = Math.max(minH, r.height + dy);
+        }
+        if (edge.includes('w')) {
+          const rawX = r.x + dx;
+          const rawW = r.width - dx;
+          if (rawW >= minW) {
+            x = rawX;
+            width = rawW;
+          } else {
+            x = r.x + (r.width - minW);
+            width = minW;
+          }
+        }
+        if (edge.includes('n')) {
+          const rawY = r.y + dy;
+          const rawH = r.height - dy;
+          if (rawH >= minH) {
+            y = rawY;
+            height = rawH;
+          } else {
+            y = r.y + (r.height - minH);
+            height = minH;
+          }
+        }
+
+        if (event.ctrlKey) {
+          x = snapGrid(x);
+          y = snapGrid(y);
+          width = Math.max(minW, snapGrid(width));
+          height = Math.max(minH, snapGrid(height));
+        }
+
+        if (
+          Math.round(x) !== Math.round(comment.x)
+          || Math.round(y) !== Math.round(comment.y)
+          || Math.round(width) !== Math.round(comment.width)
+          || Math.round(height) !== Math.round(comment.height)
+        ) {
+          r.moved = true;
+        }
+        comment.x = x;
+        comment.y = y;
+        comment.width = width;
+        comment.height = height;
+        renderCanvas();
+        scheduleCollaborativePublish(false);
+      }
+      return;
+    }
+
+    if (state.draggingComment) {
+      const comment = state.comments.find((it) => it.id === state.draggingComment.id);
+      if (comment) {
+        let nextX = state.draggingComment.commentX + ((event.clientX - state.draggingComment.startX) / state.scale);
+        let nextY = state.draggingComment.commentY + ((event.clientY - state.draggingComment.startY) / state.scale);
+        if (event.ctrlKey) {
+          nextX = snapGrid(nextX);
+          nextY = snapGrid(nextY);
+        }
+        if (Math.round(nextX) !== Math.round(comment.x) || Math.round(nextY) !== Math.round(comment.y)) {
+          state.draggingComment.moved = true;
+        }
+        comment.x = nextX;
+        comment.y = nextY;
+        renderCanvas();
+        scheduleCollaborativePublish(false);
+      }
+      return;
+    }
 
     if (state.draggingNode) {
       const block = state.blocks.find((it) => it.id === state.draggingNode.id);
       if (block) {
-        block.x = state.draggingNode.nodeX + ((event.clientX - state.draggingNode.startX) / state.scale);
-        block.y = state.draggingNode.nodeY + ((event.clientY - state.draggingNode.startY) / state.scale);
+        let nextX = state.draggingNode.nodeX + ((event.clientX - state.draggingNode.startX) / state.scale);
+        let nextY = state.draggingNode.nodeY + ((event.clientY - state.draggingNode.startY) / state.scale);
+        if (event.ctrlKey) {
+          nextX = Math.round(nextX / GRID_SIZE) * GRID_SIZE;
+          nextY = Math.round(nextY / GRID_SIZE) * GRID_SIZE;
+        }
+        if (Math.round(nextX) !== Math.round(block.x) || Math.round(nextY) !== Math.round(block.y)) {
+          state.draggingNode.moved = true;
+        }
+        block.x = nextX;
+        block.y = nextY;
         renderCanvas();
+        scheduleCollaborativePublish(false);
       }
       return;
     }
@@ -1905,6 +2956,19 @@ function installEvents() {
   });
 
   document.addEventListener('mouseup', (event) => {
+    if (state.commentDraft) {
+      const draft = state.commentDraft;
+      const x = Math.min(draft.startX, draft.currentX);
+      const y = Math.min(draft.startY, draft.currentY);
+      const width = Math.abs(draft.currentX - draft.startX);
+      const height = Math.abs(draft.currentY - draft.startY);
+      state.commentDraft = null;
+      if (width >= 16 && height >= 16) {
+        createComment(x, y, width, height);
+      }
+      renderCanvas();
+    }
+
     if (state.connectionDraft && state.linkingActive) {
       const hovered = document.elementFromPoint(event.clientX, event.clientY);
       const resolved = resolveLinkTargetFromClient(event.clientX, event.clientY);
@@ -1916,11 +2980,14 @@ function installEvents() {
           state.connectionDraft.from,
           nextTargetId,
           state.connectionDraft.kind || 'exec',
-          state.connectionDraft.fromPortClass || 'out'
+          state.connectionDraft.fromPortClass || 'out',
+          state.connectionDraft.snapTargetPort || ''
         );
       } else {
-        const emptyArea = hovered === el.workspace || hovered === el.canvas;
-        if (emptyArea) {
+        const hoveredElement = hovered instanceof Element ? hovered : null;
+        const inWorkspace = !!hoveredElement && el.workspace.contains(hoveredElement);
+        const blockedSurface = !!hoveredElement?.closest('.block-node, .port, .context-menu');
+        if (inWorkspace && !blockedSurface) {
           showContextMenu(event.clientX, event.clientY, {
             connectFromId: state.connectionDraft.from,
             connectKind: state.connectionDraft.kind || 'exec',
@@ -1933,10 +3000,19 @@ function installEvents() {
       state.linkingActive = false;
       renderCanvas();
     }
+    const movedComment = !!state.draggingComment?.moved;
+    const resizedComment = !!state.resizingComment?.moved;
+    state.resizingComment = null;
+    state.draggingComment = null;
+    const movedNode = !!state.draggingNode?.moved;
     state.draggingNode = null;
     state.panning = null;
     document.body.style.userSelect = '';
     el.workspace.style.cursor = state.spaceDown ? 'grab' : 'default';
+    if (movedComment) commitHistoryState();
+    if (resizedComment) commitHistoryState();
+    if (movedNode) commitHistoryState();
+    schedulePresencePublish(true);
   });
 
   el.workspace.addEventListener('wheel', (event) => {
@@ -1965,22 +3041,38 @@ function installEvents() {
     if (event.target === el.workspace || event.target === el.canvas) hideContextMenu();
   });
 
+  window.addEventListener('beforeunload', () => {
+    if (realtimeState.eventSource) {
+      realtimeState.eventSource.close();
+      realtimeState.eventSource = null;
+    }
+  });
+
   el.saveBtn.addEventListener('click', () => saveProject().catch((error) => setResult(String(error))));
 }
 
 async function init() {
   loadWorkspaceState();
+  await loadServerDraft();
   applyWorkspaceSnapshot(state.currentWorkspaceId || state.selectedWorkspaceId);
   renderWorkspaceTree();
-  if (getWorkspaceById(state.selectedWorkspaceId)?.kind === 'code') {
-    await showCodeEditorView(state.selectedWorkspaceId).catch((error) => setResult(String(error)));
-  } else {
-    showCanvasView();
-  }
+  showCanvasView();
   saveWorkspaceState();
+  commitHistoryState(false);
   installEvents();
+  connectCollaborativeRealtime();
+  if (document.fonts?.ready) {
+    document.fonts.ready.then(() => scheduleRelayoutRender()).catch(() => {});
+  }
+  window.addEventListener('load', scheduleRelayoutRender, { once: true });
   await refreshPluginList();
-  setResult('우클릭으로 이벤트/함수/변수 노드를 추가하고 포트를 눌러 연결하세요.');
+  scheduleRelayoutRender();
+  requestAnimationFrame(() => {
+    if (document.activeElement instanceof HTMLElement && document.activeElement !== document.body) {
+      document.activeElement.blur();
+    }
+  });
+  setResult('우클릭으로 이벤트/함수/연산/변수 노드를 추가하고 포트를 눌러 연결하세요.');
 }
 
 init().catch((error) => {

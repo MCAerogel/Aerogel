@@ -9,6 +9,8 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
 import java.net.InetSocketAddress
@@ -18,10 +20,13 @@ import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.Comparator
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.jar.JarEntry
 import java.util.jar.JarOutputStream
 import javax.tools.DiagnosticCollector
@@ -46,6 +51,9 @@ object BlockEditorModule {
 
     @Volatile
     private var host: String = "0.0.0.0"
+
+    @Volatile
+    private var privateKey: String = ""
 
     fun start() {
         if (!started.compareAndSet(false, true)) return
@@ -79,7 +87,7 @@ object BlockEditorModule {
                     }
                 }
         }
-        createdServer.executor = Executors.newFixedThreadPool(2) { runnable ->
+        createdServer.executor = Executors.newFixedThreadPool(16) { runnable ->
             Thread(runnable, "aerogel-block-editor-http").apply { isDaemon = true }
         }
         createdServer.start()
@@ -87,7 +95,8 @@ object BlockEditorModule {
         server = createdServer
         port = configuredPort
         host = configuredHost
-        logger.info("Block editor started on http://{}:{}", configuredHost, configuredPort)
+        privateKey = generatePrivateKey()
+        logger.info("Block editor started on {}", securedUrl())
     }
 
     fun stop() {
@@ -98,9 +107,16 @@ object BlockEditorModule {
 
     fun url(): String = "http://$host:$port"
 
+    fun securedUrl(): String = "${url()}/?privatekey=$privateKey"
+
     private fun handle(exchange: HttpExchange) {
         val method = exchange.requestMethod.uppercase(Locale.ROOT)
         val path = exchange.requestURI.path ?: "/"
+        val query = queryParams(exchange)
+        if (!isAuthorized(path, query)) {
+            sendJson(exchange, 403, mapOf("ok" to false, "error" to "forbidden", "message" to "Invalid privatekey"))
+            return
+        }
         if (method == "GET" && path == "/") {
             serveResource(exchange, "block-editor/index.html", "text/html; charset=utf-8")
             return
@@ -117,7 +133,46 @@ object BlockEditorModule {
             return
         }
         if (method == "GET" && path == "/api/block-editor/health") {
-            sendJson(exchange, 200, mapOf("ok" to true, "port" to port, "url" to url()))
+            sendJson(exchange, 200, mapOf("ok" to true, "port" to port, "url" to url(), "securedUrl" to securedUrl()))
+            return
+        }
+        if (method == "GET" && path == "/api/block-editor/draft") {
+            val draft = BlockEditorDraftRepository.loadDraft()
+            sendJson(exchange, 200, mapOf("ok" to true, "draft" to (draft ?: JsonNull)))
+            return
+        }
+        if (method == "POST" && path == "/api/block-editor/draft") {
+            val payload = readBodyUtf8(exchange)
+            runCatching { BlockEditorDraftRepository.saveDraft(payload) }
+                .onFailure {
+                    sendJson(exchange, 400, mapOf("ok" to false, "error" to "draft_save_failed", "message" to (it.message ?: "failed")))
+                    return
+                }
+            sendJson(exchange, 200, mapOf("ok" to true))
+            return
+        }
+        if (method == "GET" && path == "/api/block-editor/realtime/stream") {
+            val clientId = query["clientId"]?.trim().orEmpty().ifBlank { "anonymous" }
+            RealtimeSyncHub.openStream(exchange, clientId)
+            return
+        }
+        if (method == "POST" && path == "/api/block-editor/realtime/publish") {
+            val payloadText = readBodyUtf8(exchange)
+            val root = runCatching { json.parseToJsonElement(payloadText) as? JsonObject }
+                .getOrNull()
+            if (root == null) {
+                sendJson(exchange, 400, mapOf("ok" to false, "error" to "invalid_payload"))
+                return
+            }
+            val clientId = root["clientId"]?.jsonPrimitive?.contentOrNull?.ifBlank { "anonymous" } ?: "anonymous"
+            val type = root["type"]?.jsonPrimitive?.contentOrNull?.ifBlank { "state" } ?: "state"
+            val payload = root["payload"] ?: root["state"]
+            if (payload == null || payload is JsonNull) {
+                sendJson(exchange, 400, mapOf("ok" to false, "error" to "missing_state"))
+                return
+            }
+            RealtimeSyncHub.publish(clientId, type, payload)
+            sendJson(exchange, 200, mapOf("ok" to true))
             return
         }
         if (method == "GET" && path == "/api/block-editor/plugins") {
@@ -229,6 +284,21 @@ object BlockEditorModule {
             .toMap()
     }
 
+    private fun isAuthorized(path: String, query: Map<String, String>): Boolean {
+        if (path == "/favicon.ico") return true
+        if (path.startsWith("/static/")) return true
+        val provided = query["privatekey"]?.trim().orEmpty()
+        return provided.isNotEmpty() && provided == privateKey
+    }
+
+    private fun generatePrivateKey(): String {
+        val randomBytes = ByteArray(64)
+        SecureRandom().nextBytes(randomBytes)
+        val seed = randomBytes + System.nanoTime().toString().toByteArray(StandardCharsets.UTF_8)
+        val digest = MessageDigest.getInstance("SHA-512").digest(seed)
+        return digest.joinToString("") { b -> "%02x".format(b) }
+    }
+
     private fun sendBytes(exchange: HttpExchange, status: Int, contentType: String, bytes: ByteArray) {
         exchange.responseHeaders.add("Content-Type", contentType)
         exchange.sendResponseHeaders(status, bytes.size.toLong())
@@ -248,6 +318,117 @@ object BlockEditorModule {
             return
         }
         sendBytes(exchange, 200, contentType, bytes)
+    }
+}
+
+private object RealtimeSyncHub {
+    private data class Client(val clientId: String, val exchange: HttpExchange)
+
+    private val clients = CopyOnWriteArrayList<Client>()
+
+    @Volatile
+    private var lastState: JsonElement = JsonObject(emptyMap())
+
+    fun publish(clientId: String, type: String, data: JsonElement) {
+        if (type == "state") {
+            lastState = data
+        }
+        val message = JsonObject(
+            mapOf(
+                "clientId" to JsonPrimitive(clientId),
+                "type" to JsonPrimitive(type),
+                "payload" to data
+            )
+        )
+        broadcast(message)
+    }
+
+    fun openStream(exchange: HttpExchange, clientId: String) {
+        exchange.responseHeaders.add("Content-Type", "text/event-stream; charset=utf-8")
+        exchange.responseHeaders.add("Cache-Control", "no-cache, no-transform")
+        exchange.responseHeaders.add("Connection", "keep-alive")
+        exchange.responseHeaders.add("X-Accel-Buffering", "no")
+        exchange.sendResponseHeaders(200, 0)
+
+        val client = Client(clientId, exchange)
+        clients.add(client)
+
+        val initialPayload = JsonObject(
+            mapOf(
+                "clientId" to JsonPrimitive("server"),
+                "type" to JsonPrimitive("state"),
+                "payload" to lastState
+            )
+        )
+        if (!send(client, initialPayload)) {
+            remove(client)
+            return
+        }
+
+        try {
+            while (true) {
+                Thread.sleep(15000)
+                if (!sendRaw(client, ": keep-alive\n\n")) break
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            remove(client)
+        }
+    }
+
+    private fun broadcast(payload: JsonObject) {
+        for (client in clients) {
+            if (!send(client, payload)) {
+                remove(client)
+            }
+        }
+    }
+
+    private fun send(client: Client, payload: JsonObject): Boolean {
+        val data = Json.encodeToString(JsonElement.serializer(), payload)
+        return sendRaw(client, "data: $data\n\n")
+    }
+
+    private fun sendRaw(client: Client, message: String): Boolean {
+        return runCatching {
+            val bytes = message.toByteArray(StandardCharsets.UTF_8)
+            client.exchange.responseBody.write(bytes)
+            client.exchange.responseBody.flush()
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun remove(client: Client) {
+        clients.remove(client)
+        runCatching { client.exchange.close() }
+    }
+}
+
+private object BlockEditorDraftRepository {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+        prettyPrint = false
+    }
+    private val draftPath: Path = Path.of(".aerogel-cache", "block-editor", "draft.json")
+
+    fun loadDraft(): JsonObject? {
+        if (!Files.exists(draftPath)) return null
+        return runCatching {
+            val text = Files.readString(draftPath, StandardCharsets.UTF_8)
+            val parsed = json.parseToJsonElement(text)
+            parsed as? JsonObject
+        }.getOrNull()
+    }
+
+    fun saveDraft(rawPayload: String) {
+        val parsed = json.parseToJsonElement(rawPayload)
+        require(parsed is JsonObject) { "Draft payload must be a JSON object" }
+        Files.createDirectories(draftPath.parent)
+        val temp = draftPath.parent.resolve(".draft.json.tmp")
+        Files.writeString(temp, rawPayload, StandardCharsets.UTF_8)
+        Files.move(temp, draftPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
     }
 }
 
@@ -552,6 +733,47 @@ private object BlockJavaSourceGenerator {
                 .filter { it.isNotBlank() }
         }
 
+        fun isDataLink(link: BlockEditorLink): Boolean {
+            return when (link.kind) {
+                "data-text", "data-int", "data-decimal", "data-any", "data", null -> true
+                else -> false
+            }
+        }
+
+        fun resolveDataExpression(blockId: String, visiting: MutableSet<String> = HashSet()): String? {
+            if (!visiting.add(blockId)) return null
+            val block = blockById[blockId] ?: return null
+            return when (block.type.uppercase(Locale.ROOT)) {
+                "VAR_TEXT", "VAR_INTEGER", "VAR_DECIMAL" -> variableNameById[block.id]
+                "MATH_ADD" -> {
+                    val incomingDataLinks = incoming[block.id].orEmpty().filter { isDataLink(it) }
+                    val exactLeft = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-a" }
+                    val exactRight = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-b" && it !== exactLeft }
+                    val fallback = incomingDataLinks.filter { it !== exactLeft && it !== exactRight }
+                    val leftSource = exactLeft ?: incomingDataLinks.firstOrNull()
+                    val rightSource = exactRight ?: fallback.firstOrNull()
+                    val leftExpr = leftSource?.let { resolveDataExpression(it.from, visiting) }
+                    val rightExpr = rightSource?.let { resolveDataExpression(it.from, visiting) }
+                    if (leftExpr == null && rightExpr == null) null
+                    else "addValues(${leftExpr ?: "\"\""}, ${rightExpr ?: "\"\""})"
+                }
+                else -> null
+            }
+        }
+
+        fun resolveIncomingDataExpression(targetBlockId: String, preferredPortClass: String? = null): String? {
+            val incomingDataLinks = incoming[targetBlockId].orEmpty().filter { isDataLink(it) }
+            if (incomingDataLinks.isEmpty()) return null
+            val preferred = preferredPortClass?.let { port ->
+                incomingDataLinks.firstOrNull { it.toPortClass == port }
+            }
+            val candidates = if (preferred != null) listOf(preferred) + incomingDataLinks.filter { it !== preferred } else incomingDataLinks
+            return candidates
+                .asSequence()
+                .mapNotNull { resolveDataExpression(it.from, HashSet()) }
+                .firstOrNull()
+        }
+
         fun actionStatement(block: BlockEditorBlock): String? {
             val message = javaString(block.params["message"] ?: "")
             return when (block.type.uppercase(Locale.ROOT)) {
@@ -560,16 +782,8 @@ private object BlockJavaSourceGenerator {
                 "ACTION_SET_JOIN_MESSAGE", "ON_PLAYER_JOIN_SET_JOIN_MESSAGE" -> "event.setMessage(\\\"$message\\\");"
                 "ACTION_SEND_MESSAGE", "FUNCTION_SEND_MESSAGE" -> {
                     val incomingLinks = incoming[block.id].orEmpty()
-                    val linkedTextVariable = incomingLinks
-                        .asSequence()
-                        .mapNotNull { link ->
-                            val sourceType = blockById[link.from]?.type?.uppercase(Locale.ROOT)
-                            if ((link.kind == "data-text" || link.kind == "data") && sourceType == "VAR_TEXT") {
-                                variableNameById[link.from]
-                            } else null
-                        }
-                        .firstOrNull()
-                    val messageExpr = linkedTextVariable ?: "\"$message\""
+                    val linkedDataExpr = resolveIncomingDataExpression(block.id, "in-data")
+                    val messageExpr = linkedDataExpr?.let { "String.valueOf($it)" } ?: "\"$message\""
                     val linkedPlayer = incomingLinks
                         .asSequence()
                         .mapNotNull { link ->
@@ -621,18 +835,9 @@ private object BlockJavaSourceGenerator {
             when (block.type.uppercase(Locale.ROOT)) {
                 "EVENT_ON_ENABLE" -> collectActionChain(block.id, enableLines)
                 "EVENT_ON_PLAYER_JOIN" -> {
-                    val incomingLinks = incoming[block.id].orEmpty()
-                    val linkedTextVariable = incomingLinks
-                        .asSequence()
-                        .mapNotNull { link ->
-                            val sourceType = blockById[link.from]?.type?.uppercase(Locale.ROOT)
-                            if ((link.kind == "data-text" || link.kind == "data") && sourceType == "VAR_TEXT") {
-                                variableNameById[link.from]
-                            } else null
-                        }
-                        .firstOrNull()
-                    if (linkedTextVariable != null) {
-                        joinLines += "event.setMessage($linkedTextVariable);"
+                    val linkedDataExpr = resolveIncomingDataExpression(block.id, "in-data")
+                    if (linkedDataExpr != null) {
+                        joinLines += "event.setMessage(String.valueOf($linkedDataExpr));"
                     } else {
                         val message = block.params["message"]?.trim().orEmpty()
                         if (message.isNotEmpty()) {
@@ -667,6 +872,24 @@ private object BlockJavaSourceGenerator {
             val type = it.type.uppercase(Locale.ROOT)
             type == "ACTION_SEND_MESSAGE" || type == "FUNCTION_SEND_MESSAGE"
         }
+        val hasMathAddUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_ADD" }
+        val addValuesFunctionCode = if (hasMathAddUsage) {
+            """
+    private Object addValues(Object left, Object right) {
+        Object l = left == null ? "" : left;
+        Object r = right == null ? "" : right;
+        if (l instanceof Number && r instanceof Number) {
+            if (l instanceof Double || l instanceof Float || r instanceof Double || r instanceof Float) {
+                return ((Number) l).doubleValue() + ((Number) r).doubleValue();
+            }
+            return ((Number) l).longValue() + ((Number) r).longValue();
+        }
+        return String.valueOf(l) + String.valueOf(r);
+    }
+            """.trimIndent()
+        } else {
+            ""
+        }
         val sendMessageFunctionCode = if (hasSendMessageUsage) {
             """
     private void sendMessage(String message) {
@@ -694,6 +917,8 @@ public final class $className implements org.macaroon3145.api.plugin.AerogelPlug
     }
 
 $joinHandlerCode
+
+$addValuesFunctionCode
 
 $sendMessageFunctionCode
 }
@@ -761,7 +986,8 @@ private data class BlockEditorLink(
     val from: String,
     val to: String,
     val kind: String? = null,
-    val fromPortClass: String? = null
+    val fromPortClass: String? = null,
+    val toPortClass: String? = null
 )
 
 @Serializable
