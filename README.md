@@ -80,6 +80,10 @@
     <td align="center">Maintainer</td>
     <td align="center"><img src="https://github.com/uniformization.png" width="64" height="64" alt="uniformization"/><br/><strong>uniformization</strong><br/><a href="https://github.com/uniformization">GitHub</a></td>
   </tr>
+  <tr>
+    <td align="center">Contributor</td>
+    <td align="center"><img src="https://github.com/lumoungS2.png" width="64" height="64" alt="lumoungS2"/><br/><strong>lumoungS2</strong><br/><a href="https://github.com/lumoungS2">GitHub</a></td>
+  </tr>
 </table>
 
 </div>
@@ -123,7 +127,6 @@ Runtime paths:
 - `aerogel.properties`
 - `plugins/`
 - `world/`
-- `logs/`
 
 ## Plugin Development
 

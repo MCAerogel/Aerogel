@@ -80,6 +80,10 @@
     <td align="center">유지보수 담당</td>
     <td align="center"><img src="https://github.com/uniformization.png" width="64" height="64" alt="uniformization"/><br/><strong>uniformization</strong><br/><a href="https://github.com/uniformization">GitHub</a></td>
   </tr>
+  <tr>
+    <td align="center">기여자</td>
+    <td align="center"><img src="https://github.com/lumoungS2.png" width="64" height="64" alt="lumoungS2"/><br/><strong>lumoungS2</strong><br/><a href="https://github.com/lumoungS2">GitHub</a></td>
+  </tr>
 </table>
 
 </div>
@@ -123,7 +127,6 @@ java --enable-native-access=ALL-UNNAMED \
 - `aerogel.properties`
 - `plugins/`
 - `world/`
-- `logs/`
 
 ## 플러그인 개발
 
