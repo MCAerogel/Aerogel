@@ -8,6 +8,7 @@ import org.macaroon3145.network.handler.PlayerSessionManager
 import org.macaroon3145.perf.GameLoop
 import org.macaroon3145.perf.PerformanceMonitor
 import org.macaroon3145.plugin.PluginSystem
+import org.macaroon3145.blockeditor.BlockEditorModule
 import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 import org.slf4j.LoggerFactory
 import java.util.concurrent.TimeUnit
@@ -84,6 +85,8 @@ object ServerLifecycle {
             PlayerSessionManager.shutdown()
             runCatching { MojangAuthService.shutdown() }
                 .onFailure { logger.warn("Failed to shutdown Mojang auth executor", it) }
+            runCatching { BlockEditorModule.stop() }
+                .onFailure { logger.warn("Failed to stop block editor module", it) }
             PluginSystem.shutdown()
             runCatching { serverChannel?.close()?.syncUninterruptibly() }
             val bossShutdown = runCatching {

@@ -47,6 +47,7 @@ import org.macaroon3145.world.WorldManager
 import org.macaroon3145.world.VanillaMiningRules
 import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
 import org.macaroon3145.plugin.PluginSystem
+import org.macaroon3145.blockeditor.BlockEditorModule
 import java.nio.file.Files
 import java.nio.file.Path
 import java.io.BufferedReader
@@ -157,6 +158,13 @@ fun main() {
         PlayerSessionManager.applyPersistedTimeWeather(metadata)
     }
     PluginSystem.initialize()
+    runCatching { BlockEditorModule.start() }
+        .onFailure { error ->
+            ServerI18n.logCustom(
+                ServerI18n.style("[시스템] ", ServerI18n.Color.RED),
+                ServerI18n.style("BlockEditor start failed: ${error.message}", ServerI18n.Color.RED)
+            )
+        }
     warmupPickBlockLookups()
     if (ServerConfig.compressionThreshold >= 0 && ServerConfig.compressionChunkLevel < 0) {
         ServerI18n.log("aerogel.log.warn.chunk_compression_disabled")

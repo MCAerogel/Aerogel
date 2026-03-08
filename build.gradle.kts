@@ -17,6 +17,7 @@ repositories {
 dependencies {
     testImplementation(kotlin("test"))
     implementation(project(":api"))
+    implementation(project(":blockEditor"))
 
     implementation("io.netty:netty-all:4.2.10.Final")
     runtimeOnly("io.netty:netty-transport-native-epoll:4.2.10.Final:linux-x86_64")
