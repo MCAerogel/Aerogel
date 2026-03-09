@@ -4,10 +4,14 @@ const NODE_LIBRARY = {
     { type: 'EVENT_ON_PLAYER_JOIN', title: 'PlayerJoinEvent' }
   ],
   functions: [
-    { type: 'FUNCTION_SEND_MESSAGE', title: 'Player.sendMessage', defaultMessage: 'Hello from function' }
+    { type: 'FUNCTION_SEND_MESSAGE', title: 'Player.sendMessage', defaultMessage: 'Hello from function' },
+    { type: 'FUNCTION_BROADCAST_MESSAGE', title: 'broadcastMessage', defaultMessage: 'Hello everyone' }
   ],
   operations: [
-    { type: 'MATH_ADD', title: '+' }
+    { type: 'MATH_ADD', title: '+' },
+    { type: 'MATH_SUB', title: '-' },
+    { type: 'MATH_MUL', title: '*' },
+    { type: 'MATH_DIV', title: '/' }
   ],
   variables: [
     { type: 'VAR_TEXT', title: '문자열 변수', defaultValue: 'hello' },
@@ -62,8 +66,13 @@ const BLOCK_NODE_WIDTH = 260;
 const BLOCK_NODE_ESTIMATED_HEIGHT = 132;
 const GRID_SIZE = 24;
 const WORKSPACE_STORAGE_KEY = 'aerogel.blockEditor.workspaces.v1';
+const GEMINI_API_KEY_STORAGE_KEY = 'aerogel.blockEditor.geminiApiKey.v1';
 const PRIVATE_KEY = new URLSearchParams(window.location.search).get('privatekey') || '';
 const HISTORY_LIMIT = 200;
+const GEMINI_GENERATE_MODEL = 'gemini-3.1-flash-lite-preview';
+const AUTO_CREATE_STREAM_IDLE_TIMEOUT_MS = 15000;
+const AUTO_CREATE_STREAM_TOTAL_TIMEOUT_MS = 90000;
+const GEMINI_SOLUTION_MODEL = 'gemini-2.5-flash';
 const historyState = {
   undo: [],
   redo: [],
@@ -85,11 +94,42 @@ const realtimeState = {
   publishTimer: null,
   presenceTimer: null,
   publishInFlight: false,
+  publishQueued: false,
   presenceInFlight: false,
+  presenceQueued: false,
   peers: {},
+  smoothedPeers: {},
+  presenceAnimationFrame: null,
+  lastPresenceFrameAt: 0,
   suspended: false
 };
+const renderPresenceOverrides = {
+  nodePositions: new Map(),
+  commentRects: new Map()
+};
 const SHOW_SELF_PRESENCE_DEBUG = false;
+const autoCreateState = {
+  apiKey: '',
+  authenticated: false,
+  loginInFlight: false,
+  autoLoginTried: false,
+  lastVerifiedKey: '',
+  generateInFlight: false,
+  targetWorkspaceId: null,
+  targetOriginWorld: null
+};
+const actionBarState = {
+  timer: null,
+  logs: [],
+  expanded: false,
+  lastProgressMessage: ''
+};
+const minimapState = {
+  bounds: null,
+  scale: 1,
+  offsetX: 0,
+  offsetY: 0
+};
 
 const el = {
   pluginSelectField: document.querySelector('.plugin-select-field'),
@@ -115,17 +155,167 @@ const el = {
   confirmDialogMessage: document.getElementById('confirmDialogMessage'),
   confirmDialogCancelBtn: document.getElementById('confirmDialogCancelBtn'),
   confirmDialogOkBtn: document.getElementById('confirmDialogOkBtn'),
+  autoCreateDialog: document.getElementById('autoCreateDialog'),
+  autoCreateDialogTitle: document.getElementById('autoCreateDialogTitle'),
+  autoCreateApiKeyInput: document.getElementById('autoCreateApiKeyInput'),
+  autoCreateLoginBtn: document.getElementById('autoCreateLoginBtn'),
+  autoCreateAuthStatus: document.getElementById('autoCreateAuthStatus'),
+  autoCreatePromptInput: document.getElementById('autoCreatePromptInput'),
+  autoCreateCancelBtn: document.getElementById('autoCreateCancelBtn'),
+  autoCreateGenerateBtn: document.getElementById('autoCreateGenerateBtn'),
   saveBtn: document.getElementById('saveBtn'),
   workspace: document.getElementById('workspace'),
   workspaceToolbar: document.getElementById('workspaceToolbar'),
+  actionBar: document.getElementById('actionBar'),
+  actionBarToggle: document.getElementById('actionBarToggle'),
+  actionBarMessage: document.getElementById('actionBarMessage'),
+  actionBarLogs: document.getElementById('actionBarLogs'),
+  minimapCanvas: document.getElementById('minimapCanvas'),
   canvas: document.getElementById('canvas'),
   worldInfo: document.getElementById('worldInfo'),
   contextMenu: document.getElementById('contextMenu')
 };
 
+function ensureActionBarStructure() {
+  if (!(el.actionBar instanceof HTMLElement)) return;
+  let head = el.actionBar.querySelector('.action-bar-head');
+  if (!(head instanceof HTMLElement)) {
+    head = document.createElement('div');
+    head.className = 'action-bar-head';
+    el.actionBar.appendChild(head);
+  }
+  if (!(el.actionBarMessage instanceof HTMLElement)) {
+    const message = document.createElement('div');
+    message.id = 'actionBarMessage';
+    message.className = 'action-bar-message';
+    head.appendChild(message);
+    el.actionBarMessage = message;
+  } else if (!head.contains(el.actionBarMessage)) {
+    head.appendChild(el.actionBarMessage);
+  }
+  if (!(el.actionBarToggle instanceof HTMLButtonElement)) {
+    const toggle = document.createElement('button');
+    toggle.id = 'actionBarToggle';
+    toggle.className = 'action-bar-toggle';
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-label', '로그 펼치기');
+    head.appendChild(toggle);
+    el.actionBarToggle = toggle;
+  } else if (!head.contains(el.actionBarToggle)) {
+    head.appendChild(el.actionBarToggle);
+  }
+  if (!(el.actionBarLogs instanceof HTMLElement)) {
+    const logs = document.createElement('div');
+    logs.id = 'actionBarLogs';
+    logs.className = 'action-bar-logs';
+    el.actionBar.appendChild(logs);
+    el.actionBarLogs = logs;
+  } else if (!el.actionBar.contains(el.actionBarLogs)) {
+    el.actionBar.appendChild(el.actionBarLogs);
+  }
+}
+
 function setResult(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   console.info(`[AerogelStudio] ${text}`);
+}
+
+function hasActiveTextSelection() {
+  try {
+    const selection = window.getSelection();
+    return !!selection && !selection.isCollapsed && selection.toString().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function readStoredGeminiApiKey() {
+  try {
+    return localStorage.getItem(GEMINI_API_KEY_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writeStoredGeminiApiKey(key) {
+  try {
+    const value = String(key || '').trim();
+    if (!value) {
+      localStorage.removeItem(GEMINI_API_KEY_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(GEMINI_API_KEY_STORAGE_KEY, value);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function renderActionBarLogs() {
+  ensureActionBarStructure();
+  if (!el.actionBarLogs) return;
+  el.actionBarLogs.innerHTML = '';
+  for (const item of actionBarState.logs) {
+    const row = document.createElement('div');
+    row.className = `action-bar-log-item${item.kind === 'ok' ? ' ok' : item.kind === 'error' ? ' error' : ''}`;
+    row.textContent = item.message;
+    el.actionBarLogs.appendChild(row);
+  }
+  el.actionBarLogs.scrollTop = el.actionBarLogs.scrollHeight;
+}
+
+function appendActionBarLog(message, kind = '') {
+  const text = String(message || '').trim();
+  if (!text) return;
+  if (el.actionBar) el.actionBar.classList.remove('hidden');
+  actionBarState.logs.push({ message: text, kind });
+  if (actionBarState.logs.length > 300) {
+    actionBarState.logs.splice(0, actionBarState.logs.length - 300);
+  }
+  renderActionBarLogs();
+}
+
+function setActionBarExpanded(expanded) {
+  ensureActionBarStructure();
+  actionBarState.expanded = !!expanded;
+  if (el.actionBar) el.actionBar.classList.toggle('expanded', actionBarState.expanded);
+  if (el.actionBarToggle) el.actionBarToggle.setAttribute('aria-expanded', actionBarState.expanded ? 'true' : 'false');
+  if (el.actionBarLogs) el.actionBarLogs.classList.toggle('hidden', !actionBarState.expanded);
+}
+
+function showActionBar(message, kind = '', duration = 2200, options = {}) {
+  ensureActionBarStructure();
+  if (!el.actionBar) return;
+  const shouldLog = options.log === true;
+  if (el.actionBarMessage) {
+    el.actionBarMessage.textContent = message;
+  } else {
+    el.actionBar.textContent = message;
+  }
+  el.actionBar.classList.remove('hidden', 'ok', 'error');
+  if (kind === 'ok' || kind === 'error') {
+    el.actionBar.classList.add(kind);
+  }
+  if (shouldLog) {
+    const last = actionBarState.logs[actionBarState.logs.length - 1];
+    if (!last || last.message !== message || last.kind !== kind) {
+      appendActionBarLog(message, kind);
+    }
+  }
+  if (actionBarState.timer) {
+    clearTimeout(actionBarState.timer);
+    actionBarState.timer = null;
+  }
+  if (duration > 0) {
+    actionBarState.timer = setTimeout(() => {
+      if (actionBarState.expanded) {
+        actionBarState.timer = null;
+        return;
+      }
+      el.actionBar.classList.add('hidden');
+      actionBarState.timer = null;
+    }, duration);
+  }
 }
 
 function withPrivateKey(path) {
@@ -145,7 +335,7 @@ function isActionType(type) {
 }
 
 function isOperationType(type) {
-  return type === 'MATH_ADD';
+  return type === 'MATH_ADD' || type === 'MATH_SUB' || type === 'MATH_MUL' || type === 'MATH_DIV';
 }
 
 function isVariableType(type) {
@@ -161,11 +351,11 @@ function isExecInputType(type) {
 }
 
 function isDataOutputType(type) {
-  return type === 'VAR_TEXT' || type === 'VAR_INTEGER' || type === 'VAR_DECIMAL' || type === 'MATH_ADD';
+  return type === 'VAR_TEXT' || type === 'VAR_INTEGER' || type === 'VAR_DECIMAL' || type === 'MATH_ADD' || type === 'MATH_SUB' || type === 'MATH_MUL' || type === 'MATH_DIV';
 }
 
 function isDataInputType(type) {
-  return type === 'FUNCTION_SEND_MESSAGE' || type === 'EVENT_ON_PLAYER_JOIN' || type === 'MATH_ADD';
+  return type === 'FUNCTION_SEND_MESSAGE' || type === 'FUNCTION_BROADCAST_MESSAGE' || type === 'EVENT_ON_PLAYER_JOIN' || type === 'MATH_ADD' || type === 'MATH_SUB' || type === 'MATH_MUL' || type === 'MATH_DIV';
 }
 
 function canStartLink(type) {
@@ -181,6 +371,9 @@ function linkKindFromType(type) {
   if (type === 'VAR_INTEGER') return 'data-int';
   if (type === 'VAR_DECIMAL') return 'data-decimal';
   if (type === 'MATH_ADD') return 'data-any';
+  if (type === 'MATH_MUL') return 'data-number';
+  if (type === 'MATH_DIV') return 'data-number';
+  if (type === 'MATH_SUB') return 'data-number';
   if (isExecOutputType(type)) return 'exec';
   return 'none';
 }
@@ -188,20 +381,59 @@ function linkKindFromType(type) {
 function targetPortClassForLink(kind, toType, preferredPortClass = '') {
   if (preferredPortClass) return preferredPortClass;
   if (isDataKind(kind) && toType === 'MATH_ADD') return 'in-data-a';
+  if (isDataKind(kind) && toType === 'MATH_SUB') return 'in-data-a';
+  if (isDataKind(kind) && toType === 'MATH_MUL') return 'in-data-a';
+  if (isDataKind(kind) && toType === 'MATH_DIV') return 'in-data-a';
   if (isDataKind(kind) && toType === 'FUNCTION_SEND_MESSAGE') return 'in-data';
+  if (isDataKind(kind) && toType === 'FUNCTION_BROADCAST_MESSAGE') return 'in-data';
   if (isDataKind(kind) && toType === 'EVENT_ON_PLAYER_JOIN') return 'in-data';
   if (kind === 'player' && toType === 'FUNCTION_SEND_MESSAGE') return 'in-player';
   return 'in-exec';
 }
 
+function isNumericDataKind(kind) {
+  return kind === 'data-int' || kind === 'data-decimal' || kind === 'data-number';
+}
+
 function canLinkKindToType(kind, toType) {
   if (kind === 'data-text' || kind === 'data-int' || kind === 'data-decimal' || kind === 'data-any' || kind === 'data') {
+    if (toType === 'MATH_SUB' || toType === 'MATH_MUL' || toType === 'MATH_DIV') return isNumericDataKind(kind);
+    return isDataInputType(toType);
+  }
+  if (kind === 'data-number') {
+    if (toType === 'MATH_SUB' || toType === 'MATH_MUL' || toType === 'MATH_DIV') return true;
     return isDataInputType(toType);
   }
   if (kind === 'exec') return isExecInputType(toType);
   if (kind === 'player') return toType === 'FUNCTION_SEND_MESSAGE';
   if (kind === 'context') return false;
   return false;
+}
+
+function canNodeOutputBeNumeric(nodeId, depth = 0, seen = new Set()) {
+  if (!nodeId || depth > 24 || seen.has(nodeId)) return false;
+  seen.add(nodeId);
+  const node = state.blocks.find((it) => it.id === nodeId);
+  if (!node) return false;
+  if (node.type === 'VAR_INTEGER' || node.type === 'VAR_DECIMAL' || node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV') return true;
+  if (node.type !== 'MATH_ADD') return false;
+
+  const inputA = state.links.find((it) => it.to === nodeId && (it.toPortClass || '') === 'in-data-a' && isDataKind(it.kind || 'exec'));
+  const inputB = state.links.find((it) => it.to === nodeId && (it.toPortClass || '') === 'in-data-b' && isDataKind(it.kind || 'exec'));
+  if (!inputA || !inputB) return false;
+
+  const kindA = inputA.kind || 'exec';
+  const kindB = inputB.kind || 'exec';
+  const numericA = isNumericDataKind(kindA) || (kindA === 'data-any' && canNodeOutputBeNumeric(inputA.from, depth + 1, seen));
+  const numericB = isNumericDataKind(kindB) || (kindB === 'data-any' && canNodeOutputBeNumeric(inputB.from, depth + 1, seen));
+  return numericA && numericB;
+}
+
+function canLinkFromSourceToTarget(sourceId, sourceKind, targetType) {
+  if (sourceKind === 'data-any' && (targetType === 'MATH_SUB' || targetType === 'MATH_MUL' || targetType === 'MATH_DIV')) {
+    return canNodeOutputBeNumeric(sourceId);
+  }
+  return canLinkKindToType(sourceKind, targetType);
 }
 
 function canLinkTypes(fromType, toType) {
@@ -223,7 +455,11 @@ function typeLabelOf(type) {
   if (type === 'VAR_INTEGER') return '소수점 없는 숫자를 저장해 두는 칸';
   if (type === 'VAR_DECIMAL') return '소수점 있는 숫자를 저장해 두는 칸';
   if (type === 'FUNCTION_SEND_MESSAGE') return '플레이어에게 메시지를 보내는 함수';
+  if (type === 'FUNCTION_BROADCAST_MESSAGE') return '모든 플레이어에게 메시지를 보내는 함수';
   if (type === 'MATH_ADD') return '두 값을 더하거나 이어 붙이는 연산';
+  if (type === 'MATH_SUB') return '두 숫자를 빼는 연산';
+  if (type === 'MATH_MUL') return '두 숫자를 곱하는 연산';
+  if (type === 'MATH_DIV') return '두 숫자를 나누는 연산';
   return type;
 }
 
@@ -392,7 +628,7 @@ function addLink(fromId, toId, kind, fromPortClass, toPortClass) {
   const toNode = state.blocks.find((it) => it.id === toId);
   if (!fromNode || !toNode) return;
   const resolvedKind = kind || linkKindFromType(fromNode.type);
-  if (!canLinkKindToType(resolvedKind, toNode.type)) return;
+  if (!canLinkFromSourceToTarget(fromId, resolvedKind, toNode.type)) return;
   if (hasDuplicateLink(fromId, toId, resolvedKind, fromPortClass, toPortClass)) return;
   state.links.push({
     from: fromId,
@@ -437,7 +673,7 @@ function resolveLinkTargetFromClient(clientX, clientY) {
       || (isDataKind(sourceKind) && accept === 'data')
       || (sourceKind === 'player' && accept === 'player');
     if (!acceptOk) return null;
-    if (!(targetNode && canLinkKindToType(sourceKind, targetNode.type))) return null;
+    if (!(targetNode && canLinkFromSourceToTarget(sourceId, sourceKind, targetNode.type))) return null;
     return { id: targetId, port: targetPortClass };
   }
 
@@ -445,7 +681,7 @@ function resolveLinkTargetFromClient(clientX, clientY) {
   if (nodeElement?.dataset.id) {
     const targetNodeId = nodeElement.dataset.id;
     const targetNode = state.blocks.find((it) => it.id === targetNodeId);
-    if (targetNode && canLinkKindToType(sourceKind, targetNode.type)) {
+    if (targetNode && canLinkFromSourceToTarget(sourceId, sourceKind, targetNode.type)) {
       const port = targetPortClassForLink(sourceKind, targetNode.type);
       return { id: targetNodeId, port };
     }
@@ -485,13 +721,24 @@ function renderLinksLayer() {
   svg.setAttribute('height', '100%');
 
   for (const link of state.links) {
-    const isDraftSourceLink = state.connectionDraft && state.linkingActive && link.from === state.connectionDraft.from;
+    const draftPortClass = state.connectionDraft?.fromPortClass || '';
+    const linkKind = link.kind || 'exec';
+    const linkPortClass = link.fromPortClass || `out-${linkKind}`;
+    const isDraftSourceLink = !!(
+      state.connectionDraft
+      && state.linkingActive
+      && link.from === state.connectionDraft.from
+      && draftPortClass
+      && linkPortClass === draftPortClass
+    );
     const fromNode = state.blocks.find((it) => it.id === link.from);
     const toNode = state.blocks.find((it) => it.id === link.to);
     if (!fromNode || !toNode) continue;
     const kind = link.kind || linkKindFromType(fromNode.type);
-    const from = getPortCenterWorld(link.from, link.fromPortClass || 'out');
-    const to = getPortCenterWorld(link.to, targetPortClassForLink(kind, toNode.type, link.toPortClass || ''));
+    const fromPort = link.fromPortClass || `out-${kind}`;
+    const toPort = targetPortClassForLink(kind, toNode.type, link.toPortClass || '');
+    const from = getPortCenterWorld(link.from, fromPort);
+    const to = getPortCenterWorld(link.to, toPort);
     if (!from || !to) continue;
     const d = linkPath(from, to);
 
@@ -541,13 +788,44 @@ function updateDraftPathOnly() {
   if (draftFront instanceof SVGPathElement) draftFront.setAttribute('d', d);
 }
 
+function updateRenderedLinkPathsOnly() {
+  const svg = el.canvas.querySelector('.links-layer');
+  if (!(svg instanceof SVGElement)) return;
+
+  const backPaths = Array.from(svg.querySelectorAll('path.link-back, path.link-outline-back'));
+  const frontPaths = Array.from(svg.querySelectorAll('path.link-front, path.link-outline-front'));
+  let index = 0;
+
+  for (const link of state.links) {
+    const fromNode = state.blocks.find((it) => it.id === link.from);
+    const toNode = state.blocks.find((it) => it.id === link.to);
+    if (!fromNode || !toNode) continue;
+    const kind = link.kind || linkKindFromType(fromNode.type);
+    const fromPort = link.fromPortClass || `out-${kind}`;
+    const toPort = targetPortClassForLink(kind, toNode.type, link.toPortClass || '');
+    const from = getPortCenterWorld(link.from, fromPort);
+    const to = getPortCenterWorld(link.to, toPort);
+    if (!from || !to) continue;
+    const d = linkPath(from, to);
+
+    const back = backPaths[index];
+    const front = frontPaths[index];
+    if (back instanceof SVGPathElement) back.setAttribute('d', d);
+    if (front instanceof SVGPathElement) front.setAttribute('d', d);
+    index += 1;
+  }
+
+  updateDraftPathOnly();
+}
+
 function renderComment(comment) {
   const box = document.createElement('div');
   box.className = `comment-box${state.selectedCommentId === comment.id ? ' selected' : ''}`;
-  box.style.left = `${comment.x}px`;
-  box.style.top = `${comment.y}px`;
-  box.style.width = `${comment.width}px`;
-  box.style.height = `${comment.height}px`;
+  const rectOverride = renderPresenceOverrides.commentRects.get(comment.id);
+  box.style.left = `${rectOverride ? rectOverride.x : comment.x}px`;
+  box.style.top = `${rectOverride ? rectOverride.y : comment.y}px`;
+  box.style.width = `${rectOverride ? rectOverride.width : comment.width}px`;
+  box.style.height = `${rectOverride ? rectOverride.height : comment.height}px`;
   box.dataset.id = comment.id;
 
   const head = document.createElement('div');
@@ -560,7 +838,7 @@ function renderComment(comment) {
   title.placeholder = '그룹 제목';
   title.addEventListener('input', () => {
     comment.title = title.value;
-    scheduleCollaborativePublish(false);
+    scheduleCollaborativePublish(true);
   });
   title.addEventListener('blur', () => commitHistoryState());
   head.appendChild(title);
@@ -579,7 +857,7 @@ function renderComment(comment) {
   description.addEventListener('input', () => {
     comment.description = description.value;
     resizeDescription();
-    scheduleCollaborativePublish(false);
+    scheduleCollaborativePublish(true);
   });
   description.addEventListener('blur', () => commitHistoryState());
   head.appendChild(description);
@@ -668,12 +946,13 @@ function renderNode(node) {
   const sourceType = sourceId ? (state.blocks.find((it) => it.id === sourceId)?.type || '') : '';
   const sourceKind = state.connectionDraft?.kind || linkKindFromType(sourceType);
   const isLinking = !!(state.connectionDraft && state.linkingActive);
-  const canBeTarget = sourceId && node.id !== sourceId ? canLinkKindToType(sourceKind, node.type) : false;
+  const canBeTarget = sourceId && node.id !== sourceId ? canLinkFromSourceToTarget(sourceId, sourceKind, node.type) : false;
   const isCandidateTarget = isLinking && canBeTarget;
   const isUnavailableTarget = isLinking && node.id !== sourceId && !canBeTarget;
   nodeEl.className = `block-node ${roleClass}${state.selectedId === node.id ? ' selected' : ''}${isUnavailableTarget ? ' non-link-target' : ''}`;
-  nodeEl.style.left = `${node.x}px`;
-  nodeEl.style.top = `${node.y}px`;
+  const posOverride = renderPresenceOverrides.nodePositions.get(node.id);
+  nodeEl.style.left = `${posOverride ? posOverride.x : node.x}px`;
+  nodeEl.style.top = `${posOverride ? posOverride.y : node.y}px`;
   nodeEl.dataset.id = node.id;
 
   const head = document.createElement('div');
@@ -718,7 +997,7 @@ function renderNode(node) {
     valueInput.addEventListener('input', () => {
       node.params = node.params || {};
       node.params.value = valueInput.value;
-      scheduleCollaborativePublish(false);
+      scheduleCollaborativePublish(true);
     });
 
     body.appendChild(valueLabel);
@@ -756,7 +1035,7 @@ function renderNode(node) {
     inItem.appendChild(inData);
     inItem.appendChild(inLabel);
     leftPinGroup.appendChild(inItem);
-  } else if (node.type === 'FUNCTION_SEND_MESSAGE') {
+  } else if (node.type === 'FUNCTION_SEND_MESSAGE' || node.type === 'FUNCTION_BROADCAST_MESSAGE') {
     leftPinGroup.classList.add('stack');
 
     const appendInPort = (label, accept, extraClass, connected) => {
@@ -786,9 +1065,11 @@ function renderNode(node) {
     };
 
     appendInPort('실행', 'exec', 'in-exec', hasIncomingExec);
-    appendInPort('player', 'player', 'in-player', hasIncomingPlayer);
+    if (node.type === 'FUNCTION_SEND_MESSAGE') {
+      appendInPort('player', 'player', 'in-player', hasIncomingPlayer);
+    }
     appendInPort('message', 'data', 'in-data', hasIncomingData);
-  } else if (node.type === 'MATH_ADD') {
+  } else if (node.type === 'MATH_ADD' || node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV') {
     leftPinGroup.classList.add('stack');
     const appendAddInput = (label, portClass) => {
       const connected = state.links.some((it) => it.to === node.id && isDataKind(it.kind || 'exec') && (it.toPortClass || '') === portClass);
@@ -801,7 +1082,10 @@ function renderNode(node) {
       inPort.dataset.accept = 'data';
       inPort.dataset.portClass = portClass;
       inPort.dataset.nodeId = node.id;
-      if (isCandidateTarget && isDataKind(sourceKind)) inPort.classList.add('candidate');
+      const candidateAllowed = (node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV')
+        ? (isNumericDataKind(sourceKind) || (sourceKind === 'data-any' && canNodeOutputBeNumeric(sourceId)))
+        : isDataKind(sourceKind);
+      if (isCandidateTarget && candidateAllowed) inPort.classList.add('candidate');
       const inLabel = document.createElement('div');
       inLabel.className = 'pin-label';
       inLabel.textContent = label;
@@ -891,6 +1175,8 @@ function renderNode(node) {
     appendOutPort('값', 'data-int');
   } else if (node.type === 'VAR_DECIMAL') {
     appendOutPort('값', 'data-decimal');
+  } else if (node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV') {
+    appendOutPort('값', 'data-number');
   } else if (node.type === 'MATH_ADD') {
     appendOutPort('값', 'data-any');
   } else {
@@ -948,6 +1234,271 @@ function computeBlockBounds() {
   return { minX, minY, maxX, maxY, width: maxX - minX, height: maxY - minY };
 }
 
+function getViewportWorldRect() {
+  const width = Math.max(1, el.workspace.clientWidth / Math.max(0.0001, state.scale));
+  const height = Math.max(1, el.workspace.clientHeight / Math.max(0.0001, state.scale));
+  const x = -state.panX / Math.max(0.0001, state.scale);
+  const y = -state.panY / Math.max(0.0001, state.scale);
+  return { x, y, width, height };
+}
+
+function measureNodeSizeInWorld(nodeId) {
+  const nodeEl = el.canvas.querySelector(`.block-node[data-id="${nodeId}"]`);
+  if (!(nodeEl instanceof HTMLElement)) {
+    return { width: BLOCK_NODE_WIDTH, height: BLOCK_NODE_ESTIMATED_HEIGHT };
+  }
+  const rect = nodeEl.getBoundingClientRect();
+  const worldW = rect.width / Math.max(0.0001, state.scale);
+  const worldH = rect.height / Math.max(0.0001, state.scale);
+  return {
+    width: Number.isFinite(worldW) && worldW > 0 ? worldW : BLOCK_NODE_WIDTH,
+    height: Number.isFinite(worldH) && worldH > 0 ? worldH : BLOCK_NODE_ESTIMATED_HEIGHT
+  };
+}
+
+function rectEdgeAnchorToward(centerX, centerY, width, height, targetX, targetY) {
+  const halfW = Math.max(0.0001, width / 2);
+  const halfH = Math.max(0.0001, height / 2);
+  const dx = targetX - centerX;
+  const dy = targetY - centerY;
+  if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) {
+    return { x: centerX, y: centerY };
+  }
+  const t = Math.max(Math.abs(dx) / halfW, Math.abs(dy) / halfH);
+  return {
+    x: centerX + (dx / t),
+    y: centerY + (dy / t)
+  };
+}
+
+function computeSceneBoundsForMinimap() {
+  const viewport = getViewportWorldRect();
+  let minX = viewport.x;
+  let minY = viewport.y;
+  let maxX = viewport.x + viewport.width;
+  let maxY = viewport.y + viewport.height;
+
+  for (const block of state.blocks) {
+    const pos = renderPresenceOverrides.nodePositions.get(block.id);
+    const size = measureNodeSizeInWorld(block.id);
+    const x = pos ? pos.x : block.x;
+    const y = pos ? pos.y : block.y;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x + size.width);
+    maxY = Math.max(maxY, y + size.height);
+  }
+  for (const comment of state.comments) {
+    const rect = renderPresenceOverrides.commentRects.get(comment.id);
+    const x = rect ? rect.x : comment.x;
+    const y = rect ? rect.y : comment.y;
+    const w = rect ? rect.width : comment.width;
+    const h = rect ? rect.height : comment.height;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x + Math.max(1, w));
+    maxY = Math.max(maxY, y + Math.max(1, h));
+  }
+
+  const rawWidth = Math.max(1, maxX - minX);
+  const rawHeight = Math.max(1, maxY - minY);
+  const pad = Math.max(80, Math.max(rawWidth, rawHeight) * 0.08);
+  return {
+    minX: minX - pad,
+    minY: minY - pad,
+    maxX: maxX + pad,
+    maxY: maxY + pad,
+    width: rawWidth + (pad * 2),
+    height: rawHeight + (pad * 2)
+  };
+}
+
+function renderMinimap(activePeers = collectSmoothedActivePeers(performance.now()), now = performance.now()) {
+  if (!(el.minimapCanvas instanceof HTMLElement)) return;
+  const width = Math.max(1, el.minimapCanvas.clientWidth);
+  const height = Math.max(1, el.minimapCanvas.clientHeight);
+  const bounds = computeSceneBoundsForMinimap();
+  const scale = Math.max(0.0001, Math.min(width / bounds.width, height / bounds.height));
+  const offsetX = (width - (bounds.width * scale)) / 2;
+  const offsetY = (height - (bounds.height * scale)) / 2;
+  minimapState.bounds = bounds;
+  minimapState.scale = scale;
+  minimapState.offsetX = offsetX;
+  minimapState.offsetY = offsetY;
+
+  const worldToMapX = (x) => offsetX + ((x - bounds.minX) * scale);
+  const worldToMapY = (y) => offsetY + ((y - bounds.minY) * scale);
+  const worldToMapW = (w) => Math.max(1, w * scale);
+  const worldToMapH = (h) => Math.max(1, h * scale);
+  const preserveAspectMinSize = (w, h, minSize = 1) => {
+    let nextW = Math.max(0.0001, w);
+    let nextH = Math.max(0.0001, h);
+    if (nextW >= minSize && nextH >= minSize) return { width: nextW, height: nextH };
+    const factor = Math.max(minSize / nextW, minSize / nextH);
+    nextW *= factor;
+    nextH *= factor;
+    return { width: nextW, height: nextH };
+  };
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'minimap-svg');
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+  for (const comment of state.comments) {
+    const rect = renderPresenceOverrides.commentRects.get(comment.id);
+    const x = rect ? rect.x : comment.x;
+    const y = rect ? rect.y : comment.y;
+    const w = rect ? rect.width : comment.width;
+    const h = rect ? rect.height : comment.height;
+    const cell = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    cell.setAttribute('class', 'minimap-comment');
+    cell.setAttribute('x', String(worldToMapX(x)));
+    cell.setAttribute('y', String(worldToMapY(y)));
+    cell.setAttribute('width', String(worldToMapW(Math.max(1, w))));
+    cell.setAttribute('height', String(worldToMapH(Math.max(1, h))));
+    cell.setAttribute('rx', '2');
+    cell.setAttribute('ry', '2');
+    svg.appendChild(cell);
+  }
+
+  const linkGroupIndex = new Map();
+  const linkGroupTotals = new Map();
+  for (const link of state.links) {
+    const key = `${link.from}->${link.to}`;
+    linkGroupTotals.set(key, (linkGroupTotals.get(key) || 0) + 1);
+  }
+
+  for (const link of state.links) {
+    const fromNode = state.blocks.find((it) => it.id === link.from);
+    const toNode = state.blocks.find((it) => it.id === link.to);
+    if (!fromNode || !toNode) continue;
+    const groupKey = `${link.from}->${link.to}`;
+    const nth = linkGroupIndex.get(groupKey) || 0;
+    const total = linkGroupTotals.get(groupKey) || 1;
+    linkGroupIndex.set(groupKey, nth + 1);
+    const fromPos = renderPresenceOverrides.nodePositions.get(fromNode.id);
+    const toPos = renderPresenceOverrides.nodePositions.get(toNode.id);
+    const fromSize = measureNodeSizeInWorld(fromNode.id);
+    const toSize = measureNodeSizeInWorld(toNode.id);
+    const fromBaseX = fromPos ? fromPos.x : fromNode.x;
+    const fromBaseY = fromPos ? fromPos.y : fromNode.y;
+    const toBaseX = toPos ? toPos.x : toNode.x;
+    const toBaseY = toPos ? toPos.y : toNode.y;
+    const fromCenterX = fromBaseX + (fromSize.width / 2);
+    const fromCenterY = fromBaseY + (fromSize.height / 2);
+    const toCenterX = toBaseX + (toSize.width / 2);
+    const toCenterY = toBaseY + (toSize.height / 2);
+    const fromAnchor = rectEdgeAnchorToward(fromCenterX, fromCenterY, fromSize.width, fromSize.height, toCenterX, toCenterY);
+    const toAnchor = rectEdgeAnchorToward(toCenterX, toCenterY, toSize.width, toSize.height, fromCenterX, fromCenterY);
+    const fromMapX = worldToMapX(fromAnchor.x);
+    const fromMapY = worldToMapY(fromAnchor.y);
+    const toMapX = worldToMapX(toAnchor.x);
+    const toMapY = worldToMapY(toAnchor.y);
+    const dx = toMapX - fromMapX;
+    const dy = toMapY - fromMapY;
+    const len = Math.hypot(dx, dy);
+    const unitNx = len > 1e-6 ? (-dy / len) : 0;
+    const unitNy = len > 1e-6 ? (dx / len) : 0;
+    const spacing = 2;
+    const offset = (nth - ((total - 1) / 2)) * spacing;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    path.setAttribute('class', 'minimap-link');
+    path.setAttribute('x1', String(fromMapX + (unitNx * offset)));
+    path.setAttribute('y1', String(fromMapY + (unitNy * offset)));
+    path.setAttribute('x2', String(toMapX + (unitNx * offset)));
+    path.setAttribute('y2', String(toMapY + (unitNy * offset)));
+    svg.appendChild(path);
+  }
+
+  for (const block of state.blocks) {
+    const pos = renderPresenceOverrides.nodePositions.get(block.id);
+    const size = measureNodeSizeInWorld(block.id);
+    const x = pos ? pos.x : block.x;
+    const y = pos ? pos.y : block.y;
+    const roleClass = isVariableType(block.type)
+      ? 'variable'
+      : (isEventType(block.type) ? 'event' : (isOperationType(block.type) ? 'operation' : 'function'));
+    const cell = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    cell.setAttribute('class', `minimap-node ${roleClass}`);
+    cell.setAttribute('x', String(worldToMapX(x)));
+    cell.setAttribute('y', String(worldToMapY(y)));
+    cell.setAttribute('width', String(worldToMapW(size.width)));
+    cell.setAttribute('height', String(worldToMapH(size.height)));
+    cell.setAttribute('rx', '1.5');
+    cell.setAttribute('ry', '1.5');
+    svg.appendChild(cell);
+  }
+
+  for (const peer of activePeers) {
+    const p = smoothPeerPresence(peer, now) || {};
+    const color = peer.color || '#d4d8e0';
+    if (p.linking?.from && p.linking?.to) {
+      const peerLink = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      peerLink.setAttribute('class', 'minimap-peer-link');
+      peerLink.setAttribute('stroke', color);
+      peerLink.setAttribute('x1', String(worldToMapX(p.linking.from.x || 0)));
+      peerLink.setAttribute('y1', String(worldToMapY(p.linking.from.y || 0)));
+      peerLink.setAttribute('x2', String(worldToMapX(p.linking.to.x || 0)));
+      peerLink.setAttribute('y2', String(worldToMapY(p.linking.to.y || 0)));
+      svg.appendChild(peerLink);
+    }
+    if (p.pointer) {
+      const cursor = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      cursor.setAttribute('class', 'minimap-peer-cursor');
+      cursor.setAttribute('fill', color);
+      cursor.setAttribute('cx', String(worldToMapX(p.pointer.x || 0)));
+      cursor.setAttribute('cy', String(worldToMapY(p.pointer.y || 0)));
+      cursor.setAttribute('r', '3');
+      svg.appendChild(cursor);
+    }
+  }
+
+  const viewport = getViewportWorldRect();
+  const viewportLeft = worldToMapX(viewport.x);
+  const viewportTop = worldToMapY(viewport.y);
+  const viewportRight = worldToMapX(viewport.x + viewport.width);
+  const viewportBottom = worldToMapY(viewport.y + viewport.height);
+  const centerX = (viewportLeft + viewportRight) / 2;
+  const centerY = (viewportTop + viewportBottom) / 2;
+  const viewportRawW = Math.max(0.0001, viewportRight - viewportLeft);
+  const viewportRawH = Math.max(0.0001, viewportBottom - viewportTop);
+  const workspaceRatio = Math.max(0.0001, el.workspace.clientWidth / Math.max(1, el.workspace.clientHeight));
+  let ratioW = viewportRawW;
+  let ratioH = viewportRawH;
+  const currentRatio = ratioW / ratioH;
+  if (currentRatio > workspaceRatio) {
+    ratioH = ratioW / workspaceRatio;
+  } else {
+    ratioW = ratioH * workspaceRatio;
+  }
+  const viewportSize = preserveAspectMinSize(ratioW, ratioH, 1);
+  const viewportRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  viewportRect.setAttribute('class', 'minimap-viewport');
+  viewportRect.setAttribute('x', String(centerX - (viewportSize.width / 2)));
+  viewportRect.setAttribute('y', String(centerY - (viewportSize.height / 2)));
+  viewportRect.setAttribute('width', String(viewportSize.width));
+  viewportRect.setAttribute('height', String(viewportSize.height));
+  viewportRect.setAttribute('rx', '2');
+  viewportRect.setAttribute('ry', '2');
+  svg.appendChild(viewportRect);
+
+  el.minimapCanvas.innerHTML = '';
+  el.minimapCanvas.appendChild(svg);
+}
+
+function focusViewportFromMinimapClient(clientX, clientY) {
+  if (!(el.minimapCanvas instanceof HTMLElement) || !minimapState.bounds) return;
+  const rect = el.minimapCanvas.getBoundingClientRect();
+  const localX = clientX - rect.left;
+  const localY = clientY - rect.top;
+  const worldX = ((localX - minimapState.offsetX) / minimapState.scale) + minimapState.bounds.minX;
+  const worldY = ((localY - minimapState.offsetY) / minimapState.scale) + minimapState.bounds.minY;
+  state.panX = (el.workspace.clientWidth / 2) - (worldX * state.scale);
+  state.panY = (el.workspace.clientHeight / 2) - (worldY * state.scale);
+  renderCanvas();
+  schedulePresencePublish(true);
+}
+
 function getScaleBounds() {
   const max = 3;
   const bounds = computeBlockBounds();
@@ -962,12 +1513,221 @@ function getScaleBounds() {
   return { min: dynamicMin, max };
 }
 
-function renderRemotePresenceLayer() {
+function lerpNumber(current, target, alpha) {
+  const c = Number.isFinite(current) ? current : 0;
+  const t = Number.isFinite(target) ? target : 0;
+  return c + ((t - c) * alpha);
+}
+
+function blendPoint(current, target, alpha) {
+  if (!target || typeof target !== 'object') return null;
+  const c = current && typeof current === 'object' ? current : { x: target.x, y: target.y };
+  return {
+    x: lerpNumber(c.x, target.x, alpha),
+    y: lerpNumber(c.y, target.y, alpha)
+  };
+}
+
+function blendRect(current, target, alpha) {
+  if (!target || typeof target !== 'object') return null;
+  const c = current && typeof current === 'object' ? current : target;
+  return {
+    startX: lerpNumber(c.startX, target.startX, alpha),
+    startY: lerpNumber(c.startY, target.startY, alpha),
+    currentX: lerpNumber(c.currentX, target.currentX, alpha),
+    currentY: lerpNumber(c.currentY, target.currentY, alpha)
+  };
+}
+
+function blendSizedBox(current, target, alpha) {
+  if (!target || typeof target !== 'object') return null;
+  const c = current && typeof current === 'object' ? current : target;
+  return {
+    id: target.id || c.id || '',
+    x: lerpNumber(c.x, target.x, alpha),
+    y: lerpNumber(c.y, target.y, alpha),
+    width: lerpNumber(c.width, target.width, alpha),
+    height: lerpNumber(c.height, target.height, alpha)
+  };
+}
+
+function blendLinking(current, target, alpha) {
+  if (!target || typeof target !== 'object') return null;
+  const c = current && typeof current === 'object' ? current : target;
+  return {
+    from: blendPoint(c.from, target.from, alpha),
+    to: blendPoint(c.to, target.to, alpha),
+    kind: target.kind || c.kind || 'exec'
+  };
+}
+
+function blendPresence(current, target, alpha) {
+  if (!target || typeof target !== 'object') return {};
+  return {
+    pointer: blendPoint(current?.pointer, target.pointer, alpha),
+    linking: blendLinking(current?.linking, target.linking, alpha),
+    commentDraft: blendRect(current?.commentDraft, target.commentDraft, alpha),
+    draggingNode: blendSizedBox(
+      current?.draggingNode,
+      target.draggingNode
+        ? { id: target.draggingNode.id, x: target.draggingNode.x, y: target.draggingNode.y, width: BLOCK_NODE_WIDTH, height: BLOCK_NODE_ESTIMATED_HEIGHT }
+        : null,
+      alpha
+    ),
+    draggingComment: blendSizedBox(current?.draggingComment, target.draggingComment, alpha),
+    resizingComment: blendSizedBox(current?.resizingComment, target.resizingComment, alpha),
+    selectedNodeId: target.selectedNodeId ?? null,
+    selectedCommentId: target.selectedCommentId ?? null
+  };
+}
+
+function smoothPeerPresence(peer, now) {
+  const target = peer?.presence || {};
+  const stored = realtimeState.smoothedPeers[peer.clientId];
+  if (!stored) {
+    const initial = cloneJson(target);
+    realtimeState.smoothedPeers[peer.clientId] = { presence: initial, at: now };
+    return initial;
+  }
+  const elapsedMs = Math.max(0, now - (stored.at || now));
+  stored.at = now;
+  const alpha = 1 - Math.exp(-elapsedMs / 70);
+  stored.presence = blendPresence(stored.presence, target, alpha);
+  return stored.presence;
+}
+
+function isTextEditingActive() {
+  const active = document.activeElement;
+  if (!(active instanceof Element)) return false;
+  return !!active.closest('input, textarea, [contenteditable="true"]');
+}
+
+function ensurePresenceAnimationLoop() {
+  if (realtimeState.presenceAnimationFrame) return;
+  const tick = (now) => {
+    realtimeState.presenceAnimationFrame = null;
+    const activePeers = collectSmoothedActivePeers(now);
+    refreshPresenceOverrides(activePeers, now);
+    applyPresenceOverridesToCanvasDom();
+    renderRemotePresenceLayer(now, activePeers);
+    const staleBefore = Date.now() - 6000;
+    const hasActivePeers = Object.values(realtimeState.peers).some((peer) => peer && peer.lastSeen >= staleBefore);
+    const hasOverrideTail = renderPresenceOverrides.nodePositions.size > 0 || renderPresenceOverrides.commentRects.size > 0;
+    if (hasActivePeers || hasOverrideTail || SHOW_SELF_PRESENCE_DEBUG) {
+      realtimeState.presenceAnimationFrame = requestAnimationFrame(tick);
+    }
+  };
+  realtimeState.presenceAnimationFrame = requestAnimationFrame(tick);
+}
+
+function collectSmoothedActivePeers(now = performance.now()) {
   const staleBefore = Date.now() - 6000;
   const activePeers = Object.values(realtimeState.peers).filter((peer) => peer && peer.lastSeen >= staleBefore);
   for (const [clientId, peer] of Object.entries(realtimeState.peers)) {
     if (!peer || peer.lastSeen < staleBefore) delete realtimeState.peers[clientId];
   }
+  for (const clientId of Object.keys(realtimeState.smoothedPeers)) {
+    if (!realtimeState.peers[clientId] || realtimeState.peers[clientId].lastSeen < staleBefore) {
+      delete realtimeState.smoothedPeers[clientId];
+    }
+  }
+  return activePeers;
+}
+
+function refreshPresenceOverrides(activePeers, now) {
+  const frameDt = realtimeState.lastPresenceFrameAt > 0
+    ? Math.max(1, Math.min(64, now - realtimeState.lastPresenceFrameAt))
+    : 16;
+  realtimeState.lastPresenceFrameAt = now;
+  const alpha = 1 - Math.exp(-frameDt / 42);
+  const nearly = (a, b) => Math.abs((a ?? 0) - (b ?? 0)) <= 0.6;
+  const activeNodeIds = new Set();
+  const activeCommentIds = new Set();
+  for (const peer of activePeers) {
+    const p = smoothPeerPresence(peer, now) || {};
+    if (p.draggingNode?.id) {
+      activeNodeIds.add(p.draggingNode.id);
+      renderPresenceOverrides.nodePositions.set(p.draggingNode.id, {
+        x: Number.isFinite(p.draggingNode.x) ? p.draggingNode.x : 0,
+        y: Number.isFinite(p.draggingNode.y) ? p.draggingNode.y : 0
+      });
+    }
+    const activeGroupDrag = p.resizingComment || p.draggingComment;
+    if (activeGroupDrag?.id) {
+      activeCommentIds.add(activeGroupDrag.id);
+      renderPresenceOverrides.commentRects.set(activeGroupDrag.id, {
+        x: Number.isFinite(activeGroupDrag.x) ? activeGroupDrag.x : 0,
+        y: Number.isFinite(activeGroupDrag.y) ? activeGroupDrag.y : 0,
+        width: Number.isFinite(activeGroupDrag.width) ? activeGroupDrag.width : 0,
+        height: Number.isFinite(activeGroupDrag.height) ? activeGroupDrag.height : 0
+      });
+    }
+  }
+  for (const [nodeId, info] of renderPresenceOverrides.nodePositions.entries()) {
+    if (activeNodeIds.has(nodeId)) continue;
+    const node = state.blocks.find((it) => it.id === nodeId);
+    if (!node || !info) {
+      renderPresenceOverrides.nodePositions.delete(nodeId);
+      continue;
+    }
+    info.x = lerpNumber(info.x, node.x, alpha);
+    info.y = lerpNumber(info.y, node.y, alpha);
+    if (nearly(info.x, node.x) && nearly(info.y, node.y)) {
+      renderPresenceOverrides.nodePositions.delete(nodeId);
+    }
+  }
+  for (const [commentId, info] of renderPresenceOverrides.commentRects.entries()) {
+    if (activeCommentIds.has(commentId)) continue;
+    const comment = state.comments.find((it) => it.id === commentId);
+    if (!comment || !info) {
+      renderPresenceOverrides.commentRects.delete(commentId);
+      continue;
+    }
+    info.x = lerpNumber(info.x, comment.x, alpha);
+    info.y = lerpNumber(info.y, comment.y, alpha);
+    info.width = lerpNumber(info.width, comment.width, alpha);
+    info.height = lerpNumber(info.height, comment.height, alpha);
+    if (
+      nearly(info.x, comment.x)
+      && nearly(info.y, comment.y)
+      && nearly(info.width, comment.width)
+      && nearly(info.height, comment.height)
+    ) {
+      renderPresenceOverrides.commentRects.delete(commentId);
+    }
+  }
+}
+
+function applyPresenceOverridesToCanvasDom() {
+  const nodeEls = el.canvas.querySelectorAll('.block-node[data-id]');
+  for (const nodeEl of nodeEls) {
+    if (!(nodeEl instanceof HTMLElement)) continue;
+    const nodeId = nodeEl.dataset.id || '';
+    const node = state.blocks.find((it) => it.id === nodeId);
+    if (!node) continue;
+    const pos = renderPresenceOverrides.nodePositions.get(nodeId);
+    nodeEl.style.left = `${Math.round((pos ? pos.x : node.x) || 0)}px`;
+    nodeEl.style.top = `${Math.round((pos ? pos.y : node.y) || 0)}px`;
+  }
+
+  const commentEls = el.canvas.querySelectorAll('.comment-box[data-id]');
+  for (const commentEl of commentEls) {
+    if (!(commentEl instanceof HTMLElement)) continue;
+    const commentId = commentEl.dataset.id || '';
+    const comment = state.comments.find((it) => it.id === commentId);
+    if (!comment) continue;
+    const rect = renderPresenceOverrides.commentRects.get(commentId);
+    commentEl.style.left = `${Math.round((rect ? rect.x : comment.x) || 0)}px`;
+    commentEl.style.top = `${Math.round((rect ? rect.y : comment.y) || 0)}px`;
+    commentEl.style.width = `${Math.max(1, Math.round((rect ? rect.width : comment.width) || 0))}px`;
+    commentEl.style.height = `${Math.max(1, Math.round((rect ? rect.height : comment.height) || 0))}px`;
+  }
+
+  // Keep wire endpoints synced with smoothed remote drag positions without full re-render.
+  updateRenderedLinkPathsOnly();
+}
+
+function renderRemotePresenceLayer(now = performance.now(), activePeers = collectSmoothedActivePeers(now)) {
   if (SHOW_SELF_PRESENCE_DEBUG) {
     activePeers.push({
       clientId: realtimeState.clientId,
@@ -984,7 +1744,7 @@ function renderRemotePresenceLayer() {
   layer.className = 'remote-presence-layer';
 
   for (const peer of activePeers) {
-    const p = peer.presence || {};
+    const p = smoothPeerPresence(peer, now) || {};
     const color = peer.color || '#d4d8e0';
     const pointer = p.pointer;
 
@@ -1020,6 +1780,28 @@ function renderRemotePresenceLayer() {
         layer.appendChild(box);
       }
     }
+    const activeGroupDrag = p.resizingComment || p.draggingComment;
+    if (activeGroupDrag) {
+      const box = document.createElement('div');
+      box.className = 'remote-group-drag';
+      box.style.left = `${Math.round(activeGroupDrag.x || 0)}px`;
+      box.style.top = `${Math.round(activeGroupDrag.y || 0)}px`;
+      box.style.width = `${Math.max(1, Math.round(activeGroupDrag.width || 0))}px`;
+      box.style.height = `${Math.max(1, Math.round(activeGroupDrag.height || 0))}px`;
+      box.style.setProperty('--remote-color', color);
+      layer.appendChild(box);
+    }
+    if (p.draggingNode) {
+      const node = p.draggingNode;
+      const box = document.createElement('div');
+      box.className = 'remote-node-drag';
+      box.style.left = `${Math.round(node.x || 0)}px`;
+      box.style.top = `${Math.round(node.y || 0)}px`;
+      box.style.width = `${Math.max(1, Math.round(node.width || BLOCK_NODE_WIDTH))}px`;
+      box.style.height = `${Math.max(1, Math.round(node.height || BLOCK_NODE_ESTIMATED_HEIGHT))}px`;
+      box.style.setProperty('--remote-color', color);
+      layer.appendChild(box);
+    }
     if (pointer) {
       const cursor = document.createElement('div');
       cursor.className = 'remote-cursor';
@@ -1043,6 +1825,9 @@ function renderRemotePresenceLayer() {
 }
 
 function renderCanvas() {
+  const now = performance.now();
+  const activePeers = collectSmoothedActivePeers(now);
+  refreshPresenceOverrides(activePeers, now);
   const bounds = getScaleBounds();
   if (state.scale > bounds.max) state.scale = bounds.max;
 
@@ -1072,7 +1857,8 @@ function renderCanvas() {
     el.canvas.appendChild(draftEl);
   }
   renderLinksLayer();
-  renderRemotePresenceLayer();
+  renderRemotePresenceLayer(now, activePeers);
+  renderMinimap(activePeers, now);
 
   el.worldInfo.textContent = `x: ${Math.round(state.panX)}, y: ${Math.round(state.panY)}, 배율: ${(state.scale * 100).toFixed(0)}%`;
 }
@@ -1111,6 +1897,25 @@ function hideContextMenu() {
   el.contextMenu.classList.add('hidden');
 }
 
+function placeContextMenu(clientX, clientY, margin = 8) {
+  const rect = el.workspace.getBoundingClientRect();
+  el.contextMenu.classList.remove('hidden');
+  el.contextMenu.style.visibility = 'hidden';
+  el.contextMenu.style.left = '0px';
+  el.contextMenu.style.top = '0px';
+
+  const menuWidth = Math.max(1, el.contextMenu.offsetWidth || 236);
+  const menuHeight = Math.max(1, el.contextMenu.offsetHeight || 180);
+  const localX = clientX - rect.left;
+  const localY = clientY - rect.top;
+  const left = Math.max(margin, Math.min(rect.width - menuWidth - margin, localX));
+  const top = Math.max(margin, Math.min(rect.height - menuHeight - margin, localY));
+
+  el.contextMenu.style.left = `${left}px`;
+  el.contextMenu.style.top = `${top}px`;
+  el.contextMenu.style.visibility = '';
+}
+
 function showContextMenu(clientX, clientY, options = {}) {
   const worldPos = toWorldPosition(clientX, clientY);
   state.contextMenuWorld = worldPos;
@@ -1120,6 +1925,7 @@ function showContextMenu(clientX, clientY, options = {}) {
   const connectFromType = connectFromId
     ? (state.blocks.find((it) => it.id === connectFromId)?.type || '')
     : '';
+  const extraActions = Array.isArray(options.extraActions) ? options.extraActions : [];
 
   el.contextMenu.innerHTML = '';
   const search = document.createElement('input');
@@ -1148,6 +1954,21 @@ function showContextMenu(clientX, clientY, options = {}) {
   const renderMenuItems = (keyword) => {
     const q = keyword.trim().toLowerCase();
     body.innerHTML = '';
+    if (!connectFromId) {
+      const toolsTitle = document.createElement('div');
+      toolsTitle.className = 'context-title';
+      toolsTitle.textContent = '도구';
+      body.appendChild(toolsTitle);
+      const autoCreateBtn = document.createElement('button');
+      autoCreateBtn.type = 'button';
+      autoCreateBtn.className = 'context-item';
+      autoCreateBtn.textContent = '해결책 제시';
+      autoCreateBtn.addEventListener('click', () => {
+        hideContextMenu();
+        openAutoCreateDialog(state.currentWorkspaceId, { x: state.contextMenuWorld.x, y: state.contextMenuWorld.y });
+      });
+      body.appendChild(autoCreateBtn);
+    }
     const filtered = !q ? allItems : allItems.filter((it) => {
       return it.title.toLowerCase().includes(q)
         || it.type.toLowerCase().includes(q)
@@ -1168,6 +1989,7 @@ function showContextMenu(clientX, clientY, options = {}) {
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'context-item';
+        button.dataset.groupKey = item.groupKey;
         button.textContent = item.title;
         button.addEventListener('click', () => {
           const created = createNode(item.type, state.contextMenuWorld.x, state.contextMenuWorld.y);
@@ -1197,10 +2019,40 @@ function showContextMenu(clientX, clientY, options = {}) {
   search.addEventListener('input', () => renderMenuItems(search.value));
   renderMenuItems('');
 
-  const rect = el.workspace.getBoundingClientRect();
-  el.contextMenu.style.left = `${Math.max(8, Math.min(rect.width - 236, clientX - rect.left))}px`;
-  el.contextMenu.style.top = `${Math.max(8, Math.min(rect.height - 280, clientY - rect.top))}px`;
-  el.contextMenu.classList.remove('hidden');
+  if (extraActions.length) {
+    const actionNodes = [];
+    const divider = document.createElement('div');
+    divider.className = 'context-title';
+    divider.textContent = '그룹';
+    actionNodes.push(divider);
+
+    for (const action of extraActions) {
+      if (!action || typeof action.label !== 'string' || typeof action.onClick !== 'function') continue;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'context-item';
+      button.textContent = action.label;
+      button.addEventListener('click', () => {
+        action.onClick();
+        renderCanvas();
+        scheduleCollaborativePublish(true);
+        schedulePresencePublish(true);
+        hideContextMenu();
+      });
+      actionNodes.push(button);
+    }
+    if (actionNodes.length) {
+      const separator = document.createElement('div');
+      separator.className = 'context-title';
+      separator.textContent = '';
+      actionNodes.push(separator);
+      for (let i = actionNodes.length - 1; i >= 0; i -= 1) {
+        body.prepend(actionNodes[i]);
+      }
+    }
+  }
+
+  placeContextMenu(clientX, clientY);
   search.focus();
 }
 
@@ -1245,10 +2097,7 @@ function showNodeContextMenu(clientX, clientY, nodeId) {
   });
   el.contextMenu.appendChild(deleteBtn);
 
-  const rect = el.workspace.getBoundingClientRect();
-  el.contextMenu.style.left = `${Math.max(8, Math.min(rect.width - 236, clientX - rect.left))}px`;
-  el.contextMenu.style.top = `${Math.max(8, Math.min(rect.height - 232, clientY - rect.top))}px`;
-  el.contextMenu.classList.remove('hidden');
+  placeContextMenu(clientX, clientY);
 }
 
 function showCommentContextMenu(clientX, clientY, commentId) {
@@ -1270,10 +2119,7 @@ function showCommentContextMenu(clientX, clientY, commentId) {
   });
   el.contextMenu.appendChild(deleteBtn);
 
-  const rect = el.workspace.getBoundingClientRect();
-  el.contextMenu.style.left = `${Math.max(8, Math.min(rect.width - 236, clientX - rect.left))}px`;
-  el.contextMenu.style.top = `${Math.max(8, Math.min(rect.height - 140, clientY - rect.top))}px`;
-  el.contextMenu.classList.remove('hidden');
+  placeContextMenu(clientX, clientY);
 }
 
 function showPortContextMenu(clientX, clientY, nodeId, portType, portClass) {
@@ -1295,10 +2141,7 @@ function showPortContextMenu(clientX, clientY, nodeId, portType, portClass) {
   });
   el.contextMenu.appendChild(disconnectBtn);
 
-  const rect = el.workspace.getBoundingClientRect();
-  el.contextMenu.style.left = `${Math.max(8, Math.min(rect.width - 236, clientX - rect.left))}px`;
-  el.contextMenu.style.top = `${Math.max(8, Math.min(rect.height - 140, clientY - rect.top))}px`;
-  el.contextMenu.classList.remove('hidden');
+  placeContextMenu(clientX, clientY);
 }
 
 function closePluginSelectMenu() {
@@ -1397,6 +2240,1177 @@ function requestConfirmDialog(title, message, confirmLabel = '확인') {
     el.confirmDialog.addEventListener('mousedown', onBackdrop);
     document.addEventListener('keydown', onKeyDown);
   });
+}
+
+function setAutoCreateAuthStatus(message, kind = '') {
+  el.autoCreateAuthStatus.textContent = message;
+  el.autoCreateAuthStatus.classList.remove('ok', 'error');
+  if (kind === 'ok' || kind === 'error') {
+    el.autoCreateAuthStatus.classList.add(kind);
+  }
+}
+
+function refreshAutoCreateGenerateEnabled() {
+  const ready = autoCreateState.authenticated
+    && !autoCreateState.generateInFlight
+    && el.autoCreatePromptInput.value.trim().length > 0;
+  el.autoCreateGenerateBtn.disabled = !ready;
+}
+
+function resizeAutoCreatePromptInput() {
+  const input = el.autoCreatePromptInput;
+  if (!(input instanceof HTMLTextAreaElement)) return;
+  const card = input.closest('.auto-create-dialog-card');
+  if (!(card instanceof HTMLElement)) return;
+  const minHeight = 112;
+  const viewportGap = 20;
+  const maxCardHeight = Math.max(240, Math.floor(window.innerHeight - (viewportGap * 2)));
+
+  // Measure non-textarea area using minimum textarea height to keep sizing linear by viewport px.
+  input.style.height = `${minHeight}px`;
+  input.style.overflowY = 'hidden';
+  const baseCardHeight = card.scrollHeight;
+  const nonTextareaHeight = Math.max(0, baseCardHeight - minHeight);
+
+  input.style.height = 'auto';
+  const desiredHeight = Math.max(minHeight, input.scrollHeight);
+  const maxHeight = Math.max(minHeight, maxCardHeight - nonTextareaHeight);
+  const nextHeight = Math.min(maxHeight, desiredHeight);
+  input.style.height = `${Math.round(nextHeight)}px`;
+  input.style.overflowY = input.scrollHeight > maxHeight ? 'auto' : 'hidden';
+}
+
+function closeAutoCreateDialog(resetGenerateState = true) {
+  el.autoCreateDialog.classList.add('hidden');
+  if (resetGenerateState) {
+    autoCreateState.targetWorkspaceId = null;
+    autoCreateState.targetOriginWorld = null;
+  }
+  if (resetGenerateState) autoCreateState.generateInFlight = false;
+  refreshAutoCreateGenerateEnabled();
+}
+
+function openAutoCreateDialog(targetWorkspaceId = null, targetOriginWorld = null) {
+  autoCreateState.targetWorkspaceId = typeof targetWorkspaceId === 'string' ? targetWorkspaceId : state.currentWorkspaceId;
+  autoCreateState.targetOriginWorld = targetOriginWorld && Number.isFinite(targetOriginWorld.x) && Number.isFinite(targetOriginWorld.y)
+    ? { x: targetOriginWorld.x, y: targetOriginWorld.y }
+    : null;
+  el.autoCreateDialog.classList.remove('hidden');
+  el.autoCreateApiKeyInput.value = autoCreateState.apiKey || '';
+  setAutoCreateAuthStatus(autoCreateState.authenticated ? '로그인 완료' : '로그인 필요', autoCreateState.authenticated ? 'ok' : '');
+  refreshAutoCreateGenerateEnabled();
+  resizeAutoCreatePromptInput();
+  el.autoCreatePromptInput.focus();
+  if (!autoCreateState.authenticated && autoCreateState.apiKey) {
+    tryAutoLoginWithStoredGeminiKey().catch(() => {});
+  }
+}
+
+function extractJsonObjectFromText(text) {
+  if (!text) return null;
+  const fenced = text.match(/```json\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : text.trim();
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    // continue
+  }
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  const sliced = candidate.slice(start, end + 1);
+  try {
+    return JSON.parse(sliced);
+  } catch {
+    return null;
+  }
+}
+
+function responseTextFromGemini(data) {
+  const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
+  const parts = [];
+  for (const candidate of candidates) {
+    const contentParts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    for (const part of contentParts) {
+      if (typeof part?.text === 'string') parts.push(part.text);
+    }
+  }
+  return parts.join('\n').trim();
+}
+
+async function verifyAutoCreateLogin() {
+  const key = el.autoCreateApiKeyInput.value.trim();
+  if (!key) {
+    setAutoCreateAuthStatus('Gemini API Key를 입력하세요.', 'error');
+    autoCreateState.authenticated = false;
+    writeStoredGeminiApiKey('');
+    refreshAutoCreateGenerateEnabled();
+    return;
+  }
+  autoCreateState.loginInFlight = true;
+  autoCreateState.apiKey = key;
+  writeStoredGeminiApiKey(key);
+  setAutoCreateAuthStatus('로그인 확인 중...');
+  el.autoCreateLoginBtn.disabled = true;
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`);
+    if (!response.ok) {
+      throw new Error(`인증 실패 (${response.status})`);
+    }
+    autoCreateState.authenticated = true;
+    setAutoCreateAuthStatus('로그인 완료', 'ok');
+  } catch (error) {
+    autoCreateState.authenticated = false;
+    setAutoCreateAuthStatus(`로그인 실패: ${error?.message || 'unknown error'}`, 'error');
+  } finally {
+    autoCreateState.loginInFlight = false;
+    autoCreateState.lastVerifiedKey = autoCreateState.authenticated ? key : '';
+    el.autoCreateLoginBtn.disabled = false;
+    refreshAutoCreateGenerateEnabled();
+  }
+}
+
+async function tryAutoLoginWithStoredGeminiKey() {
+  if (autoCreateState.autoLoginTried) return;
+  autoCreateState.autoLoginTried = true;
+  const key = String(autoCreateState.apiKey || '').trim();
+  if (!key) return;
+  if (autoCreateState.authenticated && autoCreateState.lastVerifiedKey === key) return;
+  if (autoCreateState.loginInFlight) return;
+  el.autoCreateApiKeyInput.value = key;
+  await verifyAutoCreateLogin();
+}
+
+function shouldAllowTouchExistingNodes(promptText) {
+  const text = String(promptText || '').toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes('기존 노드 수정')
+    || text.includes('기존 노드 변경')
+    || text.includes('기존 노드 건드려')
+    || text.includes('기존 노드에 연결')
+    || text.includes('기존 노드랑 연결')
+    || text.includes('기존 노드 재배치')
+    || text.includes('modify existing')
+    || text.includes('edit existing')
+    || text.includes('update existing')
+    || text.includes('connect to existing')
+    || text.includes('없애')
+    || text.includes('삭제')
+    || text.includes('지워')
+    || text.includes('제거')
+    || text.includes('바꿔')
+    || text.includes('변경')
+    || text.includes('수정')
+    || text.includes('기존')
+    || text.includes('기본 메세지')
+    || text.includes('기본 메시지')
+    || text.includes('remove')
+    || text.includes('delete')
+    || text.includes('change')
+    || text.includes('replace')
+  );
+}
+
+function createAutoCreateStreamSession(originX, originY, allowTouchExisting = false) {
+  return {
+    originX,
+    originY,
+    allowTouchExisting,
+    idMap: new Map(),
+    createdLocalNodeIds: new Set(),
+    createdLocalGroupIds: new Set(),
+    localNodeToRemoteId: new Map(),
+    localGroupToRemoteId: new Map(),
+    nodeGroupIntentByLocalNodeId: new Map(),
+    groupMemberRemoteNodeIds: new Map(),
+    nodeCount: 0,
+    linkCount: 0,
+    linkSpecCount: 0,
+    groupCount: 0,
+    modifiedCount: 0,
+    fallbackNodeIndex: 0,
+    fallbackGroupIndex: 0,
+    pendingLinks: [],
+    seenRemoteNodeIds: new Set(),
+    seenRemoteGroupIds: new Set(),
+    seenLines: new Set(),
+    lineBuffer: '',
+    lastUiAt: 0,
+    phaseMessage: '자동 생성 중입니다',
+    parsedEntryCount: 0,
+    ndjsonViolation: false,
+    textSeen: false,
+    incompleteTail: false,
+    noTextChunkLogged: false,
+    rawPayloadSamples: [],
+    rawTextSamples: []
+  };
+}
+
+function rectsOverlap(a, b, gap = 0) {
+  return !(
+    (a.x + a.width + gap) <= b.x
+    || (b.x + b.width + gap) <= a.x
+    || (a.y + a.height + gap) <= b.y
+    || (b.y + b.height + gap) <= a.y
+  );
+}
+
+function estimateNodeHeight(node) {
+  if (node.type === 'VAR_TEXT') {
+    const value = String(node.params?.value || '');
+    const lines = Math.max(1, value.split('\n').length);
+    return Math.max(132, 112 + (lines * 18));
+  }
+  if (node.type === 'FUNCTION_SEND_MESSAGE' || node.type === 'FUNCTION_BROADCAST_MESSAGE') return 150;
+  if (node.type === 'EVENT_ON_PLAYER_JOIN') return 144;
+  if (node.type === 'EVENT_ON_ENABLE') return 134;
+  if (node.type === 'MATH_ADD' || node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV') return 136;
+  return BLOCK_NODE_ESTIMATED_HEIGHT;
+}
+
+function measureNodeHeightFromDom(nodeId) {
+  const nodeEl = el.canvas?.querySelector(`.block-node[data-id="${nodeId}"]`);
+  if (!(nodeEl instanceof HTMLElement)) return null;
+  const h = nodeEl.getBoundingClientRect().height;
+  return Number.isFinite(h) && h > 0 ? Math.round(h) : null;
+}
+
+function nodeRectOf(node) {
+  const measuredHeight = measureNodeHeightFromDom(node.id);
+  return {
+    x: node.x,
+    y: node.y,
+    width: BLOCK_NODE_WIDTH,
+    height: measuredHeight || estimateNodeHeight(node)
+  };
+}
+
+function measureGroupHeaderHeightFromDom(groupId) {
+  const groupEl = el.canvas?.querySelector(`.comment-box[data-id="${groupId}"]`);
+  if (!(groupEl instanceof HTMLElement)) return null;
+  const headEl = groupEl.querySelector('.comment-head');
+  if (!(headEl instanceof HTMLElement)) return null;
+  const h = headEl.getBoundingClientRect().height;
+  return Number.isFinite(h) && h > 0 ? Math.round(h) : null;
+}
+
+function buildSearchOffsets(step = GRID_SIZE, rings = 14) {
+  const offsets = [{ x: 0, y: 0 }];
+  for (let r = 1; r <= rings; r += 1) {
+    const d = r * step;
+    for (let x = -d; x <= d; x += step) {
+      offsets.push({ x, y: -d });
+      offsets.push({ x, y: d });
+    }
+    for (let y = -d + step; y <= d - step; y += step) {
+      offsets.push({ x: -d, y });
+      offsets.push({ x: d, y });
+    }
+  }
+  return offsets;
+}
+
+function autoArrangeCreatedNodes(session) {
+  const createdNodes = state.blocks.filter((it) => session.createdLocalNodeIds.has(it.id));
+  if (!createdNodes.length) return;
+  const fixedNodes = state.blocks.filter((it) => !session.createdLocalNodeIds.has(it.id));
+  const fixedRects = fixedNodes.map((it) => nodeRectOf(it));
+  const placedCreated = [];
+  const offsets = buildSearchOffsets(GRID_SIZE, 16);
+  const minGap = 14;
+
+  createdNodes.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+  for (const node of createdNodes) {
+    const baseX = node.x;
+    const baseY = node.y;
+    const nodeHeight = nodeRectOf(node).height;
+    let chosenX = baseX;
+    let chosenY = baseY;
+    for (const off of offsets) {
+      const candidate = {
+        x: Math.round(baseX + off.x),
+        y: Math.round(baseY + off.y),
+        width: BLOCK_NODE_WIDTH,
+        height: nodeHeight
+      };
+      let collided = false;
+      for (const rect of fixedRects) {
+        if (rectsOverlap(candidate, rect, minGap)) {
+          collided = true;
+          break;
+        }
+      }
+      if (!collided) {
+        for (const rect of placedCreated) {
+          if (rectsOverlap(candidate, rect, minGap)) {
+            collided = true;
+            break;
+          }
+        }
+      }
+      if (!collided) {
+        chosenX = candidate.x;
+        chosenY = candidate.y;
+        placedCreated.push(candidate);
+        break;
+      }
+    }
+    node.x = chosenX;
+    node.y = chosenY;
+  }
+}
+
+function autoArrangeCreatedGroups(session) {
+  const createdGroups = state.comments.filter((it) => session.createdLocalGroupIds.has(it.id));
+  if (!createdGroups.length) return;
+
+  const createdNodes = state.blocks.filter((it) => session.createdLocalNodeIds.has(it.id));
+  const contentPadding = 88;
+  const groupPadding = { left: contentPadding, right: contentPadding, bottom: contentPadding };
+  const minWidth = 280;
+  const minHeight = 170;
+
+  const estimateGroupHeaderHeight = (group) => {
+    const title = String(group?.title || '');
+    const description = String(group?.description || '');
+    const titleLines = Math.max(1, Math.ceil(title.length / 28));
+    const descriptionLines = Math.max(1, description ? description.split('\n').length : 1);
+    const base = 44; // paddings + border + default controls
+    const titleHeight = titleLines * 18;
+    const descriptionHeight = Math.max(34, descriptionLines * 16);
+    return base + titleHeight + descriptionHeight + 18;
+  };
+
+  for (const group of createdGroups) {
+    const remoteGroupId = session.localGroupToRemoteId.get(group.id) || '';
+    const explicitMembers = createdNodes.filter((node) => {
+      const intendedGroup = session.nodeGroupIntentByLocalNodeId.get(node.id);
+      if (remoteGroupId && intendedGroup === remoteGroupId) return true;
+      const remoteNodeId = session.localNodeToRemoteId.get(node.id);
+      const set = remoteGroupId ? session.groupMemberRemoteNodeIds.get(remoteGroupId) : null;
+      return !!(remoteNodeId && set && set.has(remoteNodeId));
+    });
+
+    const nodesByCenterInGroup = createdNodes.filter((node) => {
+      const rect = nodeRectOf(node);
+      const cx = rect.x + (rect.width / 2);
+      const cy = rect.y + (rect.height / 2);
+      return cx >= group.x && cx <= (group.x + group.width) && cy >= group.y && cy <= (group.y + group.height);
+    });
+    const nodesInGroup = explicitMembers.length ? explicitMembers : nodesByCenterInGroup;
+    if (!nodesInGroup.length) continue;
+
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const node of nodesInGroup) {
+      const rect = nodeRectOf(node);
+      minX = Math.min(minX, rect.x);
+      minY = Math.min(minY, rect.y);
+      maxX = Math.max(maxX, rect.x + rect.width);
+      maxY = Math.max(maxY, rect.y + rect.height);
+    }
+    const measuredHeaderHeight = measureGroupHeaderHeightFromDom(group.id);
+    const headerHeight = measuredHeaderHeight || estimateGroupHeaderHeight(group);
+    const topPadding = headerHeight + contentPadding;
+    const desiredX = Math.round(minX - groupPadding.left);
+    const desiredY = Math.round(minY - topPadding);
+    const desiredWidth = Math.max(minWidth, Math.round((maxX - minX) + groupPadding.left + groupPadding.right));
+    const desiredHeight = Math.max(minHeight, Math.round((maxY - minY) + topPadding + groupPadding.bottom));
+
+    // Keep AI intent, but never allow header/top intrusion or tight edges.
+    group.x = Math.min(group.x, desiredX);
+    group.y = Math.min(group.y, desiredY);
+    group.width = desiredWidth;
+    group.height = desiredHeight;
+  }
+}
+
+function autoArrangeCreatedContent(session) {
+  if (!session) return;
+  // Render once so layout-dependent node heights (textarea, dynamic ports) are measurable.
+  renderCanvas();
+  autoArrangeCreatedNodes(session);
+  renderCanvas();
+  autoArrangeCreatedGroups(session);
+}
+
+function pushRawSample(bucket, value, limit = 12) {
+  const text = String(value || '').trim();
+  if (!text) return;
+  bucket.push(text.length > 800 ? `${text.slice(0, 800)} ...(truncated)` : text);
+  if (bucket.length > limit) bucket.shift();
+}
+
+function readRemoteNodeId(value) {
+  if (value === null || value === undefined) return '';
+  const raw = String(value).trim();
+  if (!raw) return '';
+  return raw;
+}
+
+function portSchemaForNodeType(type) {
+  if (type === 'EVENT_ON_ENABLE') {
+    return {
+      inputs: [],
+      outputs: [
+        { portClass: 'out-exec', linkKind: 'exec' },
+        { portClass: 'out-context', linkKind: 'context' }
+      ]
+    };
+  }
+  if (type === 'EVENT_ON_PLAYER_JOIN') {
+    return {
+      inputs: [{ portClass: 'in-data', accept: 'data' }],
+      outputs: [
+        { portClass: 'out-exec', linkKind: 'exec' },
+        { portClass: 'out-player', linkKind: 'player' },
+        { portClass: 'out-data-text', linkKind: 'data-text' }
+      ]
+    };
+  }
+  if (type === 'FUNCTION_SEND_MESSAGE') {
+    return {
+      inputs: [
+        { portClass: 'in-exec', accept: 'exec' },
+        { portClass: 'in-player', accept: 'player' },
+        { portClass: 'in-data', accept: 'data' }
+      ],
+      outputs: [{ portClass: 'out-exec', linkKind: 'exec' }]
+    };
+  }
+  if (type === 'FUNCTION_BROADCAST_MESSAGE') {
+    return {
+      inputs: [
+        { portClass: 'in-exec', accept: 'exec' },
+        { portClass: 'in-data', accept: 'data' }
+      ],
+      outputs: [{ portClass: 'out-exec', linkKind: 'exec' }]
+    };
+  }
+  if (type === 'MATH_ADD') {
+    return {
+      inputs: [
+        { portClass: 'in-data-a', accept: 'data' },
+        { portClass: 'in-data-b', accept: 'data' }
+      ],
+      outputs: [{ portClass: 'out-data-any', linkKind: 'data-any' }]
+    };
+  }
+  if (type === 'MATH_SUB') {
+    return {
+      inputs: [
+        { portClass: 'in-data-a', accept: 'data-number' },
+        { portClass: 'in-data-b', accept: 'data-number' }
+      ],
+      outputs: [{ portClass: 'out-data-number', linkKind: 'data-number' }]
+    };
+  }
+  if (type === 'MATH_MUL') {
+    return {
+      inputs: [
+        { portClass: 'in-data-a', accept: 'data-number' },
+        { portClass: 'in-data-b', accept: 'data-number' }
+      ],
+      outputs: [{ portClass: 'out-data-number', linkKind: 'data-number' }]
+    };
+  }
+  if (type === 'MATH_DIV') {
+    return {
+      inputs: [
+        { portClass: 'in-data-a', accept: 'data-number' },
+        { portClass: 'in-data-b', accept: 'data-number' }
+      ],
+      outputs: [{ portClass: 'out-data-number', linkKind: 'data-number' }]
+    };
+  }
+  if (type === 'VAR_TEXT') {
+    return { inputs: [], outputs: [{ portClass: 'out-data-text', linkKind: 'data-text' }] };
+  }
+  if (type === 'VAR_INTEGER') {
+    return { inputs: [], outputs: [{ portClass: 'out-data-int', linkKind: 'data-int' }] };
+  }
+  if (type === 'VAR_DECIMAL') {
+    return { inputs: [], outputs: [{ portClass: 'out-data-decimal', linkKind: 'data-decimal' }] };
+  }
+  return { inputs: [], outputs: [] };
+}
+
+function buildExistingAutoCreateContext(maxNodes = 160, maxGroups = 80) {
+  const nodes = state.blocks.slice(0, maxNodes).map((node) => ({
+    id: node.id,
+    type: node.type,
+    x: Math.round(node.x),
+    y: Math.round(node.y),
+    params: node.params || {},
+    ports: portSchemaForNodeType(node.type)
+  }));
+  const groups = state.comments.slice(0, maxGroups).map((group) => ({
+    id: group.id,
+    x: Math.round(group.x),
+    y: Math.round(group.y),
+    width: Math.round(group.width),
+    height: Math.round(group.height),
+    title: String(group.title || '')
+  }));
+  return { nodes, groups };
+}
+
+function resolveRemoteNodeRef(session, value) {
+  const raw = readRemoteNodeId(value);
+  if (!raw) return '';
+  return session.idMap.get(raw)
+    || (session.createdLocalNodeIds.has(raw) ? raw : (session.allowTouchExisting ? raw : ''));
+}
+
+function appendRawFailureLogs(session) {
+  if (!session) return;
+  if (Array.isArray(session.rawTextSamples) && session.rawTextSamples.length > 0) {
+    for (const sample of session.rawTextSamples) {
+      appendActionBarLog(sample);
+    }
+    return;
+  }
+  if (Array.isArray(session.rawPayloadSamples) && session.rawPayloadSamples.length > 0) {
+    for (const sample of session.rawPayloadSamples) {
+      appendActionBarLog(sample);
+    }
+  }
+}
+
+function applyAutoCreateStreamNode(session, spec) {
+  if (!spec || typeof spec !== 'object') return false;
+  const remoteId = readRemoteNodeId(spec.id);
+  if (session.allowTouchExisting && remoteId) {
+    const existing = state.blocks.find((it) => it.id === remoteId && !session.createdLocalNodeIds.has(it.id));
+    if (existing) {
+      if (Number.isFinite(spec.x)) existing.x = Math.round(spec.x);
+      if (Number.isFinite(spec.y)) existing.y = Math.round(spec.y);
+      if (spec.params && typeof spec.params === 'object') {
+        existing.params = existing.params || {};
+        for (const [key, value] of Object.entries(spec.params)) {
+          existing.params[key] = String(value ?? '');
+        }
+      }
+      session.idMap.set(remoteId, existing.id);
+      session.seenRemoteNodeIds.add(remoteId);
+      session.modifiedCount += 1;
+      return true;
+    }
+  }
+  if (remoteId && session.seenRemoteNodeIds.has(remoteId)) return false;
+  const type = typeof spec.type === 'string' ? spec.type : '';
+  const allowedTypes = new Set(
+    [...NODE_LIBRARY.events, ...NODE_LIBRARY.functions, ...NODE_LIBRARY.operations, ...NODE_LIBRARY.variables]
+      .map((it) => it.type)
+  );
+  if (!allowedTypes.has(type)) return false;
+
+  const index = session.fallbackNodeIndex++;
+  const colSize = 3;
+  const fallbackX = session.originX + ((index % colSize) * 260);
+  const fallbackY = session.originY + (Math.floor(index / colSize) * 170);
+  const node = {
+    id: `n${state.nextId++}`,
+    type,
+    x: Number.isFinite(spec.x) ? Math.round(session.originX + spec.x) : Math.round(fallbackX),
+    y: Number.isFinite(spec.y) ? Math.round(session.originY + spec.y) : Math.round(fallbackY),
+    params: {}
+  };
+  const functionDef = NODE_LIBRARY.functions.find((it) => it.type === type);
+  const variableDef = NODE_LIBRARY.variables.find((it) => it.type === type);
+  if (functionDef) node.params.message = functionDef.defaultMessage;
+  if (type === 'EVENT_ON_PLAYER_JOIN') node.params.message = '';
+  if (variableDef) node.params.value = variableDef.defaultValue;
+  if (spec.params && typeof spec.params === 'object') {
+    for (const [key, value] of Object.entries(spec.params)) {
+      node.params[key] = String(value ?? '');
+    }
+  }
+  state.blocks.push(node);
+  session.createdLocalNodeIds.add(node.id);
+  if (remoteId) {
+    session.idMap.set(remoteId, node.id);
+    session.seenRemoteNodeIds.add(remoteId);
+    session.localNodeToRemoteId.set(node.id, remoteId);
+  }
+  const groupId = readRemoteNodeId(spec.groupId);
+  if (groupId) session.nodeGroupIntentByLocalNodeId.set(node.id, groupId);
+  session.nodeCount += 1;
+  state.selectedId = node.id;
+  state.selectedCommentId = null;
+  return true;
+}
+
+function applyAutoCreateStreamGroup(session, spec) {
+  if (!spec || typeof spec !== 'object') return false;
+  const remoteId = typeof spec.id === 'string' ? spec.id.trim() : '';
+  if (session.allowTouchExisting && remoteId) {
+    const existing = state.comments.find((it) => it.id === remoteId && !session.createdLocalGroupIds.has(it.id));
+    if (existing) {
+      if (Number.isFinite(spec.x)) existing.x = Math.round(spec.x);
+      if (Number.isFinite(spec.y)) existing.y = Math.round(spec.y);
+      if (Number.isFinite(spec.width)) existing.width = Math.max(180, Math.round(spec.width));
+      if (Number.isFinite(spec.height)) existing.height = Math.max(120, Math.round(spec.height));
+      if (typeof spec.title === 'string' && spec.title.trim()) existing.title = spec.title.trim();
+      if (typeof spec.description === 'string' && spec.description.trim()) existing.description = spec.description.trim();
+      session.seenRemoteGroupIds.add(remoteId);
+      session.localGroupToRemoteId.set(existing.id, remoteId);
+      if (Array.isArray(spec.nodeIds)) {
+        const ids = spec.nodeIds
+          .map((it) => readRemoteNodeId(it))
+          .filter((it) => !!it);
+        if (ids.length) session.groupMemberRemoteNodeIds.set(remoteId, new Set(ids));
+      }
+      session.modifiedCount += 1;
+      return true;
+    }
+  }
+  if (remoteId && session.seenRemoteGroupIds.has(remoteId)) return false;
+  const index = session.fallbackGroupIndex++;
+  const fallbackX = session.originX + ((index % 2) * 420) - 120;
+  const fallbackY = session.originY + (Math.floor(index / 2) * 260) - 80;
+  const comment = {
+    id: `c${state.nextCommentId++}`,
+    x: Number.isFinite(spec.x) ? Math.round(session.originX + spec.x) : Math.round(fallbackX),
+    y: Number.isFinite(spec.y) ? Math.round(session.originY + spec.y) : Math.round(fallbackY),
+    width: Math.max(180, Number.isFinite(spec.width) ? Math.round(spec.width) : 520),
+    height: Math.max(120, Number.isFinite(spec.height) ? Math.round(spec.height) : 260),
+    title: typeof spec.title === 'string' && spec.title.trim() ? spec.title.trim() : '그룹 제목',
+    description: typeof spec.description === 'string' && spec.description.trim() ? spec.description.trim() : '설명'
+  };
+  state.comments.push(comment);
+  session.createdLocalGroupIds.add(comment.id);
+  if (remoteId) {
+    session.seenRemoteGroupIds.add(remoteId);
+    session.localGroupToRemoteId.set(comment.id, remoteId);
+    if (Array.isArray(spec.nodeIds)) {
+      const ids = spec.nodeIds
+        .map((it) => readRemoteNodeId(it))
+        .filter((it) => !!it);
+      if (ids.length) session.groupMemberRemoteNodeIds.set(remoteId, new Set(ids));
+    }
+  }
+  session.groupCount += 1;
+  return true;
+}
+
+function tryApplyAutoCreateStreamLink(session, spec) {
+  if (!spec || typeof spec !== 'object') return false;
+  session.linkSpecCount += 1;
+  const from = resolveRemoteNodeRef(session, spec.from);
+  const to = resolveRemoteNodeRef(session, spec.to);
+  if (typeof from !== 'string' || typeof to !== 'string' || from === to) return false;
+  const fromNode = state.blocks.find((it) => it.id === from);
+  const toNode = state.blocks.find((it) => it.id === to);
+  if (!fromNode || !toNode) return false;
+  const kind = typeof spec.linkKind === 'string' && spec.linkKind.trim()
+    ? spec.linkKind.trim()
+    : (typeof spec.kind === 'string' && spec.kind.trim() ? spec.kind.trim() : linkKindFromType(fromNode.type));
+  if (!canLinkFromSourceToTarget(from, kind, toNode.type)) return true;
+  const fromPortClass = typeof spec.fromPortClass === 'string' && spec.fromPortClass.trim()
+    ? spec.fromPortClass.trim()
+    : `out-${kind}`;
+  const toPortClass = typeof spec.toPortClass === 'string' && spec.toPortClass.trim()
+    ? spec.toPortClass.trim()
+    : targetPortClassForLink(kind, toNode.type, '');
+  if (hasDuplicateLink(from, to, kind, fromPortClass, toPortClass)) return true;
+  state.links.push({ from, to, kind, fromPortClass, toPortClass });
+  session.linkCount += 1;
+  return true;
+}
+
+function flushPendingAutoCreateStreamLinks(session) {
+  if (!session.pendingLinks.length) return;
+  const remain = [];
+  for (const spec of session.pendingLinks) {
+    if (!tryApplyAutoCreateStreamLink(session, spec)) {
+      remain.push(spec);
+    }
+  }
+  session.pendingLinks = remain;
+}
+
+function logPendingAutoCreateLinks(session) {
+  if (!session || !Array.isArray(session.pendingLinks) || session.pendingLinks.length === 0) return;
+  appendActionBarLog(`링크 적용 실패 ${session.pendingLinks.length}개`);
+  for (const spec of session.pendingLinks.slice(0, 12)) {
+    const from = readRemoteNodeId(spec?.from) || '?';
+    const to = readRemoteNodeId(spec?.to) || '?';
+    const kind = String(spec?.kind || '?');
+    appendActionBarLog(`미적용 링크: ${from} -> ${to} (${kind})`);
+  }
+}
+
+function logAutoCreateLinkSummary(session) {
+  if (!session) return;
+  appendActionBarLog(`링크 라인 ${session.linkSpecCount}개 / 적용 ${session.linkCount}개 / 수정 ${session.modifiedCount}개`);
+}
+
+function renderAutoCreateStreamProgress(session, force = false) {
+  const now = performance.now();
+  if (!force && (now - session.lastUiAt) < 90) return;
+  session.lastUiAt = now;
+  renderCanvas();
+  scheduleCollaborativePublish(true);
+  const progressMessage = `${session.phaseMessage}... 노드 ${session.nodeCount}개, 연결 ${session.linkCount}개, 그룹 ${session.groupCount}개, 수정 ${session.modifiedCount}개`;
+  showActionBar(progressMessage, '', 0, { log: false });
+}
+
+function applyAutoCreateStreamEntry(session, entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  const kind = typeof entry.kind === 'string' ? entry.kind : '';
+  const looksLikeLink = typeof entry.from === 'string' && typeof entry.to === 'string'
+    && (typeof entry.fromPortClass === 'string' || typeof entry.toPortClass === 'string' || typeof entry.linkKind === 'string');
+  if (kind === 'thinking') {
+    const message = typeof entry.message === 'string' ? entry.message.trim() : '';
+    if (message) session.phaseMessage = `생각: ${message}`;
+    return true;
+  }
+  if (kind === 'status') {
+    const message = typeof entry.message === 'string' ? entry.message.trim() : '';
+    if (message) session.phaseMessage = message;
+    return true;
+  }
+  if (kind === 'node') return applyAutoCreateStreamNode(session, entry);
+  if (kind === 'group') return applyAutoCreateStreamGroup(session, entry);
+  if (kind === 'link' || looksLikeLink) {
+    if (tryApplyAutoCreateStreamLink(session, entry)) return true;
+    session.pendingLinks.push(entry);
+    return false;
+  }
+  if (Array.isArray(entry.nodes)) {
+    let changed = false;
+    for (const node of entry.nodes) changed = applyAutoCreateStreamNode(session, node) || changed;
+    if (Array.isArray(entry.links)) {
+      for (const link of entry.links) {
+        if (!tryApplyAutoCreateStreamLink(session, link)) session.pendingLinks.push(link);
+      }
+    }
+    if (Array.isArray(entry.groups)) {
+      for (const group of entry.groups) changed = applyAutoCreateStreamGroup(session, group) || changed;
+    }
+    return changed;
+  }
+  return false;
+}
+
+function responseTextPartsFromGemini(data) {
+  const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
+  const parts = [];
+  for (const candidate of candidates) {
+    const contentParts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    for (const part of contentParts) {
+      if (typeof part?.text === 'string' && part.text) parts.push(part.text);
+    }
+  }
+  return parts;
+}
+
+function splitConcatenatedJsonObjects(text) {
+  const source = String(text || '').trim();
+  if (!source) return [];
+  const chunks = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaping = false;
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaping) {
+        escaping = false;
+      } else if (ch === '\\') {
+        escaping = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth += 1;
+      continue;
+    }
+    if (ch === '}') {
+      if (depth > 0) depth -= 1;
+      if (depth === 0 && start >= 0) {
+        chunks.push(source.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return chunks.length ? chunks : [source];
+}
+
+function processGeminiSseDataBlock(dataBlockText, session, onEntry) {
+  const lines = String(dataBlockText || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    if (line === '[DONE]') continue;
+    const payloadChunks = splitConcatenatedJsonObjects(line);
+    for (const chunk of payloadChunks) {
+      pushRawSample(session.rawPayloadSamples, chunk);
+      let payload;
+      try {
+        payload = JSON.parse(chunk);
+      } catch {
+        continue;
+      }
+      const textParts = responseTextPartsFromGemini(payload);
+      for (const part of textParts) {
+        pushRawSample(session.rawTextSamples, part);
+        ingestAutoCreateNdjsonChunk(session, part, onEntry);
+      }
+    }
+  }
+}
+
+function ingestAutoCreateNdjsonChunk(session, textChunk, onEntry) {
+  if (!textChunk) return;
+  session.textSeen = true;
+  session.lineBuffer += String(textChunk).replace(/\r/g, '');
+  let nl = session.lineBuffer.indexOf('\n');
+  while (nl >= 0) {
+    const rawLine = session.lineBuffer.slice(0, nl).trim();
+    session.lineBuffer = session.lineBuffer.slice(nl + 1);
+    if (rawLine && rawLine !== '```' && rawLine !== '```json' && !session.seenLines.has(rawLine)) {
+      session.seenLines.add(rawLine);
+      appendActionBarLog(rawLine);
+      try {
+        const parsed = JSON.parse(rawLine);
+        session.parsedEntryCount += 1;
+        onEntry(parsed);
+      } catch {
+        session.ndjsonViolation = true;
+      }
+    }
+    nl = session.lineBuffer.indexOf('\n');
+  }
+}
+
+function finalizeAutoCreateNdjson(session, onEntry) {
+  const tail = session.lineBuffer.trim();
+  session.lineBuffer = '';
+  if (!tail || tail === '```' || tail === '```json') return;
+  if (session.seenLines.has(tail)) return;
+  session.seenLines.add(tail);
+  appendActionBarLog(tail);
+  try {
+    session.parsedEntryCount += 1;
+    onEntry(JSON.parse(tail));
+  } catch {
+    // Streaming tail can be truncated; treat as incomplete, not malformed NDJSON.
+    session.incompleteTail = true;
+  }
+}
+
+async function requestAutoGeneratedBlueprintStream(promptText, allowTouchExisting, session, retryMode = false) {
+  const key = autoCreateState.apiKey;
+  if (!key || !autoCreateState.authenticated) {
+    throw new Error('먼저 Gemini API Key 로그인 후 다시 시도하세요.');
+  }
+  const systemPrompt = [
+    '너는 블록 에디터 자동 생성기다.',
+    '반드시 NDJSON 형식으로만 출력한다. 한 줄에 JSON 객체 하나만 출력하고, 코드펜스/설명문을 절대 쓰지 않는다.',
+    '지원 라인 형식:',
+    '{"kind":"thinking","message":"요청을 해석하고 필요한 노드 구성을 판단하는 중입니다"}',
+    '{"kind":"status","message":"노드 배치를 계획하는 중입니다"}',
+    '{"kind":"node","id":"a","type":"EVENT_ON_ENABLE","x":0,"y":0,"groupId":"g1","params":{}}',
+    '{"kind":"link","from":"a","to":"b","linkKind":"exec","fromPortClass":"out-exec","toPortClass":"in-exec"}',
+    '{"kind":"group","id":"g1","x":-80,"y":-60,"width":560,"height":280,"title":"초기화 흐름","description":"플러그인 시작 시 메시지 전송","nodeIds":["a","b"]}',
+    '{"kind":"done"}',
+    '허용 타입: EVENT_ON_ENABLE, EVENT_ON_PLAYER_JOIN, FUNCTION_SEND_MESSAGE, FUNCTION_BROADCAST_MESSAGE, MATH_ADD, MATH_SUB, MATH_MUL, MATH_DIV, VAR_TEXT, VAR_INTEGER, VAR_DECIMAL',
+    '링크 타입은 linkKind 필드에 넣고, 값은 exec, player, data-text, data-int, data-decimal, data-any, data-number 중 하나를 사용한다.',
+    '포트명은 반드시 표준 포트명만 사용한다. 별칭/축약/오타는 금지한다.',
+    '표준 fromPortClass: out-exec, out-player, out-data-text, out-data-int, out-data-decimal, out-data-any, out-data-number',
+    '표준 toPortClass: in-exec, in-player, in-data, in-data-a, in-data-b',
+    'FUNCTION_SEND_MESSAGE/FUNCTION_BROADCAST_MESSAGE의 메시지 입력은 in-data 계열로 연결한다.',
+    '링크를 출력하기 전에 self-check: fromPortClass/toPortClass가 표준 목록에 없으면 해당 링크를 출력하지 않는다.',
+    '타입/포트 규칙에 맞지 않는 연결은 만들지 않는다.',
+    '그룹 소속을 명확히 표현한다: node에는 groupId를 넣고, group에는 nodeIds 배열을 넣는다.',
+    'nodes/links/groups는 생성 순서대로 출력하고, 연결에 필요한 노드는 먼저 출력한다.',
+    '출력 시작 직후 thinking 라인을 먼저 출력하고, 이어서 status 라인으로 진행 단계를 중간중간 알린다.',
+    'groups 생성 여부는 AI가 판단한다.',
+    '노드가 적고 단순한 흐름이면 group 없이 구성하고, 노드가 많거나 의미 단위가 분명하면 group을 사용해 가독성을 높인다.',
+    '변수 규칙: 문자열/정수/실수 값이 필요하면 반드시 VAR_TEXT/VAR_INTEGER/VAR_DECIMAL 노드를 만들고 링크로 전달한다.',
+    '함수 입력에 값을 직접 박아 넣지 말고, 변수 노드로 분리해서 연결한다.',
+    '기존 노드와 연결/수정 시 기존 컨텍스트의 ports 정보를 반드시 따른다.',
+    '기존 노드를 수정할 때는 node/group 라인의 id에 기존 id를 그대로 사용한다. 이 경우 새로 생성하지 않고 기존 항목을 수정한다.',
+    retryMode
+      ? '직전 응답이 형식 오류였다. 이번 응답은 반드시 NDJSON 라인만 출력하고, 한 줄도 예외를 두지 않는다.'
+      : '형식 오류 없이 NDJSON 규칙을 엄격히 지킨다.',
+    allowTouchExisting
+      ? '기존 노드와 신규 노드 중 어떤 방식이 더 적절한지 AI가 판단한다. 필요한 경우 기존 노드를 수정/재연결하고, 필요하면 새 노드를 추가한다.'
+      : '기본 정책: 현재 작업 내용은 보존하고, 기존 노드는 가능한 한 건드리지 않는다. 새 노드/새 그룹을 중심으로 추가 구성한다.'
+  ].join('\n');
+
+  const existingContext = allowTouchExisting ? buildExistingAutoCreateContext() : null;
+  const userPrompt = [
+    `설명: ${promptText}`,
+    allowTouchExisting && existingContext
+      ? `기존 항목 컨텍스트(JSON): ${JSON.stringify(existingContext)}`
+      : '',
+    '좌표는 대략적으로 배치해도 된다.',
+    'group 생성 여부는 요청 의도와 복잡도를 보고 스스로 판단한다.',
+    '응답은 반드시 NDJSON 라인만 출력한다.',
+    '생성 중간에는 status 라인을 수시로 출력해 현재 단계를 알려준다.',
+    '마지막 done 전에 링크 포트명을 다시 검증하고, 표준 포트명이 아닌 링크는 제거한다.',
+    retryMode ? '다시 말하지만 NDJSON 한 줄 JSON 규칙을 절대 어기지 마라.' : ''
+  ].join('\n');
+
+  const abortController = new AbortController();
+  let timeoutReason = '';
+  let idleTimer = null;
+  const totalTimer = setTimeout(() => {
+    timeoutReason = 'AUTO_CREATE_TIMEOUT_TOTAL';
+    abortController.abort();
+  }, AUTO_CREATE_STREAM_TOTAL_TIMEOUT_MS);
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      timeoutReason = 'AUTO_CREATE_TIMEOUT_IDLE';
+      abortController.abort();
+    }, AUTO_CREATE_STREAM_IDLE_TIMEOUT_MS);
+  };
+  resetIdleTimer();
+
+  let response;
+  try {
+    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_GENERATE_MODEL)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: userPrompt }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          responseMimeType: 'text/plain'
+        }
+      }),
+      signal: abortController.signal
+    });
+  } catch (error) {
+    if (idleTimer) clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    if (error?.name === 'AbortError') {
+      const timeoutError = new Error(timeoutReason || '스트림 응답 대기 시간 초과');
+      timeoutError.code = timeoutReason || 'AUTO_CREATE_TIMEOUT';
+      throw timeoutError;
+    }
+    throw error;
+  }
+  if (!response.ok) {
+    if (idleTimer) clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    throw new Error(`생성 실패 (${response.status})`);
+  }
+  if (!response.body) {
+    if (idleTimer) clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    throw new Error('스트리밍을 지원하지 않는 응답입니다.');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let sseBuffer = '';
+  const onEntry = (entry) => {
+    if (!entry || (entry.kind === 'done')) return;
+    const changed = applyAutoCreateStreamEntry(session, entry);
+    flushPendingAutoCreateStreamLinks(session);
+    if (changed) renderAutoCreateStreamProgress(session);
+  };
+  try {
+    while (true) {
+      let readResult;
+      try {
+        readResult = await reader.read();
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          const timeoutError = new Error(timeoutReason || '스트림 응답 대기 시간 초과');
+          timeoutError.code = timeoutReason || 'AUTO_CREATE_TIMEOUT';
+          throw timeoutError;
+        }
+        throw error;
+      }
+      const { done, value } = readResult;
+      if (done) break;
+      resetIdleTimer();
+      sseBuffer += decoder.decode(value, { stream: true });
+      let sep = sseBuffer.indexOf('\n\n');
+      while (sep >= 0) {
+        const block = sseBuffer.slice(0, sep);
+        sseBuffer = sseBuffer.slice(sep + 2);
+        const lines = block.split('\n');
+        let dataLines = '';
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            dataLines += `${line.slice(5).trimStart()}\n`;
+          }
+        }
+        const payloadText = dataLines.trim();
+        if (payloadText && payloadText !== '[DONE]') {
+          processGeminiSseDataBlock(payloadText, session, onEntry);
+        }
+        sep = sseBuffer.indexOf('\n\n');
+      }
+    }
+    const remainText = decoder.decode();
+    if (remainText) sseBuffer += remainText;
+    if (sseBuffer) {
+      const lines = sseBuffer.split('\n');
+      let dataLines = '';
+      for (const line of lines) {
+        if (line.startsWith('data:')) {
+          dataLines += `${line.slice(5).trimStart()}\n`;
+        }
+      }
+      const payloadText = dataLines.trim();
+      if (payloadText && payloadText !== '[DONE]') {
+        processGeminiSseDataBlock(payloadText, session, onEntry);
+      }
+    }
+    finalizeAutoCreateNdjson(session, onEntry);
+    flushPendingAutoCreateStreamLinks(session);
+    autoArrangeCreatedContent(session);
+    logAutoCreateLinkSummary(session);
+    logPendingAutoCreateLinks(session);
+    renderAutoCreateStreamProgress(session, true);
+    if (session.parsedEntryCount === 0) {
+      appendRawFailureLogs(session);
+      const emptyError = new Error('AI 출력 0건');
+      emptyError.code = 'NDJSON_EMPTY';
+      throw emptyError;
+    }
+    if (session.ndjsonViolation || (session.textSeen && session.parsedEntryCount === 0)) {
+      appendRawFailureLogs(session);
+      const formatError = new Error(session.ndjsonViolation ? 'NDJSON 형식 오류' : 'NDJSON 응답이 잘려 유효 라인을 만들지 못함');
+      formatError.code = session.ndjsonViolation ? 'NDJSON_INVALID' : 'NDJSON_INCOMPLETE';
+      throw formatError;
+    }
+    return {
+      nodeCount: session.nodeCount,
+      linkCount: session.linkCount,
+      groupCount: session.groupCount,
+      modifiedCount: session.modifiedCount
+    };
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+  }
+}
+
+function buildSolutionContextSnapshot(maxNodes = 120) {
+  const nodes = state.blocks.slice(0, maxNodes).map((node) => ({
+    id: node.id,
+    type: node.type,
+    params: node.params || {}
+  }));
+  const links = state.links.slice(0, 240).map((link) => ({
+    from: link.from,
+    to: link.to,
+    kind: link.kind || 'exec'
+  }));
+  return { nodeCount: state.blocks.length, linkCount: state.links.length, nodes, links };
+}
+
+function normalizeSolutionLines(text) {
+  return String(text || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.replace(/^\s*[-*]\s*/, '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+async function requestAiSolutions(promptText) {
+  const key = autoCreateState.apiKey;
+  if (!key || !autoCreateState.authenticated) {
+    throw new Error('먼저 Gemini API Key 로그인 후 다시 시도하세요.');
+  }
+  const context = buildSolutionContextSnapshot();
+  const systemPrompt = [
+    '너는 블록 에디터 해결책 제시 도우미다.',
+    '절대 블록을 생성/수정하지 말고, 사용자에게 실행 가능한 해결 단계만 제시한다.',
+    '응답은 한국어 불릿 리스트 최대 6개로 짧고 명확하게 작성한다.',
+    '가능하면 EVENT_ON_*, FUNCTION_*, MATH_*, VAR_* 타입명을 포함한다.'
+  ].join('\n');
+  const userPrompt = [
+    `요청: ${promptText}`,
+    `현재 블록 상태(JSON): ${JSON.stringify(context)}`
+  ].join('\n');
+
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_SOLUTION_MODEL)}:generateContent?key=${encodeURIComponent(key)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+      generationConfig: { temperature: 0.3 }
+    })
+  });
+  if (!response.ok) throw new Error(`해결책 생성 실패 (${response.status})`);
+  const payload = await response.json();
+  const lines = normalizeSolutionLines(responseTextFromGemini(payload));
+  if (!lines.length) throw new Error('유효한 해결책 응답이 없습니다.');
+  return lines;
+}
+
+async function runAutoCreateFromDialog() {
+  const promptText = el.autoCreatePromptInput.value.trim();
+  if (!promptText) {
+    setAutoCreateAuthStatus('설명을 입력하세요.', 'error');
+    return;
+  }
+  if (!autoCreateState.authenticated) {
+    setAutoCreateAuthStatus('먼저 로그인하세요.', 'error');
+    return;
+  }
+
+  autoCreateState.generateInFlight = true;
+  refreshAutoCreateGenerateEnabled();
+  actionBarState.logs = [];
+  renderActionBarLogs();
+  showActionBar('AI 해결책을 생성 중입니다...', '', 0);
+  try {
+    const solutions = await requestAiSolutions(promptText);
+    actionBarState.logs = solutions.map((line) => ({ message: `- ${line}`, kind: '' }));
+    renderActionBarLogs();
+    setActionBarExpanded(true);
+    setAutoCreateAuthStatus('해결책 생성 완료', 'ok');
+    showActionBar(`해결책 ${solutions.length}개 제시`, 'ok', 2500);
+    setResult({
+      ok: true,
+      kind: 'solution_suggestions',
+      prompt: promptText,
+      suggestions: solutions
+    });
+    closeAutoCreateDialog(false);
+  } catch (error) {
+    setAutoCreateAuthStatus(`해결책 생성 실패: ${error?.message || 'unknown error'}`, 'error');
+    showActionBar(`해결책 생성 실패: ${error?.message || 'unknown error'}`, 'error', 3800);
+  } finally {
+    autoCreateState.generateInFlight = false;
+    refreshAutoCreateGenerateEnabled();
+  }
 }
 
 function syncPluginSelectLabel() {
@@ -1576,6 +3590,8 @@ function undoHistory() {
   if (!prevSerialized) return;
   applyCapturedEditorState(prevSerialized);
   historyState.lastSerialized = prevSerialized;
+  scheduleWorkspacePersist(true);
+  scheduleCollaborativePublish(true);
 }
 
 function redoHistory() {
@@ -1586,6 +3602,8 @@ function redoHistory() {
   historyState.undo.push(nextSerialized);
   if (historyState.undo.length > HISTORY_LIMIT) historyState.undo.shift();
   historyState.lastSerialized = nextSerialized;
+  scheduleWorkspacePersist(true);
+  scheduleCollaborativePublish(true);
 }
 
 function captureCollaborativeState() {
@@ -1619,6 +3637,11 @@ function applyCollaborativeStateFromRemote(payload) {
   realtimeState.suspended = true;
   historyState.applying = true;
   try {
+    const localCommentDraft = state.commentDraft ? cloneJson(state.commentDraft) : null;
+    const localDraggingNode = state.draggingNode ? cloneJson(state.draggingNode) : null;
+    const localDraggingComment = state.draggingComment ? cloneJson(state.draggingComment) : null;
+    const localResizingComment = state.resizingComment ? cloneJson(state.resizingComment) : null;
+    const localPanning = state.panning ? cloneJson(state.panning) : null;
     const localConnectionDraft = state.connectionDraft && state.linkingActive
       ? cloneJson(state.connectionDraft)
       : null;
@@ -1692,9 +3715,19 @@ function applyCollaborativeStateFromRemote(payload) {
       }
     }
     state.draggingNode = null;
+    if (localDraggingNode && typeof localDraggingNode.id === 'string' && state.blocks.some((it) => it.id === localDraggingNode.id)) {
+      state.draggingNode = localDraggingNode;
+    }
     state.draggingComment = null;
+    if (localDraggingComment && typeof localDraggingComment.id === 'string' && state.comments.some((it) => it.id === localDraggingComment.id)) {
+      state.draggingComment = localDraggingComment;
+    }
     state.resizingComment = null;
-    state.commentDraft = null;
+    if (localResizingComment && typeof localResizingComment.id === 'string' && state.comments.some((it) => it.id === localResizingComment.id)) {
+      state.resizingComment = localResizingComment;
+    }
+    state.commentDraft = localCommentDraft;
+    state.panning = localPanning;
     renderWorkspaceTree();
     renderCanvas();
     saveWorkspaceState();
@@ -1706,7 +3739,11 @@ function applyCollaborativeStateFromRemote(payload) {
 }
 
 async function publishCollaborativeStateNow() {
-  if (realtimeState.suspended || !realtimeState.connected || realtimeState.publishInFlight) return;
+  if (realtimeState.suspended || !realtimeState.connected) return;
+  if (realtimeState.publishInFlight) {
+    realtimeState.publishQueued = true;
+    return;
+  }
   const collabState = captureCollaborativeState();
   const serialized = JSON.stringify(collabState);
   if (!serialized || serialized === realtimeState.lastPublishedSerialized) return;
@@ -1728,6 +3765,10 @@ async function publishCollaborativeStateNow() {
     // ignore transient realtime failures
   } finally {
     realtimeState.publishInFlight = false;
+    if (realtimeState.publishQueued) {
+      realtimeState.publishQueued = false;
+      publishCollaborativeStateNow();
+    }
   }
 }
 
@@ -1810,7 +3851,11 @@ function buildLocalPresence() {
 }
 
 async function publishPresenceNow() {
-  if (realtimeState.suspended || !realtimeState.connected || realtimeState.presenceInFlight) return;
+  if (realtimeState.suspended || !realtimeState.connected) return;
+  if (realtimeState.presenceInFlight) {
+    realtimeState.presenceQueued = true;
+    return;
+  }
   const presence = buildLocalPresence();
   const serialized = JSON.stringify(presence);
   if (!serialized || serialized === realtimeState.lastPresenceSerialized) return;
@@ -1830,6 +3875,10 @@ async function publishPresenceNow() {
     // ignore
   } finally {
     realtimeState.presenceInFlight = false;
+    if (realtimeState.presenceQueued) {
+      realtimeState.presenceQueued = false;
+      publishPresenceNow();
+    }
   }
 }
 
@@ -1862,6 +3911,10 @@ function connectCollaborativeRealtime() {
   };
   es.onerror = () => {
     realtimeState.connected = false;
+    if (realtimeState.presenceAnimationFrame) {
+      cancelAnimationFrame(realtimeState.presenceAnimationFrame);
+      realtimeState.presenceAnimationFrame = null;
+    }
   };
   es.onmessage = (event) => {
     if (!event?.data) return;
@@ -1889,6 +3942,7 @@ function connectCollaborativeRealtime() {
         presence: body,
         lastSeen: Date.now()
       };
+      ensurePresenceAnimationLoop();
       renderRemotePresenceLayer();
     }
   };
@@ -2507,6 +4561,8 @@ async function saveProject() {
 }
 
 function installEvents() {
+  let minimapDragging = false;
+
   const suppressNativeContextMenu = (event) => {
     event.preventDefault();
   };
@@ -2539,6 +4595,55 @@ function installEvents() {
     rebuildPluginSelectMenu();
     await loadSelectedPlugin().catch((error) => setResult(String(error)));
   });
+
+  el.autoCreateApiKeyInput.addEventListener('input', () => {
+    autoCreateState.apiKey = el.autoCreateApiKeyInput.value.trim();
+    autoCreateState.autoLoginTried = false;
+    autoCreateState.lastVerifiedKey = '';
+    if (!autoCreateState.apiKey) {
+      writeStoredGeminiApiKey('');
+      autoCreateState.authenticated = false;
+      setAutoCreateAuthStatus('로그인 필요');
+    } else {
+      writeStoredGeminiApiKey(autoCreateState.apiKey);
+    }
+    refreshAutoCreateGenerateEnabled();
+  });
+  el.autoCreatePromptInput.addEventListener('input', () => {
+    resizeAutoCreatePromptInput();
+    refreshAutoCreateGenerateEnabled();
+  });
+  el.autoCreateLoginBtn.addEventListener('click', () => {
+    verifyAutoCreateLogin().catch((error) => {
+      autoCreateState.authenticated = false;
+      setAutoCreateAuthStatus(`로그인 실패: ${error?.message || 'unknown error'}`, 'error');
+      refreshAutoCreateGenerateEnabled();
+    });
+  });
+  el.autoCreateGenerateBtn.addEventListener('click', () => {
+    runAutoCreateFromDialog().catch((error) => {
+      setAutoCreateAuthStatus(`생성 실패: ${error?.message || 'unknown error'}`, 'error');
+      autoCreateState.generateInFlight = false;
+      refreshAutoCreateGenerateEnabled();
+    });
+  });
+  el.autoCreateCancelBtn.addEventListener('click', () => {
+    closeAutoCreateDialog();
+  });
+  el.autoCreateDialog.addEventListener('mousedown', (event) => {
+    if (event.target === el.autoCreateDialog) {
+      closeAutoCreateDialog();
+    }
+  });
+
+  if (el.minimapCanvas instanceof HTMLElement) {
+    el.minimapCanvas.addEventListener('mousedown', (event) => {
+      if (event.button !== 0) return;
+      minimapDragging = true;
+      focusViewportFromMinimapClient(event.clientX, event.clientY);
+      event.preventDefault();
+    });
+  }
 
   el.addFolderMenuBtn.addEventListener('click', async () => {
     closeWorkspaceTreeMenu();
@@ -2697,6 +4802,7 @@ function installEvents() {
   document.addEventListener('keydown', (event) => {
     const target = event.target instanceof Element ? event.target : null;
     const typing = !!target?.closest('input, textarea, [contenteditable="true"]');
+    const selectingText = hasActiveTextSelection();
     const withCtrl = event.ctrlKey || event.metaKey;
     const key = event.key.toLowerCase();
 
@@ -2711,20 +4817,37 @@ function installEvents() {
       return;
     }
 
-    if (!typing && withCtrl && key === 'c') {
+    if (!typing && !selectingText && withCtrl && key === 'c') {
       if (copySelectedNodeToClipboard()) {
         event.preventDefault();
         setResult('노드 복사됨');
       }
       return;
     }
-    if (!typing && withCtrl && key === 'v') {
+    if (!typing && !selectingText && withCtrl && key === 'v') {
       if (pasteNodeFromClipboard()) {
         event.preventDefault();
         renderCanvas();
         setResult('노드 붙여넣기됨');
       }
       return;
+    }
+
+    if (!typing && event.key === 'Backspace') {
+      if (state.selectedId) {
+        event.preventDefault();
+        removeNode(state.selectedId);
+        renderCanvas();
+        schedulePresencePublish(true);
+        return;
+      }
+      if (state.selectedCommentId) {
+        event.preventDefault();
+        removeComment(state.selectedCommentId);
+        renderCanvas();
+        schedulePresencePublish(true);
+        return;
+      }
     }
 
     if (event.code === 'Space') {
@@ -2736,6 +4859,7 @@ function installEvents() {
       hideContextMenu();
       closePluginSelectMenu();
       closeWorkspaceTreeMenu();
+      closeAutoCreateDialog();
       renderCanvas();
       schedulePresencePublish(true);
     }
@@ -2787,7 +4911,15 @@ function installEvents() {
     if (commentEl instanceof HTMLElement && commentEl.dataset.id) {
       state.selectedCommentId = commentEl.dataset.id;
       state.selectedId = null;
-      showCommentContextMenu(event.clientX, event.clientY, commentEl.dataset.id);
+      const commentId = commentEl.dataset.id;
+      showContextMenu(event.clientX, event.clientY, {
+        extraActions: [
+          {
+            label: '그룹 삭제',
+            onClick: () => removeComment(commentId)
+          }
+        ]
+      });
       renderCanvas();
       return;
     }
@@ -2816,6 +4948,11 @@ function installEvents() {
   });
 
   document.addEventListener('mousemove', (event) => {
+    if (minimapDragging) {
+      focusViewportFromMinimapClient(event.clientX, event.clientY);
+      return;
+    }
+
     state.mouseWorld = toWorldPosition(event.clientX, event.clientY);
     schedulePresencePublish(false);
     renderRemotePresenceLayer();
@@ -2956,6 +5093,11 @@ function installEvents() {
   });
 
   document.addEventListener('mouseup', (event) => {
+    if (minimapDragging) {
+      minimapDragging = false;
+      return;
+    }
+
     if (state.commentDraft) {
       const draft = state.commentDraft;
       const x = Math.min(draft.startX, draft.currentX);
@@ -3040,11 +5182,29 @@ function installEvents() {
     if (!el.contextMenu.contains(event.target) && event.target !== el.workspace && event.target !== el.canvas) return;
     if (event.target === el.workspace || event.target === el.canvas) hideContextMenu();
   });
+  ensureActionBarStructure();
+  const actionBarHead = el.actionBar?.querySelector('.action-bar-head');
+  if (actionBarHead instanceof HTMLElement) {
+    actionBarHead.addEventListener('click', (event) => {
+      event.preventDefault();
+      setActionBarExpanded(!actionBarState.expanded);
+    });
+  }
+  window.addEventListener('resize', () => {
+    scheduleRelayoutRender();
+    if (!el.autoCreateDialog.classList.contains('hidden')) {
+      resizeAutoCreatePromptInput();
+    }
+  });
 
   window.addEventListener('beforeunload', () => {
     if (realtimeState.eventSource) {
       realtimeState.eventSource.close();
       realtimeState.eventSource = null;
+    }
+    if (realtimeState.presenceAnimationFrame) {
+      cancelAnimationFrame(realtimeState.presenceAnimationFrame);
+      realtimeState.presenceAnimationFrame = null;
     }
   });
 
@@ -3052,6 +5212,11 @@ function installEvents() {
 }
 
 async function init() {
+  ensureActionBarStructure();
+  autoCreateState.apiKey = readStoredGeminiApiKey();
+  if (autoCreateState.apiKey) {
+    tryAutoLoginWithStoredGeminiKey().catch(() => {});
+  }
   loadWorkspaceState();
   await loadServerDraft();
   applyWorkspaceSnapshot(state.currentWorkspaceId || state.selectedWorkspaceId);
@@ -3067,6 +5232,9 @@ async function init() {
   window.addEventListener('load', scheduleRelayoutRender, { once: true });
   await refreshPluginList();
   scheduleRelayoutRender();
+  setActionBarExpanded(false);
+  renderActionBarLogs();
+  resizeAutoCreatePromptInput();
   requestAnimationFrame(() => {
     if (document.activeElement instanceof HTMLElement && document.activeElement !== document.body) {
       document.activeElement.blur();

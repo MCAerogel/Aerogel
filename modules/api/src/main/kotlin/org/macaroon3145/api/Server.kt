@@ -60,6 +60,19 @@ object Server {
         return registry.player(name)
     }
 
+    val players: List<ConnectedPlayer>
+        get() {
+            val registry = checkNotNull(playerRegistry) { "Server is not initialized yet: playerRegistry is unavailable." }
+            return registry.players()
+        }
+
+    fun broadcastMessage(message: String) {
+        val normalized = message
+        players.forEach { player ->
+            player.sendMessage(normalized)
+        }
+    }
+
     fun getWorlds(): List<World> = worldRegistry?.allWorlds() ?: emptyList()
 
     fun getMainTick(): Long = mainTickScheduler.currentTick

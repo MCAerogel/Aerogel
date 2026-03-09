@@ -8,6 +8,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
+import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -363,6 +364,10 @@ private object FoliaRuntimeBootstrap {
     }
 
     private fun resolveSidecarJvmArgs(): List<String> {
+        val sidecarEncoding = System.getProperty("aerogel.folia.sidecar.file-encoding")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: Charset.defaultCharset().name()
         val explicitXms = System.getProperty("aerogel.folia.sidecar.xms")
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
@@ -373,12 +378,19 @@ private object FoliaRuntimeBootstrap {
             ?.let { "-Xmx$it" }
         if (explicitXms != null || explicitXmx != null) {
             return listOfNotNull(
+                "-Dfile.encoding=$sidecarEncoding",
+                "-Dsun.jnu.encoding=$sidecarEncoding",
                 explicitXms ?: "-Xms${defaultSidecarXmsMb}M",
                 explicitXmx ?: "-Xmx${defaultSidecarXmxMb}M"
             )
         }
 
-        return listOf("-Xms${defaultSidecarXmsMb}M", "-Xmx${defaultSidecarXmxMb}M")
+        return listOf(
+            "-Dfile.encoding=$sidecarEncoding",
+            "-Dsun.jnu.encoding=$sidecarEncoding",
+            "-Xms${defaultSidecarXmsMb}M",
+            "-Xmx${defaultSidecarXmxMb}M"
+        )
     }
 
     private fun downloadFoliaJar(info: FoliaDownloadInfo, targetPath: Path) {

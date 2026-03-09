@@ -39,14 +39,23 @@ data class FallingBlockLandedEvent(
     val chunkPos: ChunkPos
 )
 
+data class FallingBlockDroppedEvent(
+    val blockX: Int,
+    val blockY: Int,
+    val blockZ: Int,
+    val blockStateId: Int,
+    val chunkPos: ChunkPos
+)
+
 data class FallingBlockTickEvents(
     val spawned: List<FallingBlockSnapshot>,
     val updated: List<FallingBlockSnapshot>,
     val removed: List<FallingBlockRemovedEvent>,
-    val landed: List<FallingBlockLandedEvent>
+    val landed: List<FallingBlockLandedEvent>,
+    val dropped: List<FallingBlockDroppedEvent>
 ) {
     fun isEmpty(): Boolean {
-        return spawned.isEmpty() && updated.isEmpty() && removed.isEmpty() && landed.isEmpty()
+        return spawned.isEmpty() && updated.isEmpty() && removed.isEmpty() && landed.isEmpty() && dropped.isEmpty()
     }
 }
 
@@ -104,6 +113,7 @@ class FallingBlockSystem(
     private val reservedPendingEntityIds = ConcurrentHashMap.newKeySet<Int>()
     private val collidableStateCache = ConcurrentHashMap<Int, Boolean>()
     private val fallThroughStateCache = ConcurrentHashMap<Int, Boolean>()
+    private val impactFragileStateCache = ConcurrentHashMap<Int, Boolean>()
 
     fun spawn(
         entityId: Int,
@@ -175,16 +185,17 @@ class FallingBlockSystem(
         chunkDeltaSecondsProvider: ((ChunkPos) -> Double)? = null,
         chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
     ): FallingBlockTickEvents {
-        if (deltaSeconds <= 0.0) return FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList())
+        if (deltaSeconds <= 0.0) return FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
 
         val spawned = ArrayList<FallingBlockSnapshot>()
         val updated = ArrayList<FallingBlockSnapshot>()
         val removed = ArrayList<FallingBlockRemovedEvent>()
         val landed = ArrayList<FallingBlockLandedEvent>()
+        val dropped = ArrayList<FallingBlockDroppedEvent>()
         val chunkDeltaSecondsByChunk = HashMap<ChunkPos, Double>()
 
         flushPendingSpawnsInto(spawned)
-        if (entities.isEmpty()) return FallingBlockTickEvents(spawned, updated, removed, landed)
+        if (entities.isEmpty()) return FallingBlockTickEvents(spawned, updated, removed, landed, dropped)
 
         for ((entityId, entity) in entities.toList()) {
             val chunkPos = ChunkPos(entity.chunkX, entity.chunkZ)
@@ -220,10 +231,11 @@ class FallingBlockSystem(
                         val landedY = floor(entity.y).toInt()
                         val landedX = floor(entity.x).toInt()
                         val landedZ = floor(entity.z).toInt()
-                        if (landedY in WORLD_MIN_Y..WORLD_MAX_Y && tryPlaceLandedBlock(landedX, landedY, landedZ, entity.blockStateId)) {
-                            clearBlockEntity(landedX, landedY, landedZ)
-                            landed.add(
-                                FallingBlockLandedEvent(
+                        val landingStateId = if (landedY in WORLD_MIN_Y..WORLD_MAX_Y) blockStateAt(landedX, landedY, landedZ) else 0
+                        val supportStateId = if (landedY - 1 in WORLD_MIN_Y..WORLD_MAX_Y) blockStateAt(landedX, landedY - 1, landedZ) else 0
+                        if (landedY in WORLD_MIN_Y..WORLD_MAX_Y && shouldDropOnLanding(landedX, landedY, landedZ)) {
+                            dropped.add(
+                                FallingBlockDroppedEvent(
                                     blockX = landedX,
                                     blockY = landedY,
                                     blockZ = landedZ,
@@ -231,6 +243,30 @@ class FallingBlockSystem(
                                     chunkPos = ChunkPos(landedX shr 4, landedZ shr 4)
                                 )
                             )
+                        } else if (landedY in WORLD_MIN_Y..WORLD_MAX_Y) {
+                            if (tryPlaceLandedBlock(landedX, landedY, landedZ, entity.blockStateId)) {
+                                clearBlockEntity(landedX, landedY, landedZ)
+                                landed.add(
+                                    FallingBlockLandedEvent(
+                                        blockX = landedX,
+                                        blockY = landedY,
+                                        blockZ = landedZ,
+                                        blockStateId = entity.blockStateId,
+                                        chunkPos = ChunkPos(landedX shr 4, landedZ shr 4)
+                                    )
+                                )
+                            } else {
+                                // Vanilla-like fallback: if landing placement is blocked, drop item instead.
+                                dropped.add(
+                                    FallingBlockDroppedEvent(
+                                        blockX = landedX,
+                                        blockY = landedY,
+                                        blockZ = landedZ,
+                                        blockStateId = entity.blockStateId,
+                                        chunkPos = ChunkPos(landedX shr 4, landedZ shr 4)
+                                    )
+                                )
+                            }
                         }
                     }
                 }
@@ -262,7 +298,7 @@ class FallingBlockSystem(
             }
             chunkTimeRecorder?.invoke(newChunk, System.nanoTime() - startedAtNanos)
         }
-        return FallingBlockTickEvents(spawned, updated, removed, landed)
+        return FallingBlockTickEvents(spawned, updated, removed, landed, dropped)
     }
 
     internal fun flushPendingSpawns() {
@@ -305,6 +341,14 @@ class FallingBlockSystem(
         return true
     }
 
+    private fun shouldDropOnLanding(x: Int, y: Int, z: Int): Boolean {
+        val landingState = blockStateAt(x, y, z)
+        if (isImpactFragileState(landingState)) return true
+        if (y - 1 < WORLD_MIN_Y) return false
+        val supportState = blockStateAt(x, y - 1, z)
+        return isImpactFragileState(supportState)
+    }
+
     private fun stepEntity(entity: MutableFallingBlock, tickScale: Double) {
         entity.vy -= GRAVITY_PER_TICK * tickScale
 
@@ -328,8 +372,8 @@ class FallingBlockSystem(
             } else if (entity.vy <= VELOCITY_EPSILON) {
                 val feet = nextY - 0.01
                 if (collidesFootprint(entity.x, feet, entity.z)) {
-                    val blockY = floor(feet).toInt()
-                    nextY = blockY + 1.0
+                    val supportY = floor(feet).toInt()
+                    nextY = supportY + 1.0
                     entity.vy = 0.0
                     stepOnGround = true
                 }
@@ -436,6 +480,16 @@ class FallingBlockSystem(
         }
     }
 
+    private fun isImpactFragileState(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        return impactFragileStateCache.computeIfAbsent(stateId) { id ->
+            val blockKey = BlockStateRegistry.parsedState(id)?.blockKey ?: return@computeIfAbsent false
+            blockKey in FALLING_BLOCK_IMPACT_BREAK_KEYS ||
+                blockKey.endsWith("_button") ||
+                blockKey.endsWith("_pressure_plate")
+        }
+    }
+
     private fun addToChunkIndex(chunkPos: ChunkPos, entityId: Int) {
         chunkIndex.computeIfAbsent(chunkPos) { ConcurrentHashMap.newKeySet<Int>() }.add(entityId)
     }
@@ -476,6 +530,7 @@ class FallingBlockSystem(
         private const val WORLD_MAX_Y = 319
         private val json = Json { ignoreUnknownKeys = true }
         private val FALL_THROUGH_BLOCK_KEYS = loadBlockTag("falling_block_pass_through")
+        private val FALLING_BLOCK_IMPACT_BREAK_KEYS = loadBlockTag("falling_block_impact_break")
 
         private fun loadBlockTag(tagName: String): Set<String> {
             return resolveBlockTag(tagName, HashSet())

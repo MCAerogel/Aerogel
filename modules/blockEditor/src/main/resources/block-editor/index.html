@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Aerogel Studio</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" />
-<link rel="stylesheet" href="/static/style.css?v=20260308e" />
+<link rel="stylesheet" href="/static/style.css?v=20260309g" />
 </head>
 <body oncontextmenu="return false">
 <div class="app">
@@ -36,6 +36,10 @@
     </div>
 
     <div class="sidebar-bottom">
+      <section class="minimap-panel">
+        <div class="workspace-hub-title">전체 공간 미리보기</div>
+        <div id="minimapCanvas" class="minimap-canvas" aria-label="전체 공간 미리보기"></div>
+      </section>
       <div class="row">
         <button id="saveBtn" class="btn" type="button">저장</button>
       </div>
@@ -46,6 +50,13 @@
     <div id="workspaceToolbar" class="workspace-toolbar">
       <div>우클릭: 이벤트/함수/연산/변수 추가 | 빈 공간 좌클릭 드래그: 이동 | 휠: 확대/축소</div>
       <div id="worldInfo">x: 0, y: 0, 배율: 100%</div>
+    </div>
+    <div id="actionBar" class="action-bar hidden" aria-live="polite">
+      <div class="action-bar-head">
+        <div id="actionBarMessage" class="action-bar-message"></div>
+        <button id="actionBarToggle" class="action-bar-toggle" type="button" aria-expanded="false" aria-label="로그 펼치기"></button>
+      </div>
+      <div id="actionBarLogs" class="action-bar-logs hidden"></div>
     </div>
     <div id="workspace" class="workspace">
       <div id="canvas" class="canvas"></div>
@@ -73,6 +84,23 @@
     </div>
   </div>
 </div>
-<script src="/static/app.js?v=20260308h"></script>
+<div id="autoCreateDialog" class="name-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="autoCreateDialogTitle">
+  <div class="name-dialog-card auto-create-dialog-card">
+    <div id="autoCreateDialogTitle" class="name-dialog-title">해결책 제시</div>
+    <label for="autoCreateApiKeyInput">Gemini API Key</label>
+    <div class="auto-create-auth-row">
+      <input id="autoCreateApiKeyInput" type="password" autocomplete="off" placeholder="AIza..." />
+      <button id="autoCreateLoginBtn" class="btn ghost" type="button">로그인</button>
+    </div>
+    <div id="autoCreateAuthStatus" class="auto-create-status">로그인 필요</div>
+    <label for="autoCreatePromptInput">설명</label>
+    <textarea id="autoCreatePromptInput" placeholder="문제를 설명하면, 현재 블록 상태를 바탕으로 해결책을 제시합니다"></textarea>
+    <div class="name-dialog-actions">
+      <button id="autoCreateCancelBtn" class="btn ghost" type="button">취소</button>
+      <button id="autoCreateGenerateBtn" class="btn" type="button" disabled>제시</button>
+    </div>
+  </div>
+</div>
+<script src="/static/app.js?v=20260309aa"></script>
 </body>
 </html>

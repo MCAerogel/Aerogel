@@ -18,6 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Future
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -42,6 +43,21 @@ data class FluidBlockChange(
 
 data class FluidTickEvents(
     val changed: List<FluidBlockChange>
+) {
+    fun isEmpty(): Boolean = changed.isEmpty()
+}
+
+data class GrassBlockChange(
+    val x: Int,
+    val y: Int,
+    val z: Int,
+    val previousStateId: Int,
+    val stateId: Int,
+    val chunkPos: ChunkPos
+)
+
+data class GrassTickEvents(
+    val changed: List<GrassBlockChange>
 ) {
     fun isEmpty(): Boolean = changed.isEmpty()
 }
@@ -89,6 +105,10 @@ class World(
     private val inFlightChunkBuilds = ConcurrentHashMap<ChunkPos, InFlightChunkBuild>()
     private val pendingFluidUpdates = ConcurrentHashMap.newKeySet<BlockPos>()
     private val pendingFluidTickChanges = ConcurrentLinkedQueue<FluidBlockChange>()
+    private val pendingGrassUpdates = ConcurrentHashMap.newKeySet<BlockPos>()
+    private val pendingGrassUpdatesByChunk = ConcurrentHashMap<ChunkPos, MutableSet<BlockPos>>()
+    private val pendingGrassDelaySeconds = ConcurrentHashMap<BlockPos, Double>()
+    private val pendingGrassTickChanges = ConcurrentLinkedQueue<GrassBlockChange>()
     private val pendingAnimalTickEvents = ConcurrentLinkedQueue<AnimalTickEvents>()
     private val droppedItemLastTickNanos = ConcurrentHashMap<ChunkPos, Long>()
     private val droppedItemChunkAccumulatorSeconds = ConcurrentHashMap<ChunkPos, Double>()
@@ -97,8 +117,10 @@ class World(
     private val fallingBlockLastTickNanos = ConcurrentHashMap<ChunkPos, Long>()
     private val fluidLastTickNanos = ConcurrentHashMap<ChunkPos, Long>()
     private val fluidChunkAccumulatorSeconds = ConcurrentHashMap<ChunkPos, Double>()
+    private val grassLastTickNanos = ConcurrentHashMap<ChunkPos, Long>()
     private val animalChunkTickInFlight = ConcurrentHashMap<ChunkPos, AtomicBoolean>()
     private val fluidChunkTickInFlight = ConcurrentHashMap<ChunkPos, AtomicBoolean>()
+    private val grassChunkTickInFlight = ConcurrentHashMap<ChunkPos, AtomicBoolean>()
     private val chunkActorScheduler = ChunkActorScheduler()
     @Volatile private var warmedSeed: Long = Long.MIN_VALUE
     private val warmupFutureRef = AtomicReference<CompletableFuture<Long>?>(null)
@@ -303,6 +325,10 @@ class World(
         setBlockStateInternal(x, y, z, stateId, enqueueFluidUpdates = false)
     }
 
+    fun setBlockStateFromChunkLoad(x: Int, y: Int, z: Int, stateId: Int) {
+        setBlockStateInternalFromChunkLoad(x, y, z, stateId)
+    }
+
     private fun setBlockStateInternal(x: Int, y: Int, z: Int, stateId: Int, enqueueFluidUpdates: Boolean) {
         val pos = BlockPos(x, y, z)
         val chunkPos = pos.chunkPos()
@@ -320,6 +346,7 @@ class World(
             if (enqueueFluidUpdates) {
                 enqueueFluidUpdatesAround(x, y, z)
             }
+            enqueueGrassUpdatesAround(x, y, z)
             return
         }
         changedBlockStates[pos] = stateId
@@ -332,6 +359,32 @@ class World(
         if (enqueueFluidUpdates) {
             enqueueFluidUpdatesAround(x, y, z)
         }
+        enqueueGrassUpdatesAround(x, y, z)
+    }
+
+    private fun setBlockStateInternalFromChunkLoad(x: Int, y: Int, z: Int, stateId: Int) {
+        val pos = BlockPos(x, y, z)
+        val chunkPos = pos.chunkPos()
+        val base = baseBlockStateProvider(x, y, z)
+        val previous = changedBlockStates[pos] ?: base
+        if (previous == stateId) return
+        if (stateId == base) {
+            changedBlockStates.remove(pos)
+            changedBlocksByChunk[chunkPos]?.remove(pos)
+            changedBlockEntities.remove(pos)
+            changedBlockEntitiesByChunk[chunkPos]?.remove(pos)
+            changedBlockRevisionByChunk.computeIfAbsent(chunkPos) { AtomicLong(0L) }.incrementAndGet()
+            FoliaSharedMemoryWorldGenerator.invalidateChunkGeneratedAndLighting(key, chunkPos.x, chunkPos.z)
+            markTerrainChunkDirty(chunkPos)
+            return
+        }
+        changedBlockStates[pos] = stateId
+        changedBlocksByChunk
+            .computeIfAbsent(chunkPos) { ConcurrentHashMap.newKeySet() }
+            .add(pos)
+        changedBlockRevisionByChunk.computeIfAbsent(chunkPos) { AtomicLong(0L) }.incrementAndGet()
+        FoliaSharedMemoryWorldGenerator.invalidateChunkGeneratedAndLighting(key, chunkPos.x, chunkPos.z)
+        markTerrainChunkDirty(chunkPos)
     }
 
     fun setBlockEntity(x: Int, y: Int, z: Int, data: BlockEntityData?) {
@@ -1376,6 +1429,93 @@ class World(
         return FluidTickEvents(ready)
     }
 
+    fun tickGrass(
+        deltaSeconds: Double,
+        activeSimulationChunks: Set<ChunkPos>? = null,
+        onChunkChanged: ((List<GrassBlockChange>) -> Unit)? = null,
+        onDispatchComplete: (() -> Unit)? = null,
+        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)? = null
+    ): GrassTickEvents {
+        val ready = ArrayList<GrassBlockChange>()
+        while (true) {
+            val changed = pendingGrassTickChanges.poll() ?: break
+            ready.add(changed)
+        }
+        if (deltaSeconds <= 0.0) {
+            onDispatchComplete?.invoke()
+            return GrassTickEvents(ready)
+        }
+        if (pendingGrassUpdatesByChunk.isEmpty()) {
+            grassLastTickNanos.clear()
+            onDispatchComplete?.invoke()
+            return GrassTickEvents(ready)
+        }
+
+        val byChunk = LinkedHashMap<ChunkPos, MutableList<BlockPos>>()
+        for ((chunkPos, positions) in pendingGrassUpdatesByChunk) {
+            if (activeSimulationChunks != null && chunkPos !in activeSimulationChunks) continue
+            if (positions.isEmpty()) continue
+            byChunk.computeIfAbsent(chunkPos) { ArrayList() }.addAll(positions)
+        }
+        if (byChunk.isEmpty()) {
+            grassLastTickNanos.clear()
+            onDispatchComplete?.invoke()
+            return GrassTickEvents(ready)
+        }
+        pruneIdleChunkTimingState(grassLastTickNanos, byChunk.keys)
+
+        val pendingTasks = AtomicInteger(0)
+        for ((chunkPos, positions) in byChunk) {
+            if (!tryAcquireChunkTick(grassChunkTickInFlight, chunkPos)) {
+                continue
+            }
+            pendingTasks.incrementAndGet()
+            chunkActorScheduler.submit(chunkPos) {
+                try {
+                    val chunkDeltaSeconds = consumeChunkElapsedDeltaSeconds(
+                        chunkPos = chunkPos,
+                        fallbackSeconds = deltaSeconds,
+                        lastTickMap = grassLastTickNanos
+                    )
+                    if (chunkDeltaSeconds <= 0.0) {
+                        return@submit emptyList<GrassBlockChange>()
+                    }
+                    val currentPositions = claimPendingGrassUpdates(chunkPos, positions)
+                    if (currentPositions.isEmpty()) {
+                        return@submit emptyList<GrassBlockChange>()
+                    }
+                    val localChanged = ArrayList<GrassBlockChange>()
+                    processGrassCandidatesChunk(
+                        chunkPos = chunkPos,
+                        positions = currentPositions,
+                        chunkDeltaSeconds = chunkDeltaSeconds,
+                        out = localChanged,
+                        chunkTimeRecorder = chunkTimeRecorder
+                    )
+                    if (localChanged.isNotEmpty()) {
+                        if (onChunkChanged != null) {
+                            onChunkChanged(localChanged)
+                        } else {
+                            for (change in localChanged) {
+                                pendingGrassTickChanges.add(change)
+                            }
+                        }
+                    }
+                    localChanged
+                } finally {
+                    releaseChunkTick(grassChunkTickInFlight, chunkPos)
+                    if (onDispatchComplete != null && pendingTasks.decrementAndGet() == 0) {
+                        onDispatchComplete()
+                    }
+                }
+            }
+        }
+        if (pendingTasks.get() == 0) {
+            onDispatchComplete?.invoke()
+        }
+        return GrassTickEvents(ready)
+    }
+
     private fun consumeChunkElapsedDeltaSeconds(
         chunkPos: ChunkPos,
         fallbackSeconds: Double,
@@ -1405,6 +1545,171 @@ class World(
             return scaledFallbackSeconds
         }
         return scaledElapsedSeconds
+    }
+
+    private fun claimPendingGrassUpdates(chunkPos: ChunkPos, seedPositions: List<BlockPos>): List<BlockPos> {
+        if (seedPositions.isEmpty()) return drainPendingGrassUpdatesForChunk(chunkPos)
+        val bucket = pendingGrassUpdatesByChunk[chunkPos]
+        val out = LinkedHashSet<BlockPos>(seedPositions.size)
+        for (pos in seedPositions) {
+            if (pos.chunkPos() != chunkPos) continue
+            if (!pendingGrassUpdates.remove(pos)) continue
+            bucket?.remove(pos)
+            out.add(pos)
+        }
+        if (bucket != null && bucket.isEmpty()) {
+            pendingGrassUpdatesByChunk.remove(chunkPos, bucket)
+        }
+        if (out.isNotEmpty()) return out.toList()
+        return drainPendingGrassUpdatesForChunk(chunkPos)
+    }
+
+    private fun drainPendingGrassUpdatesForChunk(chunkPos: ChunkPos): List<BlockPos> {
+        val bucket = pendingGrassUpdatesByChunk.remove(chunkPos) ?: return emptyList()
+        if (bucket.isEmpty()) return emptyList()
+        val out = ArrayList<BlockPos>(bucket.size)
+        for (pos in bucket) {
+            if (pendingGrassUpdates.remove(pos)) {
+                out.add(pos)
+            }
+        }
+        return out
+    }
+
+    private fun processGrassCandidatesChunk(
+        chunkPos: ChunkPos,
+        positions: List<BlockPos>,
+        chunkDeltaSeconds: Double,
+        out: MutableList<GrassBlockChange>,
+        chunkTimeRecorder: ((ChunkPos, Long) -> Unit)?
+    ) {
+        val started = if (chunkTimeRecorder != null) System.nanoTime() else 0L
+        var processed = 0
+        try {
+            for (pos in positions) {
+                if (processed >= GRASS_MAX_CANDIDATES_PER_CHUNK_TICK) {
+                    requeueGrassCandidate(pos)
+                    continue
+                }
+                processed++
+                if (pos.y !in WORLD_MIN_Y..WORLD_MAX_Y) continue
+                val current = blockStateAt(pos.x, pos.y, pos.z)
+                if (current != DIRT_BLOCK_STATE_ID && current != GRASS_BLOCK_STATE_ID) {
+                    pendingGrassDelaySeconds.remove(pos)
+                    continue
+                }
+                val remaining = pendingGrassDelaySeconds[pos] ?: continue
+                val nextRemaining = remaining - chunkDeltaSeconds
+                if (nextRemaining > 0.0) {
+                    pendingGrassDelaySeconds[pos] = nextRemaining
+                    requeueGrassCandidate(pos)
+                    continue
+                }
+                pendingGrassDelaySeconds.remove(pos)
+                if (current == GRASS_BLOCK_STATE_ID) {
+                    when (canGrassStayAtCached(pos.x, pos.y, pos.z)) {
+                        null -> {}
+                        false -> {
+                        setBlockStateWithoutFluidUpdates(pos.x, pos.y, pos.z, DIRT_BLOCK_STATE_ID)
+                        out.add(
+                            GrassBlockChange(
+                                x = pos.x,
+                                y = pos.y,
+                                z = pos.z,
+                                previousStateId = current,
+                                stateId = DIRT_BLOCK_STATE_ID,
+                                chunkPos = chunkPos
+                            )
+                        )
+                        }
+                        true -> {}
+                    }
+                    continue
+                }
+                if (current != DIRT_BLOCK_STATE_ID) continue
+                val canSpread = canGrassSpreadToCached(pos.x, pos.y, pos.z)
+                if (canSpread == null) continue
+                if (!canSpread) continue
+                setBlockStateWithoutFluidUpdates(pos.x, pos.y, pos.z, GRASS_BLOCK_STATE_ID)
+                out.add(
+                    GrassBlockChange(
+                        x = pos.x,
+                        y = pos.y,
+                        z = pos.z,
+                        previousStateId = current,
+                        stateId = GRASS_BLOCK_STATE_ID,
+                        chunkPos = chunkPos
+                    )
+                )
+            }
+        } finally {
+            if (chunkTimeRecorder != null) {
+                chunkTimeRecorder(chunkPos, System.nanoTime() - started)
+            }
+        }
+    }
+
+    private fun canGrassSpreadToCached(x: Int, y: Int, z: Int): Boolean? {
+        val canStay = canGrassStayAtCached(x, y, z) ?: return null
+        if (!canStay) return false
+        if (y >= WORLD_MAX_Y) return false
+        val brightness = rawBrightnessAtIfCached(x, y + 1, z) ?: return false
+        if (brightness < 9) return false
+        for ((dx, dz) in HORIZONTAL_NEIGHBOR_OFFSETS) {
+            if (blockStateAtIfCached(x + dx, y, z + dz) != GRASS_BLOCK_STATE_ID) continue
+            val neighborCanStay = canGrassStayAtCached(x + dx, y, z + dz) ?: continue
+            if (neighborCanStay) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun canGrassStayAtCached(x: Int, y: Int, z: Int): Boolean? {
+        if (y >= WORLD_MAX_Y) return false
+        val brightness = rawBrightnessAtIfCached(x, y + 1, z) ?: return null
+        return brightness >= 4
+    }
+
+    private fun enqueueGrassUpdatesAround(x: Int, y: Int, z: Int) {
+        enqueueGrassCandidate(x, y, z)
+        if (y > WORLD_MIN_Y) {
+            enqueueGrassCandidate(x, y - 1, z)
+        }
+        if (y < WORLD_MAX_Y) {
+            enqueueGrassCandidate(x, y + 1, z)
+        }
+        for ((dx, dz) in HORIZONTAL_NEIGHBOR_OFFSETS) {
+            enqueueGrassCandidate(x + dx, y, z + dz)
+            if (y > WORLD_MIN_Y) {
+                enqueueGrassCandidate(x + dx, y - 1, z + dz)
+            }
+        }
+    }
+
+    private fun enqueueGrassCandidate(x: Int, y: Int, z: Int) {
+        val stateId = blockStateAt(x, y, z)
+        enqueueGrassCandidateIfEligible(x, y, z, stateId)
+    }
+
+    private fun enqueueGrassCandidateIfEligible(x: Int, y: Int, z: Int, stateId: Int) {
+        if (y !in WORLD_MIN_Y..WORLD_MAX_Y) return
+        if (stateId != DIRT_BLOCK_STATE_ID && stateId != GRASS_BLOCK_STATE_ID) return
+        val pos = BlockPos(x, y, z)
+        pendingGrassDelaySeconds.computeIfAbsent(pos) {
+            ThreadLocalRandom.current().nextDouble(GRASS_CANDIDATE_MIN_DELAY_SECONDS, GRASS_CANDIDATE_MAX_DELAY_SECONDS)
+        }
+        pendingGrassUpdates.add(pos)
+        pendingGrassUpdatesByChunk
+            .computeIfAbsent(pos.chunkPos()) { ConcurrentHashMap.newKeySet() }
+            .add(pos)
+    }
+
+    private fun requeueGrassCandidate(pos: BlockPos) {
+        pendingGrassUpdates.add(pos)
+        pendingGrassUpdatesByChunk
+            .computeIfAbsent(pos.chunkPos()) { ConcurrentHashMap.newKeySet() }
+            .add(pos)
     }
 
     private fun consumeChunkFixedStepDeltaSeconds(
@@ -2089,7 +2394,18 @@ class World(
         private const val NO_WATER_LEVEL = -1
         private const val SPAWN_SEARCH_CHUNK_RADIUS = 8
         private const val MAX_CHUNK_CATCHUP_MULTIPLIER = 4.0
+        private const val GRASS_CANDIDATE_MIN_DELAY_SECONDS = 8.0
+        private const val GRASS_CANDIDATE_MAX_DELAY_SECONDS = 90.0
+        private const val GRASS_MAX_CANDIDATES_PER_CHUNK_TICK = 2048
+        private val DIRT_BLOCK_STATE_ID = BlockStateRegistry.defaultStateId("minecraft:dirt") ?: AIR_STATE_ID
+        private val GRASS_BLOCK_STATE_ID = BlockStateRegistry.defaultStateId("minecraft:grass_block") ?: AIR_STATE_ID
         private val HORIZONTAL_DIRS = arrayOf(
+            1 to 0,
+            -1 to 0,
+            0 to 1,
+            0 to -1
+        )
+        private val HORIZONTAL_NEIGHBOR_OFFSETS = arrayOf(
             1 to 0,
             -1 to 0,
             0 to 1,

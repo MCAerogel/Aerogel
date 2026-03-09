@@ -55,6 +55,7 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.io.PrintStream
+import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
 import java.util.Properties
 import java.util.concurrent.Executors
@@ -134,10 +135,10 @@ fun main() {
         ?.coerceAtMost(1.0)
         ?: 1.0
     ServerConfig.maxViewDistanceChunks = props.getProperty("max-view-distance-chunks")?.toIntOrNull()
-        ?.coerceIn(2, 32)
+        ?.coerceAtLeast(2)
         ?: 32
     ServerConfig.maxSimulationDistanceChunks = props.getProperty("max-simulation-distance-chunks")?.toIntOrNull()
-        ?.coerceIn(2, 32)
+        ?.coerceAtLeast(2)
         ?: 16
     ServerConfig.chunkWorkerThreads = parsedChunkWorkerThreads
     ServerConfig.compressionThreshold = props.getProperty("compression-threshold")?.toIntOrNull()
@@ -356,6 +357,7 @@ private fun createFilteredPrintStream(
     original: PrintStream,
     suppress: (String) -> Boolean
 ): PrintStream {
+    val consoleCharset = Charset.defaultCharset()
     val filtered = object : OutputStream() {
         private val localBuffer = ThreadLocal.withInitial { ByteArrayOutputStream(256) }
 
@@ -377,13 +379,13 @@ private fun createFilteredPrintStream(
         }
 
         private fun flushLine(buffer: ByteArrayOutputStream) {
-            val line = buffer.toString(StandardCharsets.UTF_8)
+            val line = buffer.toString(consoleCharset)
             buffer.reset()
             if (suppress(line)) return
             original.println(line)
         }
     }
-    return PrintStream(filtered, true, StandardCharsets.UTF_8)
+    return PrintStream(filtered, true, consoleCharset)
 }
 
 private fun shouldSuppressJvmWarningLine(line: String): Boolean {

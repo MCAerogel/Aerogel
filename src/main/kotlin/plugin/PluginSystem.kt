@@ -1431,6 +1431,13 @@ private class RuntimePlayerRegistry : PlayerRegistry {
         val session = PlayerSessionManager.byName(name)
         return if (session != null) RuntimeConnectedPlayer.fromSession(session) else null
     }
+
+    override fun players(): List<ConnectedPlayer> {
+        return PlayerSessionManager.players()
+            .asSequence()
+            .map { RuntimeConnectedPlayer.fromSession(it) }
+            .toList()
+    }
 }
 
 private class RuntimeInventoryBridge : InventoryRuntimeBridge {

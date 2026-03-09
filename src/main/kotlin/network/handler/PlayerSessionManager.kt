@@ -177,6 +177,8 @@ data class PlayerSession(
     val hotbarBlockEntityTypeIds: IntArray,
     val hotbarBlockEntityNbtPayloads: Array<ByteArray?>,
     @Volatile var cursorStack: ItemStackState,
+    @Volatile var cursorOriginContainerId: Int,
+    @Volatile var cursorOriginSlot: Int,
     @Volatile var inventoryStateId: Int,
     @Volatile var openContainerId: Int,
     @Volatile var openContainerType: Int,
@@ -307,7 +309,6 @@ private data class ActiveBlockBreakVisual(
     val startedAtNanos: Long,
     val startedStateId: Int,
     val startedHeldItemKey: String?,
-    var fixedBreakSeconds: Double?,
     var progressSeconds: Double,
     var lastStage: Int
 )
@@ -1239,6 +1240,8 @@ data class EncodedStackSection(
             hotbarBlockEntityTypeIds = IntArray(9) { -1 },
             hotbarBlockEntityNbtPayloads = arrayOfNulls(9),
             cursorStack = ItemStackState.empty(),
+            cursorOriginContainerId = NO_CURSOR_ORIGIN_CONTAINER_ID,
+            cursorOriginSlot = NO_CURSOR_ORIGIN_SLOT,
             inventoryStateId = 0,
             openContainerId = 0,
             openContainerType = CONTAINER_TYPE_PLAYER_INVENTORY,
@@ -2776,6 +2779,11 @@ data class EncodedStackSection(
                 physicsDeltaSeconds = physicsDeltaSeconds,
                 context = simulationContext
             )
+            scheduleGrassEvents(
+                tickSequence = tickSequence,
+                physicsDeltaSeconds = physicsDeltaSeconds,
+                context = simulationContext
+            )
             tickFurnaces(tickSequence, physicsDeltaSeconds, simulationContext)
             scheduleEntityPushing(tickSequence, simulationContext, physicsDeltaSeconds)
         }
@@ -4204,7 +4212,7 @@ data class EncodedStackSection(
                             worldSessions = sessionsSnapshot,
                             events = WorldPhysicsEvents(
                                 droppedItems = chunkEvents,
-                                fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
+                                fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList()),
                                 thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
                                 animals = org.macaroon3145.world.AnimalTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
                             ),
@@ -4238,7 +4246,7 @@ data class EncodedStackSection(
                                 worldSessions = sessionsSnapshot,
                                 events = WorldPhysicsEvents(
                                     droppedItems = org.macaroon3145.world.DroppedItemTickEvents(emptyList(), emptyList(), emptyList()),
-                                    fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList()),
+                                    fallingBlocks = org.macaroon3145.world.FallingBlockTickEvents(emptyList(), emptyList(), emptyList(), emptyList(), emptyList()),
                                     thrownItems = org.macaroon3145.world.ThrownItemTickEvents(emptyList(), emptyList(), emptyList()),
                                     animals = chunkEvents
                                 ),
@@ -4321,6 +4329,7 @@ data class EncodedStackSection(
             .groupBy { it.chunkPos }
         val fallingRemovedByChunk = fallingEvents.removed.groupBy { it.chunkPos }
         val fallingLandedByChunk = fallingEvents.landed.groupBy { it.chunkPos }
+        val fallingDroppedByChunk = fallingEvents.dropped.groupBy { it.chunkPos }
         val fallingSpawnedByChunk = fallingEvents.spawned.groupBy { it.chunkPos }
         val fallingUpdatedByChunk = fallingEvents.updated.groupBy { it.chunkPos }
         val thrownRemovedByChunk = thrownRemoved.groupBy { it.chunkPos }
@@ -4347,6 +4356,7 @@ data class EncodedStackSection(
         chunksInOrder.addAll(droppedUpdatedByChunk.keys)
         chunksInOrder.addAll(fallingRemovedByChunk.keys)
         chunksInOrder.addAll(fallingLandedByChunk.keys)
+        chunksInOrder.addAll(fallingDroppedByChunk.keys)
         chunksInOrder.addAll(fallingSpawnedByChunk.keys)
         chunksInOrder.addAll(fallingUpdatedByChunk.keys)
         chunksInOrder.addAll(thrownRemovedByChunk.keys)
@@ -4419,9 +4429,9 @@ data class EncodedStackSection(
                 val packet = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
                 for (session in worldSessions) {
                     val wasVisible = session.visibleDroppedItemEntityIds.remove(removed.entityId)
+                    val hadTracker = session.droppedItemTrackerStates.remove(removed.entityId) != null
                     val inLoadedChunk = session.loadedChunks.contains(chunkPos)
-                    if (!wasVisible && !inLoadedChunk) continue
-                    session.droppedItemTrackerStates.remove(removed.entityId)
+                    if (!wasVisible && !hadTracker && !inLoadedChunk) continue
                     val ctx = contexts[session.channelId] ?: continue
                     if (!ctx.channel().isActive) continue
                     enqueueDroppedItemPacket(outboundByContext, ctx, packet)
@@ -4467,6 +4477,17 @@ data class EncodedStackSection(
                     if (!ctx.channel().isActive) continue
                     enqueueDroppedItemPacket(outboundByContext, ctx, packet)
                 }
+            }
+            for (fallingDrop in fallingDroppedByChunk[chunkPos].orEmpty()) {
+                val itemId = itemIdForState(fallingDrop.blockStateId)
+                if (itemId < 0) continue
+                spawnBrokenBlockDropsInWorld(
+                    world = world,
+                    x = fallingDrop.blockX,
+                    y = fallingDrop.blockY,
+                    z = fallingDrop.blockZ,
+                    drops = listOf(org.macaroon3145.world.VanillaDrop.from(itemId = itemId, count = 1))
+                )
             }
             for (snapshot in fallingSpawnedByChunk[chunkPos].orEmpty()) {
                 syncFallingBlockSnapshot(
@@ -4771,6 +4792,41 @@ data class EncodedStackSection(
         }
     }
 
+    private fun scheduleGrassEvents(
+        tickSequence: Long,
+        physicsDeltaSeconds: Double,
+        context: TickSimulationContext
+    ) {
+        for ((worldKey, activeSimulationChunks) in context.activeChunksByWorld) {
+            val world = WorldManager.world(worldKey)
+            if (world == null) continue
+            try {
+                val chunkProcessingFrame = world.beginChunkProcessingFrame(tickSequence)
+                val grassEvents = world.tickGrass(
+                    physicsDeltaSeconds,
+                    activeSimulationChunks,
+                    onChunkChanged = { changedList ->
+                        if (changedList.isEmpty()) return@tickGrass
+                        applyAndBroadcastGrassChanges(world, changedList)
+                    },
+                    onDispatchComplete = {}
+                ) { chunkPos, elapsedNanos ->
+                    world.recordChunkProcessingNanos(chunkProcessingFrame, chunkPos, elapsedNanos, category = "grass")
+                }
+                world.finishChunkProcessingFrame(
+                    frame = chunkProcessingFrame,
+                    activeChunks = activeSimulationChunks,
+                    includeZeroForInactive = false,
+                    accumulateIntoLast = true
+                )
+                if (grassEvents.changed.isEmpty()) {
+                    continue
+                }
+                applyAndBroadcastGrassChanges(world, grassEvents.changed)
+            } catch (_: Throwable) {}
+        }
+    }
+
     private fun applyAndBroadcastFluidChanges(
         world: org.macaroon3145.world.World,
         changes: List<org.macaroon3145.world.FluidBlockChange>
@@ -4807,6 +4863,39 @@ data class EncodedStackSection(
             )
         }
         return appliedSeeds
+    }
+
+    private fun applyAndBroadcastGrassChanges(
+        world: org.macaroon3145.world.World,
+        changes: List<org.macaroon3145.world.GrassBlockChange>
+    ) {
+        if (changes.isEmpty()) return
+        for (change in changes) {
+            val proceed = org.macaroon3145.plugin.PluginSystem.beforeBlockChange(
+                session = null,
+                worldKey = world.key,
+                x = change.x,
+                y = change.y,
+                z = change.z,
+                previousStateId = change.previousStateId,
+                changedStateId = change.stateId,
+                reason = BlockChangeReason.SYSTEM
+            )
+            val finalState = if (proceed) {
+                change.stateId
+            } else {
+                world.setBlockStateWithoutFluidUpdates(change.x, change.y, change.z, change.previousStateId)
+                change.previousStateId
+            }
+            broadcastBlockChangeToLoadedPlayers(
+                worldKey = world.key,
+                chunkPos = change.chunkPos,
+                x = change.x,
+                y = change.y,
+                z = change.z,
+                stateId = finalState
+            )
+        }
     }
 
     private fun broadcastAppliedFluidChanges(worldKey: String, changes: List<org.macaroon3145.world.FluidBlockChange>) {
@@ -6198,7 +6287,7 @@ data class EncodedStackSection(
             return
         }
 
-        val maxSimulation = ServerConfig.maxSimulationDistanceChunks.coerceIn(2, 32)
+        val maxSimulation = ServerConfig.maxSimulationDistanceChunks.coerceAtLeast(2)
         activeSimulationLastMaxDistanceChunks = maxSimulation
         val changedWorldKeys = HashSet<String>()
 
@@ -7886,15 +7975,23 @@ data class EncodedStackSection(
             onGround = false
         )
         val headLookPacket = PlayPackets.entityHeadLookPacket(session.entityId, 0f)
+        val standingMetadataPacket = PlayPackets.playerSharedFlagsMetadataPacket(
+            entityId = session.entityId,
+            sneaking = false,
+            sprinting = false,
+            swimming = false,
+            usingItemHand = -1
+        )
         for ((id, other) in sessions) {
             if (id == session.channelId || other.worldKey != session.worldKey) continue
             val otherCtx = contexts[id] ?: continue
             if (!otherCtx.channel().isActive) continue
             otherCtx.write(syncPacket)
             otherCtx.write(headLookPacket)
+            otherCtx.write(standingMetadataPacket)
             otherCtx.flush()
         }
-        updateAndBroadcastPlayerState(session.channelId, sneaking = false, sprinting = false, swimming = false)
+        animalSourceDirtyWorlds.add(session.worldKey)
     }
 
     private fun resetRespawningSessionChunkView(
@@ -8067,10 +8164,10 @@ data class EncodedStackSection(
             ?.coerceAtMost(1.0)
             ?: 1.0
         ServerConfig.maxViewDistanceChunks = props.getProperty("max-view-distance-chunks")?.toIntOrNull()
-            ?.coerceIn(2, 32)
+            ?.coerceAtLeast(2)
             ?: 32
         ServerConfig.maxSimulationDistanceChunks = props.getProperty("max-simulation-distance-chunks")?.toIntOrNull()
-            ?.coerceIn(2, 32)
+            ?.coerceAtLeast(2)
             ?: 16
         ServerConfig.chunkWorkerThreads = parsedChunkWorkerThreads
         ServerConfig.compressionThreshold = props.getProperty("compression-threshold")?.toIntOrNull()
@@ -9777,11 +9874,9 @@ data class EncodedStackSection(
             startedAtNanos = System.nanoTime(),
             startedStateId = stateId,
             startedHeldItemKey = heldItemKey,
-            fixedBreakSeconds = null,
             progressSeconds = 0.0,
             lastStage = 0
         )
-        visual.fixedBreakSeconds = resolveBreakVisualDurationSeconds(session, resolvedWorld, visual)
         activeBlockBreakVisualByChannelId[session.channelId] = visual
         broadcastBlockBreakVisual(session, x, y, z, stage = 0)
     }
@@ -9856,8 +9951,6 @@ data class EncodedStackSection(
         world: org.macaroon3145.world.World,
         visual: ActiveBlockBreakVisual
     ): Double? {
-        val fixed = visual.fixedBreakSeconds
-        if (fixed != null && fixed > 0.0) return fixed
         val stateId = world.blockStateAt(visual.x, visual.y, visual.z)
         if (stateId <= 0 || isInstantBreakBlock(stateId)) return null
         val heldSlot = session.selectedHotbarSlot.coerceIn(0, 8)
@@ -9877,11 +9970,7 @@ data class EncodedStackSection(
             hasteLevel = session.miningHasteLevel,
             miningFatigueLevel = session.miningFatigueLevel
         )
-        val resolved = VanillaBlockBreakingSpeed.breakDurationSeconds(context) ?: BLOCK_BREAK_VISUAL_DURATION_SECONDS
-        if (resolved > 0.0) {
-            visual.fixedBreakSeconds = resolved
-        }
-        return resolved
+        return VanillaBlockBreakingSpeed.breakDurationSeconds(context) ?: BLOCK_BREAK_VISUAL_DURATION_SECONDS
     }
 
     fun updateMiningStatusEffects(
@@ -10118,6 +10207,11 @@ data class EncodedStackSection(
             resyncContainerForSession(session, containerId)
             return
         }
+        if (slot == SLOT_OUTSIDE) {
+            handleOutsidePickupClick(session, containerId, button)
+            resyncContainerForSession(session, containerId)
+            return
+        }
         when {
             containerId == PLAYER_INVENTORY_CONTAINER_ID -> {
                 handlePlayerInventoryPickupClick(session, slot, button)
@@ -10152,6 +10246,30 @@ data class EncodedStackSection(
                     }
                 )
             }
+        }
+    }
+
+    private fun handleOutsidePickupClick(session: PlayerSession, containerId: Int, button: Int) {
+        if (button !in 0..1) return
+        if (!isQuickCraftContainerValid(session, containerId)) return
+        val cursor = normalizeItemStackState(session.cursorStack)
+        if (cursor.isEmpty()) return
+
+        val dropCount = if (button == 1) 1 else cursor.count
+        if (dropCount <= 0) return
+        val dropStack = if (dropCount >= cursor.count) {
+            cursor
+        } else {
+            buildStackStateLike(cursor, count = dropCount)
+        }
+        if (!spawnDroppedItemFromPlayer(session, dropStack, dropStackMotion = button == 0, textMeta = itemTextMetaFromStack(dropStack))) {
+            return
+        }
+
+        val remain = cursor.count - dropCount
+        session.cursorStack = if (remain > 0) buildStackStateLike(cursor, count = remain) else ItemStackState.empty()
+        if (remain <= 0) {
+            clearCursorOrigin(session)
         }
     }
 
@@ -10236,7 +10354,11 @@ data class EncodedStackSection(
                     resetQuickCraftDrag(session)
                     return true
                 }
-                if (mouseButton !in 0..1) {
+                if (mouseButton !in 0..2) {
+                    resetQuickCraftDrag(session)
+                    return true
+                }
+                if (mouseButton == 2 && session.gameMode != GAME_MODE_CREATIVE) {
                     resetQuickCraftDrag(session)
                     return true
                 }
@@ -10273,6 +10395,13 @@ data class EncodedStackSection(
         if (session.cursorItemId < 0 || session.cursorItemCount <= 0) return
         val targets = session.quickCraftSlots.toList().sorted()
         if (targets.isEmpty()) return
+        if (session.quickCraftMouseButton == 2) {
+            if (session.gameMode != GAME_MODE_CREATIVE) return
+            for (slot in targets) {
+                quickCraftCloneIntoSlot(session, containerId, slot)
+            }
+            return
+        }
         if (session.quickCraftMouseButton == 1) {
             for (slot in targets) {
                 if (session.cursorItemCount <= 0) break
@@ -10343,6 +10472,18 @@ data class EncodedStackSection(
         }
         onContainerSlotMutated(session, containerId, slot)
         return canAdd
+    }
+
+    private fun quickCraftCloneIntoSlot(session: PlayerSession, containerId: Int, slot: Int) {
+        if (session.gameMode != GAME_MODE_CREATIVE) return
+        val cursorStack = normalizeItemStackState(session.cursorStack)
+        if (cursorStack.isEmpty()) return
+        if (isBlockedShulkerNesting(session, containerId, slot, cursorStack.itemId, cursorStack.count)) return
+        val maxCount = itemMaxStackSize(cursorStack.itemId).coerceAtLeast(1)
+        val cloneStack = buildStackStateLike(cursorStack, count = maxCount)
+        writeContainerStackState(session, containerId, slot, cloneStack)
+        writeContainerSlotTextMeta(session, containerId, slot, itemTextMetaFromStack(cloneStack))
+        onContainerSlotMutated(session, containerId, slot)
     }
 
     private fun onContainerSlotMutated(session: PlayerSession, containerId: Int, slot: Int) {
@@ -10931,6 +11072,8 @@ data class EncodedStackSection(
         val clonedStack = buildStackStateLike(stack, count = itemMaxStackSize(itemId).coerceAtLeast(1))
         val sourceTextMeta = normalizeItemTextMeta(readContainerSlotTextMeta(session, containerId, slot), itemId)
         session.cursorStack = stackWithItemTextMeta(normalizeItemStackState(clonedStack), sourceTextMeta)
+        session.cursorOriginContainerId = CURSOR_ORIGIN_INVENTORY_FALLBACK_CONTAINER_ID
+        session.cursorOriginSlot = NO_CURSOR_ORIGIN_SLOT
     }
 
     private fun pickupAllCandidateSlots(session: PlayerSession, containerId: Int): List<Int> {
@@ -11494,7 +11637,7 @@ data class EncodedStackSection(
         if (session.openContainerType == CONTAINER_TYPE_CHEST && containerId == session.openContainerId) {
             val ranges = chestContainerRanges(session)
             return when (slot) {
-                in ranges.storage -> ranges.playerMain.toList() + ranges.playerHotbar.toList()
+                in ranges.storage -> ranges.playerHotbar.reversed() + ranges.playerMain.reversed()
                 in ranges.playerMain -> {
                     if (isBlockedShulkerNestingIntoOpenContainerStorage(session, itemId, 1)) {
                         emptyList()
@@ -11514,7 +11657,8 @@ data class EncodedStackSection(
         }
         if (session.openContainerType == CONTAINER_TYPE_ENDER_CHEST && containerId == session.openContainerId) {
             return when (slot) {
-                in ENDER_CHEST_STORAGE_SLOT_RANGE -> ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE.toList() + ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.toList()
+                in ENDER_CHEST_STORAGE_SLOT_RANGE ->
+                    ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.reversed() + ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE.reversed()
                 in ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE -> ENDER_CHEST_STORAGE_SLOT_RANGE.toList()
                 in ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE -> ENDER_CHEST_STORAGE_SLOT_RANGE.toList()
                 else -> emptyList()
@@ -11969,7 +12113,9 @@ data class EncodedStackSection(
             applyPickupSwap(
                 session = session,
                 rightClick = button == 1,
-                slotAccess = playerCraftGridStackAccess(session, gridIndex)
+                slotAccess = playerCraftGridStackAccess(session, gridIndex),
+                sourceContainerId = PLAYER_INVENTORY_CONTAINER_ID,
+                sourceSlot = slot
             )
             return
         }
@@ -11986,7 +12132,9 @@ data class EncodedStackSection(
             applyPickupSwap(
                 session = session,
                 rightClick = button == 1,
-                slotAccess = tableCraftGridStackAccess(session, gridIndex)
+                slotAccess = tableCraftGridStackAccess(session, gridIndex),
+                sourceContainerId = session.openContainerId,
+                sourceSlot = slot
             )
             return
         }
@@ -12017,7 +12165,9 @@ data class EncodedStackSection(
                 applyPickupSwap(
                     session = session,
                     rightClick = rightClick,
-                    slotAccess = furnaceStackAccess(furnace, FURNACE_INPUT_SLOT)
+                    slotAccess = furnaceStackAccess(furnace, FURNACE_INPUT_SLOT),
+                    sourceContainerId = containerId,
+                    sourceSlot = slot
                 )
                 refreshFurnaceActivity(furnaceKey, furnace)
                 return
@@ -12032,7 +12182,9 @@ data class EncodedStackSection(
                     session = session,
                     rightClick = rightClick,
                     slotAccess = furnaceStackAccess(furnace, FURNACE_FUEL_SLOT),
-                    slotStackValidator = { stack -> stack.isEmpty() || isFuelItemId(stack.itemId) }
+                    slotStackValidator = { stack -> stack.isEmpty() || isFuelItemId(stack.itemId) },
+                    sourceContainerId = containerId,
+                    sourceSlot = slot
                 )
                 if (!changed) return
                 refreshFurnaceActivity(furnaceKey, furnace)
@@ -12056,7 +12208,9 @@ data class EncodedStackSection(
                 applyPickupSwap(
                     session = session,
                     rightClick = rightClick,
-                    slotAccess = enderChestStorageStackAccess(chest, index)
+                    slotAccess = enderChestStorageStackAccess(chest, index),
+                    sourceContainerId = session.openContainerId,
+                    sourceSlot = slot
                 )
             } else {
                 val index = slot - storageRange.first
@@ -12067,7 +12221,9 @@ data class EncodedStackSection(
                 applyPickupSwap(
                     session = session,
                     rightClick = rightClick,
-                    slotAccess = openChestStorageStackAccess(session, index)
+                    slotAccess = openChestStorageStackAccess(session, index),
+                    sourceContainerId = session.openContainerId,
+                    sourceSlot = slot
                 )
             }
             return
@@ -12178,7 +12334,13 @@ data class EncodedStackSection(
                 includeOffhand = includeOffhand,
                 readSlot = read,
                 writeSlot = write
-            )
+            ),
+            sourceContainerId = if (tableContainer || furnaceContainer || chestContainer || enderChestContainer) {
+                session.openContainerId
+            } else {
+                PLAYER_INVENTORY_CONTAINER_ID
+            },
+            sourceSlot = slot
         )
         if (!tableContainer && slot in 36..44) {
             val hotbar = slot - 36
@@ -12608,13 +12770,73 @@ data class EncodedStackSection(
         session: PlayerSession,
         rightClick: Boolean,
         slotAccess: ItemStackStateAccess,
-        slotStackValidator: (ItemStackState) -> Boolean = { true }
+        slotStackValidator: (ItemStackState) -> Boolean = { true },
+        sourceContainerId: Int = NO_CURSOR_ORIGIN_CONTAINER_ID,
+        sourceSlot: Int = NO_CURSOR_ORIGIN_SLOT
     ): Boolean {
-        val (updatedSlotStack, updatedCursorStack) = pickupSwap(slotAccess.read(), session.cursorStack, rightClick)
+        val previousSlotStack = slotAccess.read()
+        val previousCursorStack = normalizeItemStackState(session.cursorStack)
+        val (updatedSlotStack, updatedCursorStack) = pickupSwap(previousSlotStack, previousCursorStack, rightClick)
         if (!slotStackValidator(updatedSlotStack)) return false
         slotAccess.write(updatedSlotStack)
-        session.cursorStack = normalizeItemStackState(updatedCursorStack)
+        val normalizedCursorStack = normalizeItemStackState(updatedCursorStack)
+        session.cursorStack = normalizedCursorStack
+        updateCursorOriginAfterPickupSwap(
+            session = session,
+            previousCursorStack = previousCursorStack,
+            previousSlotStack = previousSlotStack,
+            updatedCursorStack = normalizedCursorStack,
+            sourceContainerId = sourceContainerId,
+            sourceSlot = sourceSlot
+        )
         return true
+    }
+
+    private fun updateCursorOriginAfterPickupSwap(
+        session: PlayerSession,
+        previousCursorStack: ItemStackState,
+        previousSlotStack: ItemStackState,
+        updatedCursorStack: ItemStackState,
+        sourceContainerId: Int,
+        sourceSlot: Int
+    ) {
+        if (updatedCursorStack.isEmpty()) {
+            clearCursorOrigin(session)
+            return
+        }
+        if (previousCursorStack.isEmpty() && !previousSlotStack.isEmpty()) {
+            if (sourceContainerId != NO_CURSOR_ORIGIN_CONTAINER_ID && sourceSlot != NO_CURSOR_ORIGIN_SLOT) {
+                session.cursorOriginContainerId = sourceContainerId
+                session.cursorOriginSlot = sourceSlot
+            } else {
+                clearCursorOrigin(session)
+            }
+            return
+        }
+        if (!previousCursorStack.isEmpty()) {
+            val sameItemKind =
+                previousCursorStack.itemId == updatedCursorStack.itemId &&
+                    areItemTextMetaEquivalent(
+                        itemTextMetaFromStack(previousCursorStack),
+                        itemTextMetaFromStack(updatedCursorStack)
+                    )
+            if (sameItemKind) {
+                // Keep original rollback target while the same cursor stack is being partially placed/merged.
+                return
+            }
+            if (sourceContainerId != NO_CURSOR_ORIGIN_CONTAINER_ID && sourceSlot != NO_CURSOR_ORIGIN_SLOT) {
+                // Cursor stack changed by swap-like interaction; rollback target becomes the newly picked source slot.
+                session.cursorOriginContainerId = sourceContainerId
+                session.cursorOriginSlot = sourceSlot
+            } else {
+                clearCursorOrigin(session)
+            }
+        }
+    }
+
+    private fun clearCursorOrigin(session: PlayerSession) {
+        session.cursorOriginContainerId = NO_CURSOR_ORIGIN_CONTAINER_ID
+        session.cursorOriginSlot = NO_CURSOR_ORIGIN_SLOT
     }
 
     private fun pickupSwap(
@@ -13532,6 +13754,7 @@ data class EncodedStackSection(
             openPluginChestViewByChannelId.remove(session.channelId)
         }
         val closingContainerId = session.openContainerId
+        rollbackCursorToOriginSlotOnContainerClose(session, closingContainerId)
         session.openContainerType = CONTAINER_TYPE_PLAYER_INVENTORY
         session.openContainerId = PLAYER_INVENTORY_CONTAINER_ID
         session.openChestX = 0
@@ -13584,6 +13807,88 @@ data class EncodedStackSection(
                 if (viewersBeforeClose == 1) {
                     broadcastChestOpenCloseSound(closingWorldKey, closingX, closingY, closingZ, opening = false, closingType)
                 }
+            }
+        }
+    }
+
+    private fun rollbackCursorToOriginSlotOnContainerClose(session: PlayerSession, closingContainerId: Int) {
+        val cursor = normalizeItemStackState(session.cursorStack)
+        if (cursor.isEmpty()) {
+            clearCursorOrigin(session)
+            return
+        }
+        if (session.cursorOriginContainerId == CURSOR_ORIGIN_INVENTORY_FALLBACK_CONTAINER_ID) {
+            rollbackClonedCursorToInventoryOrDropOnClose(session, cursor, closingContainerId)
+            clearCursorOrigin(session)
+            return
+        }
+        if (session.cursorOriginContainerId != closingContainerId) {
+            clearCursorOrigin(session)
+            return
+        }
+        val originSlot = session.cursorOriginSlot
+        if (originSlot == NO_CURSOR_ORIGIN_SLOT) {
+            clearCursorOrigin(session)
+            return
+        }
+        if (!isQuickCraftContainerValid(session, closingContainerId)) {
+            clearCursorOrigin(session)
+            return
+        }
+        val cursorTextMeta = itemTextMetaFromStack(cursor)
+        val remaining = moveItemIntoContainerSlots(
+            session = session,
+            containerId = closingContainerId,
+            stack = cursor,
+            stackTextMeta = cursorTextMeta,
+            remaining = cursor.count,
+            targets = listOf(originSlot)
+        )
+        if (remaining > 0) {
+            val remainingStack = buildStackStateLike(cursor, count = remaining)
+            rollbackClonedCursorToInventoryOrDropOnClose(session, remainingStack, closingContainerId)
+        } else {
+            session.cursorStack = ItemStackState.empty()
+        }
+        clearCursorOrigin(session)
+    }
+
+    private fun rollbackClonedCursorToInventoryOrDropOnClose(
+        session: PlayerSession,
+        cursor: ItemStackState,
+        closingContainerId: Int
+    ) {
+        val targets = playerInventoryContainerSlotsForOpenContainer(session)
+        val cursorTextMeta = itemTextMetaFromStack(cursor)
+        val remaining = moveItemIntoContainerSlots(
+            session = session,
+            containerId = closingContainerId,
+            stack = cursor,
+            stackTextMeta = cursorTextMeta,
+            remaining = cursor.count,
+            targets = targets
+        )
+        if (remaining > 0) {
+            val remainingStack = buildStackStateLike(cursor, count = remaining)
+            val dropped = spawnDroppedItemFromPlayer(
+                session = session,
+                stack = remainingStack,
+                dropStackMotion = remaining > 1,
+                textMeta = itemTextMetaFromStack(remainingStack)
+            )
+            session.cursorStack = if (dropped) ItemStackState.empty() else remainingStack
+            return
+        }
+        session.cursorStack = ItemStackState.empty()
+    }
+
+    private fun playerInventoryContainerSlotsForOpenContainer(session: PlayerSession): List<Int> {
+        return when (session.openContainerType) {
+            CONTAINER_TYPE_ENDER_CHEST ->
+                ENDER_CHEST_PLAYER_HOTBAR_SLOT_RANGE.toList() + ENDER_CHEST_PLAYER_MAIN_SLOT_RANGE.toList()
+            else -> {
+                val ranges = chestContainerRanges(session)
+                ranges.playerHotbar.toList() + ranges.playerMain.toList()
             }
         }
     }
@@ -13661,6 +13966,9 @@ data class EncodedStackSection(
         val replacingOpenContainer = session.openContainerType != CONTAINER_TYPE_PLAYER_INVENTORY
         closeOpenContainer(session, sendClosePacket = false)
         openPluginChestViewByChannelId.remove(session.channelId)
+        val world = WorldManager.world(session.worldKey)
+        val openedBlockKey = world?.let { BlockStateRegistry.parsedState(it.blockStateAt(x, y, z))?.blockKey }
+        val barrelContainer = openedBlockKey == "minecraft:barrel"
         val viewersBeforeOpen = countChestViewersAt(session.worldKey, x, y, z)
         val ctx = contexts[session.channelId] ?: return
         if (!ctx.channel().isActive) return
@@ -13677,7 +13985,11 @@ data class EncodedStackSection(
         } else {
             generic9x3MenuTypeId
         }
-        val titleKey = if (storageSlots > 27) "container.chestDouble" else "container.chest"
+        val titleKey = when {
+            barrelContainer -> "container.barrel"
+            storageSlots > 27 -> "container.chestDouble"
+            else -> "container.chest"
+        }
         val stateId = nextInventoryStateId(session)
         ctx.write(
             PlayPackets.openScreenPacket(
@@ -13881,7 +14193,7 @@ data class EncodedStackSection(
         if (y !in -64..319) return null
         val stateId = world.blockStateAt(x, y, z)
         val blockKey = BlockStateRegistry.parsedState(stateId)?.blockKey ?: return null
-        if (isChestBlockKey(blockKey) || blockKey == "minecraft:ender_chest" || isShulkerBoxBlockKey(blockKey)) {
+        if (isChestBlockKey(blockKey) || blockKey == "minecraft:ender_chest" || blockKey == "minecraft:barrel" || isShulkerBoxBlockKey(blockKey)) {
             return Triple(x, y, z)
         }
         return null
@@ -13902,7 +14214,7 @@ data class EncodedStackSection(
     private fun isChestState(stateId: Int): Boolean {
         if (stateId <= 0) return false
         val parsed = BlockStateRegistry.parsedState(stateId) ?: return false
-        return isChestBlockKey(parsed.blockKey)
+        return isChestBlockKey(parsed.blockKey) || parsed.blockKey == "minecraft:barrel"
     }
 
     private fun isShulkerBoxState(stateId: Int): Boolean {
@@ -14677,14 +14989,17 @@ data class EncodedStackSection(
         val positions = chestLidBroadcastPositions(world, x, y, z)
         if (positions.isEmpty()) return
         for ((px, py, pz) in positions) {
-            val packet = chestLidPacketAt(world, worldKey, px, py, pz) ?: continue
+            val packets = chestLidPacketsAt(world, worldKey, px, py, pz)
+            if (packets.isEmpty()) continue
             val chunk = ChunkPos(px shr 4, pz shr 4)
             for ((id, other) in sessions) {
                 if (other.worldKey != worldKey) continue
                 if (!other.loadedChunks.contains(chunk)) continue
                 val ctx = contexts[id] ?: continue
                 if (!ctx.channel().isActive) continue
-                ctx.write(packet)
+                for (packet in packets) {
+                    ctx.write(packet)
+                }
                 ctx.flush()
             }
         }
@@ -14778,6 +15093,8 @@ data class EncodedStackSection(
                 if (opening) "minecraft:block.shulker_box.open" else "minecraft:block.shulker_box.close"
             blockKeyFromWorld == "minecraft:ender_chest" || openedContainerType == CONTAINER_TYPE_ENDER_CHEST ->
                 if (opening) "minecraft:block.ender_chest.open" else "minecraft:block.ender_chest.close"
+            blockKeyFromWorld == "minecraft:barrel" ->
+                if (opening) "minecraft:block.barrel.open" else "minecraft:block.barrel.close"
             blockKeyFromWorld != null && isCopperChestBlockKey(blockKeyFromWorld) ->
                 if (opening) "minecraft:block.copper_chest.open" else "minecraft:block.copper_chest.close"
             (blockKeyFromWorld != null && isChestBlockKey(blockKeyFromWorld)) || openedContainerType == CONTAINER_TYPE_CHEST ->
@@ -14838,8 +15155,11 @@ data class EncodedStackSection(
                 if ((px shr 4) != chunkPos.x || (pz shr 4) != chunkPos.z) continue
                 val key = Triple(px, py, pz)
                 if (!seen.add(key)) continue
-                val packet = chestLidPacketAt(world, session.worldKey, px, py, pz) ?: continue
-                ctx.write(packet)
+                val packets = chestLidPacketsAt(world, session.worldKey, px, py, pz)
+                if (packets.isEmpty()) continue
+                for (packet in packets) {
+                    ctx.write(packet)
+                }
             }
         }
         if (seen.isNotEmpty()) {
@@ -14847,27 +15167,36 @@ data class EncodedStackSection(
         }
     }
 
-    private fun chestLidPacketAt(
+    private fun chestLidPacketsAt(
         world: org.macaroon3145.world.World,
         worldKey: String,
         x: Int,
         y: Int,
         z: Int
-    ): ByteArray? {
+    ): List<ByteArray> {
         val stateId = world.blockStateAt(x, y, z)
-        val blockKey = BlockStateRegistry.parsedState(stateId)?.blockKey ?: return null
-        if (!isChestBlockKey(blockKey) && blockKey != "minecraft:ender_chest" && !isShulkerBoxBlockKey(blockKey)) {
-            return null
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return emptyList()
+        val blockKey = parsed.blockKey
+        if (!isChestBlockKey(blockKey) && blockKey != "minecraft:ender_chest" && blockKey != "minecraft:barrel" && !isShulkerBoxBlockKey(blockKey)) {
+            return emptyList()
         }
-        val blockId = itemIdByKey[blockKey] ?: return null
         val viewers = countChestViewersAt(worldKey, x, y, z).coerceIn(0, 255)
-        return PlayPackets.blockActionPacket(
-            x = x,
-            y = y,
-            z = z,
-            actionId = 1,
-            actionParam = viewers,
-            blockId = blockId
+        if (blockKey == "minecraft:barrel") {
+            val properties = HashMap(parsed.properties)
+            properties["open"] = if (viewers > 0) "true" else "false"
+            val openedStateId = BlockStateRegistry.stateId(blockKey, properties) ?: stateId
+            return listOf(PlayPackets.blockChangePacket(x, y, z, openedStateId))
+        }
+        val blockId = itemIdByKey[blockKey] ?: return emptyList()
+        return listOf(
+            PlayPackets.blockActionPacket(
+                x = x,
+                y = y,
+                z = z,
+                actionId = 1,
+                actionParam = viewers,
+                blockId = blockId
+            )
         )
     }
 
@@ -14880,6 +15209,9 @@ data class EncodedStackSection(
         val stateId = world.blockStateAt(x, y, z)
         val parsed = BlockStateRegistry.parsedState(stateId) ?: return emptyList()
         if (parsed.blockKey == "minecraft:ender_chest") {
+            return listOf(Triple(x, y, z))
+        }
+        if (parsed.blockKey == "minecraft:barrel") {
             return listOf(Triple(x, y, z))
         }
         if (isShulkerBoxBlockKey(parsed.blockKey)) {
@@ -15239,7 +15571,8 @@ data class EncodedStackSection(
             cursorX = cursorX,
             cursorY = cursorY,
             cursorZ = cursorZ,
-            playerYaw = session.yaw
+            playerYaw = session.yaw,
+            playerPitch = session.pitch
         ))
         if (!isValidPlacementSupportForState(world, placementX, placementY, placementZ, blockStateId)) {
             if (PLACEMENT_DEBUG_LOG_ENABLED) {
@@ -18212,7 +18545,11 @@ data class EncodedStackSection(
             abs(state.lastVx) > DROPPED_ITEM_VELOCITY_EPSILON ||
                 abs(state.lastVy) > DROPPED_ITEM_VELOCITY_EPSILON ||
                 abs(state.lastVz) > DROPPED_ITEM_VELOCITY_EPSILON
-        val shouldSendVelocity = movementPacketSent || onGroundChanged
+        val velocityChanged =
+            abs(packetVxForMovement - state.lastVx) > DROPPED_ITEM_VELOCITY_SYNC_DELTA ||
+                abs(packetVyForMovement - state.lastVy) > DROPPED_ITEM_VELOCITY_SYNC_DELTA ||
+                abs(packetVzForMovement - state.lastVz) > DROPPED_ITEM_VELOCITY_SYNC_DELTA
+        val shouldSendVelocity = movementPacketSent || onGroundChanged || velocityChanged
         if (shouldSendVelocity) {
             val hasVelocity =
                 abs(packetVxForMovement) > DROPPED_ITEM_VELOCITY_EPSILON ||
@@ -19343,7 +19680,8 @@ data class EncodedStackSection(
         cursorX: Float,
         cursorY: Float,
         cursorZ: Float,
-        playerYaw: Float
+        playerYaw: Float,
+        playerPitch: Float
     ): Int {
         val parsed = BlockStateRegistry.parsedState(baseStateId) ?: return baseStateId
         if (parsed.properties.isEmpty()) return baseStateId
@@ -19377,11 +19715,20 @@ data class EncodedStackSection(
                 else -> null
             }
             val horizontal = horizontalPlacement
+            val barrelPlacementFacing = if (blockKey == "minecraft:barrel") {
+                oppositeNearestLookingFacing(playerYaw, playerPitch)
+            } else {
+                face
+            }
             props["facing"] = when {
-                face != null && values.contains(face) -> face
+                barrelPlacementFacing != null && values.contains(barrelPlacementFacing) -> barrelPlacementFacing
                 values.contains(horizontal) -> horizontal
                 else -> props["facing"] ?: horizontal
             }
+        }
+
+        if (blockKey == "minecraft:barrel" && props.containsKey("open")) {
+            props["open"] = "false"
         }
 
         if (props.containsKey("face")) {
@@ -19436,8 +19783,19 @@ data class EncodedStackSection(
             "south" -> "north"
             "west" -> "east"
             "east" -> "west"
+            "up" -> "down"
+            "down" -> "up"
             else -> facing
         }
+    }
+
+    private fun oppositeNearestLookingFacing(yaw: Float, pitch: Float): String {
+        val nearest = when {
+            pitch > 45f -> "down"
+            pitch < -45f -> "up"
+            else -> yawToHorizontalFacing(yaw)
+        }
+        return oppositeHorizontalFacing(nearest)
     }
 
     fun breakBlock(channelId: ChannelId, x: Int, y: Int, z: Int) {
@@ -20115,8 +20473,10 @@ data class EncodedStackSection(
         while (currentY <= maxY) {
             val stateId = world.blockStateAt(x, currentY, z)
             if (stateId == 0) {
-                currentY++
-                continue
+                // Do not propagate gravity checks through air gaps.
+                // Vanilla neighbor updates affect adjacent blocks; distant unsupported
+                // blocks above an air column should not be triggered by this change.
+                break
             }
             if (!isFallingGravityBlockState(stateId)) break
             if (!canFallingBlockPassThrough(world.blockStateAt(x, currentY - 1, z))) break
@@ -22174,6 +22534,7 @@ data class EncodedStackSection(
     private const val DROPPED_ITEM_RELATIVE_MOVE_SCALE = 4096.0
     private const val MAX_DROPPED_ITEM_RELATIVE_SECONDS_BEFORE_HARD_SYNC = 20.0
     private const val DROPPED_ITEM_VELOCITY_EPSILON = 1.0e-8
+    private const val DROPPED_ITEM_VELOCITY_SYNC_DELTA = 1.0e-4
     private const val ANIMAL_ROTATION_EPSILON_DEGREES = 0.5f
     private const val SMALL_ENTITY_PACKET_IMMEDIATE_BYTES = 96
     private const val PLAYER_INVENTORY_CONTAINER_ID = 0
@@ -22215,6 +22576,10 @@ data class EncodedStackSection(
     private const val CLICK_TYPE_CLONE = 3
     private const val CLICK_TYPE_QUICK_CRAFT = 5
     private const val CLICK_TYPE_PICKUP_ALL = 6
+    private const val SLOT_OUTSIDE = -999
+    private const val CURSOR_ORIGIN_INVENTORY_FALLBACK_CONTAINER_ID = Int.MIN_VALUE + 1
+    private const val NO_CURSOR_ORIGIN_CONTAINER_ID = Int.MIN_VALUE
+    private const val NO_CURSOR_ORIGIN_SLOT = Int.MIN_VALUE
     private const val OFFHAND_SWAP_BUTTON = 40
     private const val MAX_SHIFT_CRAFT_ITERATIONS = 2048
     private const val PLAYER_CRAFT_RESULT_SLOT = 0

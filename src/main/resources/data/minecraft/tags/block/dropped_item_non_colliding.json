@@ -1,5 +1,8 @@
 {
   "values": [
+    "#minecraft:water_breakable",
+    "#minecraft:below_support_break",
+    "#minecraft:falling_block_impact_break",
     "#minecraft:replaceable",
     "#minecraft:flowers",
     "#minecraft:small_flowers",
@@ -24,6 +27,8 @@
     "minecraft:cave_vines",
     "minecraft:cave_vines_plant",
     "minecraft:glow_lichen",
+    "minecraft:sculk_vein",
+    "minecraft:resin_clump",
     "minecraft:sugar_cane",
     "minecraft:fire",
     "minecraft:soul_fire"

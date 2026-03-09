@@ -1309,25 +1309,9 @@ class DroppedItemSystem(
                 val transferable = minOf(maxStackSize - keep.stack.count, merge.stack.count)
                 if (transferable <= 0) continue
 
-                val midpointVx = (self.vx + partnerLive.vx) * 0.5
-                val midpointVy = (self.vy + partnerLive.vy) * 0.5
-                val midpointVz = (self.vz + partnerLive.vz) * 0.5
-                val totalCountForAccel = (self.stack.count + partnerLive.stack.count).coerceAtLeast(1)
-                val mergedAx =
-                    ((self.accelerationX * self.stack.count) + (partnerLive.accelerationX * partnerLive.stack.count)) / totalCountForAccel
-                val mergedAy =
-                    ((self.accelerationY * self.stack.count) + (partnerLive.accelerationY * partnerLive.stack.count)) / totalCountForAccel
-                val mergedAz =
-                    ((self.accelerationZ * self.stack.count) + (partnerLive.accelerationZ * partnerLive.stack.count)) / totalCountForAccel
                 val tx = applyMergeTransaction(
                     keep = keep,
-                    merge = merge,
-                    vx = midpointVx,
-                    vy = midpointVy,
-                    vz = midpointVz,
-                    ax = mergedAx,
-                    ay = mergedAy,
-                    az = mergedAz
+                    merge = merge
                 ) ?: continue
                 updated[tx.keep.entityId] = tx.keep
                 if (tx.merge == null) {
@@ -1369,13 +1353,7 @@ class DroppedItemSystem(
 
     private fun applyMergeTransaction(
         keep: DroppedItemSnapshot,
-        merge: DroppedItemSnapshot,
-        vx: Double,
-        vy: Double,
-        vz: Double,
-        ax: Double,
-        ay: Double,
-        az: Double
+        merge: DroppedItemSnapshot
     ): MergeTxResult? {
         return withPairEntityLocks(keep.entityId, merge.entityId) {
             val keepSnapshot = snapshot(keep.entityId) ?: return@withPairEntityLocks null
@@ -1390,18 +1368,15 @@ class DroppedItemSystem(
             val mergeCount = mergeSnapshot.stack.count - transferable
 
             val mergedPickupDelay = minOf(keepSnapshot.pickupDelaySeconds, mergeSnapshot.pickupDelaySeconds)
-
             if (mergeCount <= 0) {
                 val keepLive = mutateIfUuidMatches(keep.entityId, keep.uuid) { entity ->
                     entity.stack = copyDroppedItemStackState(entity.stack.copy(count = keepCount))
-                    entity.vx = vx
-                    entity.vy = vy
-                    entity.vz = vz
-                    if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
-                        entity.accelerationX = ax
-                        entity.accelerationY = ay
-                        entity.accelerationZ = az
-                    }
+                    entity.vx = keepSnapshot.vx
+                    entity.vy = keepSnapshot.vy
+                    entity.vz = keepSnapshot.vz
+                    entity.accelerationX = keepSnapshot.accelerationX
+                    entity.accelerationY = keepSnapshot.accelerationY
+                    entity.accelerationZ = keepSnapshot.accelerationZ
                     entity.pickupDelaySeconds = mergedPickupDelay
                     entity.sleeping = false
                     entity.restTicks = 0.0
@@ -1415,28 +1390,18 @@ class DroppedItemSystem(
             }
             val mergeLive = mutateIfUuidMatches(merge.entityId, merge.uuid) { entity ->
                 entity.stack = copyDroppedItemStackState(entity.stack.copy(count = mergeCount))
-                entity.vx = vx
-                entity.vy = vy
-                entity.vz = vz
-                if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
-                    entity.accelerationX = ax
-                    entity.accelerationY = ay
-                    entity.accelerationZ = az
-                }
                 entity.pickupDelaySeconds = mergedPickupDelay
                 entity.sleeping = false
                 entity.restTicks = 0.0
             } ?: return@withPairEntityLocks null
             val keepLive = mutateIfUuidMatches(keep.entityId, keep.uuid) { entity ->
                 entity.stack = copyDroppedItemStackState(entity.stack.copy(count = keepCount))
-                entity.vx = vx
-                entity.vy = vy
-                entity.vz = vz
-                if (ax.isFinite() && ay.isFinite() && az.isFinite()) {
-                    entity.accelerationX = ax
-                    entity.accelerationY = ay
-                    entity.accelerationZ = az
-                }
+                entity.vx = keepSnapshot.vx
+                entity.vy = keepSnapshot.vy
+                entity.vz = keepSnapshot.vz
+                entity.accelerationX = keepSnapshot.accelerationX
+                entity.accelerationY = keepSnapshot.accelerationY
+                entity.accelerationZ = keepSnapshot.accelerationZ
                 entity.pickupDelaySeconds = mergedPickupDelay
                 entity.sleeping = false
                 entity.restTicks = 0.0

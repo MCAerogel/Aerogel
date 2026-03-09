@@ -1216,7 +1216,7 @@ object VanillaAnvilWorldSaver {
                         val blockZ = (expectedChunkZ shl 4) + localZ
                         val currentState = world.blockStateAt(blockX, blockY, blockZ)
                         if (currentState == stateId) continue
-                        world.setBlockStateWithoutFluidUpdates(blockX, blockY, blockZ, stateId)
+                        world.setBlockStateFromChunkLoad(blockX, blockY, blockZ, stateId)
                         appliedOverrides++
                     }
                 }

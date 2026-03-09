@@ -13,7 +13,10 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.nio.file.FileSystems
@@ -51,6 +54,9 @@ object BlockEditorModule {
 
     @Volatile
     private var host: String = "0.0.0.0"
+
+    @Volatile
+    private var advertisedHost: String = "127.0.0.1"
 
     @Volatile
     private var privateKey: String = ""
@@ -95,8 +101,9 @@ object BlockEditorModule {
         server = createdServer
         port = configuredPort
         host = configuredHost
+        advertisedHost = resolveAdvertisedHost(configuredHost)
         privateKey = generatePrivateKey()
-        logger.info("Block editor started on {}", securedUrl())
+        logger.info("Block editor started on {}", securedPublicUrl())
     }
 
     fun stop() {
@@ -108,6 +115,39 @@ object BlockEditorModule {
     fun url(): String = "http://$host:$port"
 
     fun securedUrl(): String = "${url()}/?privatekey=$privateKey"
+
+    fun publicUrl(): String = "http://$advertisedHost:$port"
+
+    fun securedPublicUrl(): String = "${publicUrl()}/?privatekey=$privateKey"
+
+    private fun resolveAdvertisedHost(boundHost: String): String {
+        val normalized = boundHost.trim().lowercase(Locale.ROOT)
+        if (
+            normalized.isNotEmpty()
+            && normalized != "0.0.0.0"
+            && normalized != "::"
+            && normalized != "::0"
+            && normalized != "[::]"
+        ) {
+            return boundHost
+        }
+        val candidates = mutableListOf<InetAddress>()
+        runCatching {
+            NetworkInterface.getNetworkInterfaces().toList().forEach { ni ->
+                if (!ni.isUp || ni.isLoopback || ni.isVirtual) return@forEach
+                ni.inetAddresses.toList()
+                    .filterIsInstance<Inet4Address>()
+                    .forEach { addr ->
+                        if (!addr.isLoopbackAddress && !addr.isAnyLocalAddress && !addr.isLinkLocalAddress) {
+                            candidates += addr
+                        }
+                    }
+            }
+        }
+        val preferred = candidates.firstOrNull { it.isSiteLocalAddress }
+            ?: candidates.firstOrNull()
+        return preferred?.hostAddress ?: "127.0.0.1"
+    }
 
     private fun handle(exchange: HttpExchange) {
         val method = exchange.requestMethod.uppercase(Locale.ROOT)
@@ -133,7 +173,18 @@ object BlockEditorModule {
             return
         }
         if (method == "GET" && path == "/api/block-editor/health") {
-            sendJson(exchange, 200, mapOf("ok" to true, "port" to port, "url" to url(), "securedUrl" to securedUrl()))
+            sendJson(
+                exchange,
+                200,
+                mapOf(
+                    "ok" to true,
+                    "port" to port,
+                    "url" to url(),
+                    "securedUrl" to securedUrl(),
+                    "publicUrl" to publicUrl(),
+                    "securedPublicUrl" to securedPublicUrl()
+                )
+            )
             return
         }
         if (method == "GET" && path == "/api/block-editor/draft") {
@@ -317,6 +368,10 @@ object BlockEditorModule {
             sendJson(exchange, 404, mapOf("ok" to false, "error" to "resource_not_found", "path" to resourcePath))
             return
         }
+        // Prevent stale editor assets in aggressive browser caches.
+        exchange.responseHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        exchange.responseHeaders.set("Pragma", "no-cache")
+        exchange.responseHeaders.set("Expires", "0")
         sendBytes(exchange, 200, contentType, bytes)
     }
 }
@@ -757,6 +812,42 @@ private object BlockJavaSourceGenerator {
                     if (leftExpr == null && rightExpr == null) null
                     else "addValues(${leftExpr ?: "\"\""}, ${rightExpr ?: "\"\""})"
                 }
+                "MATH_SUB" -> {
+                    val incomingDataLinks = incoming[block.id].orEmpty().filter { isDataLink(it) }
+                    val exactLeft = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-a" }
+                    val exactRight = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-b" && it !== exactLeft }
+                    val fallback = incomingDataLinks.filter { it !== exactLeft && it !== exactRight }
+                    val leftSource = exactLeft ?: incomingDataLinks.firstOrNull()
+                    val rightSource = exactRight ?: fallback.firstOrNull()
+                    val leftExpr = leftSource?.let { resolveDataExpression(it.from, visiting) }
+                    val rightExpr = rightSource?.let { resolveDataExpression(it.from, visiting) }
+                    if (leftExpr == null && rightExpr == null) null
+                    else "subtractValues(${leftExpr ?: "0"}, ${rightExpr ?: "0"})"
+                }
+                "MATH_MUL" -> {
+                    val incomingDataLinks = incoming[block.id].orEmpty().filter { isDataLink(it) }
+                    val exactLeft = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-a" }
+                    val exactRight = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-b" && it !== exactLeft }
+                    val fallback = incomingDataLinks.filter { it !== exactLeft && it !== exactRight }
+                    val leftSource = exactLeft ?: incomingDataLinks.firstOrNull()
+                    val rightSource = exactRight ?: fallback.firstOrNull()
+                    val leftExpr = leftSource?.let { resolveDataExpression(it.from, visiting) }
+                    val rightExpr = rightSource?.let { resolveDataExpression(it.from, visiting) }
+                    if (leftExpr == null && rightExpr == null) null
+                    else "multiplyValues(${leftExpr ?: "0"}, ${rightExpr ?: "0"})"
+                }
+                "MATH_DIV" -> {
+                    val incomingDataLinks = incoming[block.id].orEmpty().filter { isDataLink(it) }
+                    val exactLeft = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-a" }
+                    val exactRight = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-b" && it !== exactLeft }
+                    val fallback = incomingDataLinks.filter { it !== exactLeft && it !== exactRight }
+                    val leftSource = exactLeft ?: incomingDataLinks.firstOrNull()
+                    val rightSource = exactRight ?: fallback.firstOrNull()
+                    val leftExpr = leftSource?.let { resolveDataExpression(it.from, visiting) }
+                    val rightExpr = rightSource?.let { resolveDataExpression(it.from, visiting) }
+                    if (leftExpr == null && rightExpr == null) null
+                    else "divideValues(${leftExpr ?: "0"}, ${rightExpr ?: "1"})"
+                }
                 else -> null
             }
         }
@@ -796,6 +887,11 @@ private object BlockJavaSourceGenerator {
                     } else {
                         "sendMessage($messageExpr);"
                     }
+                }
+                "FUNCTION_BROADCAST_MESSAGE" -> {
+                    val linkedDataExpr = resolveIncomingDataExpression(block.id, "in-data")
+                    val messageExpr = linkedDataExpr?.let { "String.valueOf($it)" } ?: "\"$message\""
+                    "broadcastMessage($messageExpr);"
                 }
                 "FUNCTION_WORK_CODE" -> {
                     val rawCode = block.params["code"] ?: ""
@@ -853,7 +949,9 @@ private object BlockJavaSourceGenerator {
 
         val onEnableBody = if (enableLines.isEmpty()) "" else enableLines.joinToString("\n        ")
         val hasJoinListener = joinLines.isNotEmpty()
-        val listenersCode = if (hasJoinListener) {
+        val hasBroadcastUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "FUNCTION_BROADCAST_MESSAGE" }
+        val hasAnyListener = hasJoinListener
+        val listenersCode = if (hasAnyListener) {
             "return java.util.Collections.<Object>singletonList(this);"
         } else {
             "return java.util.Collections.emptyList();"
@@ -868,11 +966,16 @@ private object BlockJavaSourceGenerator {
         } else {
             ""
         }
+        val quitHandlerCode = ""
         val hasSendMessageUsage = normalizedBlocks.any {
             val type = it.type.uppercase(Locale.ROOT)
             type == "ACTION_SEND_MESSAGE" || type == "FUNCTION_SEND_MESSAGE"
         }
         val hasMathAddUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_ADD" }
+        val hasMathSubUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_SUB" }
+        val hasMathMulUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_MUL" }
+        val hasMathDivUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_DIV" }
+        val onlinePlayersFieldCode = ""
         val addValuesFunctionCode = if (hasMathAddUsage) {
             """
     private Object addValues(Object left, Object right) {
@@ -890,10 +993,89 @@ private object BlockJavaSourceGenerator {
         } else {
             ""
         }
+        val subtractValuesFunctionCode = if (hasMathSubUsage) {
+            """
+    private Object subtractValues(Object left, Object right) {
+        Number l = asNumber(left);
+        Number r = asNumber(right);
+        if (l instanceof Double || l instanceof Float || r instanceof Double || r instanceof Float) {
+            return l.doubleValue() - r.doubleValue();
+        }
+        return l.longValue() - r.longValue();
+    }
+            """.trimIndent()
+        } else {
+            ""
+        }
+        val multiplyValuesFunctionCode = if (hasMathMulUsage) {
+            """
+    private Object multiplyValues(Object left, Object right) {
+        Number l = asNumber(left);
+        Number r = asNumber(right);
+        if (l instanceof Double || l instanceof Float || r instanceof Double || r instanceof Float) {
+            return l.doubleValue() * r.doubleValue();
+        }
+        return l.longValue() * r.longValue();
+    }
+            """.trimIndent()
+        } else {
+            ""
+        }
+        val divideValuesFunctionCode = if (hasMathDivUsage) {
+            """
+    private Object divideValues(Object left, Object right) {
+        Number l = asNumber(left);
+        Number r = asNumber(right);
+        double divisor = r.doubleValue();
+        if (Math.abs(divisor) < 1.0E-12) {
+            return 0;
+        }
+        return l.doubleValue() / divisor;
+    }
+            """.trimIndent()
+        } else {
+            ""
+        }
+        val asNumberFunctionCode = if (hasMathSubUsage || hasMathMulUsage || hasMathDivUsage) {
+            """
+    private Number asNumber(Object value) {
+        if (value instanceof Number) {
+            return (Number) value;
+        }
+        if (value == null) {
+            return 0;
+        }
+        String raw = String.valueOf(value).trim();
+        if (raw.isEmpty()) {
+            return 0;
+        }
+        try {
+            if (raw.contains(".") || raw.contains("e") || raw.contains("E")) {
+                return Double.parseDouble(raw);
+            }
+            return Long.parseLong(raw);
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+            """.trimIndent()
+        } else {
+            ""
+        }
         val sendMessageFunctionCode = if (hasSendMessageUsage) {
             """
     private void sendMessage(String message) {
         System.out.println(message);
+    }
+            """.trimIndent()
+        } else {
+            ""
+        }
+        val broadcastMessageFunctionCode = if (hasBroadcastUsage) {
+            """
+    private void broadcastMessage(String message) {
+        String normalized = message == null ? "" : message;
+        org.macaroon3145.api.Server.broadcastMessage(normalized);
     }
             """.trimIndent()
         } else {
@@ -905,6 +1087,7 @@ package $packageName;
 
 public final class $className implements org.macaroon3145.api.plugin.AerogelPlugin {
     ${if (variableFieldLines.isEmpty()) "" else variableFieldLines.joinToString("\n    ")}
+    $onlinePlayersFieldCode
 
     @Override
     public void onEnable(org.macaroon3145.api.plugin.PluginContext context) {
@@ -918,9 +1101,21 @@ public final class $className implements org.macaroon3145.api.plugin.AerogelPlug
 
 $joinHandlerCode
 
-$addValuesFunctionCode
+$quitHandlerCode
 
-$sendMessageFunctionCode
+    $addValuesFunctionCode
+
+    $subtractValuesFunctionCode
+
+    $multiplyValuesFunctionCode
+
+    $divideValuesFunctionCode
+
+    $asNumberFunctionCode
+
+    $sendMessageFunctionCode
+
+    $broadcastMessageFunctionCode
 }
         """.trimIndent()
     }

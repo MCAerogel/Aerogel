@@ -2,15 +2,16 @@ package org.macaroon3145
 
 import java.io.FileOutputStream
 import java.io.PrintStream
-import java.nio.charset.StandardCharsets
+import java.nio.charset.Charset
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import org.macaroon3145.i18n.ServerI18n
 import kotlin.concurrent.thread
 
 object DebugConsole {
-    private val rawOut = PrintStream(FileOutputStream(java.io.FileDescriptor.out), true, StandardCharsets.UTF_8)
-    private val rawErr = PrintStream(FileOutputStream(java.io.FileDescriptor.err), true, StandardCharsets.UTF_8)
+    private val consoleCharset: Charset = Charset.defaultCharset()
+    private val rawOut = PrintStream(FileOutputStream(java.io.FileDescriptor.out), true, consoleCharset)
+    private val rawErr = PrintStream(FileOutputStream(java.io.FileDescriptor.err), true, consoleCharset)
     private val ubuntuBrailleSpinnerFrames = arrayOf("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
     fun newSpinner(): ConsoleSpinner {
