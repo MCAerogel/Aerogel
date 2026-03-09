@@ -8555,13 +8555,16 @@ data class EncodedStackSection(
             dispatchCommandAsync(sender, clean)
             return
         }
-        ServerI18n.log("aerogel.log.chat.message", sender.profile.username, clean)
+        val chatDecision = org.macaroon3145.plugin.PluginSystem.onPlayerChat(sender, clean)
+        if (chatDecision.cancelled) return
+        val finalMessage = chatDecision.message ?: clean
+        ServerI18n.log("aerogel.log.chat.message", sender.profile.username, finalMessage)
         val packet = PlayPackets.systemChatPacket(
             PlayPackets.ChatComponent.Text(
                 text = "<",
                 extra = listOf(
                     playerNameComponent(sender),
-                    PlayPackets.ChatComponent.Text("> $clean")
+                    PlayPackets.ChatComponent.Text("> $finalMessage")
                 )
             )
         )

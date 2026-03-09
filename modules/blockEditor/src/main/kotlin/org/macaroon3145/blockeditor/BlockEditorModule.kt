@@ -737,6 +737,7 @@ private object BlockJavaSourceGenerator {
     ): String {
         val enableLines = ArrayList<String>()
         val joinLines = ArrayList<String>()
+        val chatLines = ArrayList<String>()
         val normalizedBlocks = blocks.mapIndexed { index, block ->
             block.copy(id = block.id.ifBlank { "n${index + 1}" })
         }
@@ -760,6 +761,13 @@ private object BlockJavaSourceGenerator {
                     variableNameById[block.id] = name
                     val value = (block.params["value"] ?: "").trim().toDoubleOrNull() ?: 0.0
                     "private double $name = $value;"
+                }
+                "VAR_BOOLEAN" -> {
+                    val name = javaIdentifier("boolean_${block.id}")
+                    variableNameById[block.id] = name
+                    val raw = (block.params["value"] ?: "").trim()
+                    val value = raw.equals("true", ignoreCase = true)
+                    "private boolean $name = $value;"
                 }
                 else -> null
             }
@@ -790,7 +798,7 @@ private object BlockJavaSourceGenerator {
 
         fun isDataLink(link: BlockEditorLink): Boolean {
             return when (link.kind) {
-                "data-text", "data-int", "data-decimal", "data-any", "data", null -> true
+                "data-text", "data-int", "data-decimal", "data-bool", "data-any", "data", null -> true
                 else -> false
             }
         }
@@ -799,7 +807,7 @@ private object BlockJavaSourceGenerator {
             if (!visiting.add(blockId)) return null
             val block = blockById[blockId] ?: return null
             return when (block.type.uppercase(Locale.ROOT)) {
-                "VAR_TEXT", "VAR_INTEGER", "VAR_DECIMAL" -> variableNameById[block.id]
+                "VAR_TEXT", "VAR_INTEGER", "VAR_DECIMAL", "VAR_BOOLEAN" -> variableNameById[block.id]
                 "MATH_ADD" -> {
                     val incomingDataLinks = incoming[block.id].orEmpty().filter { isDataLink(it) }
                     val exactLeft = incomingDataLinks.firstOrNull { it.toPortClass == "in-data-a" }
@@ -879,13 +887,13 @@ private object BlockJavaSourceGenerator {
                         .asSequence()
                         .mapNotNull { link ->
                             val sourceType = blockById[link.from]?.type?.uppercase(Locale.ROOT)
-                            if (link.kind == "player" && sourceType == "EVENT_ON_PLAYER_JOIN") "event.getPlayer()" else null
+                            if (link.kind == "player" && (sourceType == "EVENT_ON_PLAYER_JOIN" || sourceType == "EVENT_ON_PLAYER_CHAT")) "event.getPlayer()" else null
                         }
                         .firstOrNull()
                     if (linkedPlayer != null) {
                         "$linkedPlayer.sendMessage($messageExpr);"
                     } else {
-                        "sendMessage($messageExpr);"
+                        null
                     }
                 }
                 "FUNCTION_BROADCAST_MESSAGE" -> {
@@ -942,6 +950,22 @@ private object BlockJavaSourceGenerator {
                     }
                     collectActionChain(block.id, joinLines)
                 }
+                "EVENT_ON_PLAYER_CHAT" -> {
+                    val linkedDataExpr = resolveIncomingDataExpression(block.id, "in-data")
+                    if (linkedDataExpr != null) {
+                        chatLines += "event.setMessage(String.valueOf($linkedDataExpr));"
+                    } else {
+                        val message = block.params["message"]?.trim().orEmpty()
+                        if (message.isNotEmpty()) {
+                            chatLines += "event.setMessage(\"${javaString(message)}\");"
+                        }
+                    }
+                    val linkedCancelExpr = resolveIncomingDataExpression(block.id, "in-cancel")
+                    if (linkedCancelExpr != null) {
+                        chatLines += "event.setCancelled(asBoolean($linkedCancelExpr));"
+                    }
+                    collectActionChain(block.id, chatLines)
+                }
                 "ON_ENABLE_LOG" -> actionStatement(block)?.let { enableLines += it }
                 "ON_PLAYER_JOIN_MESSAGE", "ON_PLAYER_JOIN_SET_JOIN_MESSAGE" -> actionStatement(block)?.let { joinLines += it }
             }
@@ -949,8 +973,9 @@ private object BlockJavaSourceGenerator {
 
         val onEnableBody = if (enableLines.isEmpty()) "" else enableLines.joinToString("\n        ")
         val hasJoinListener = joinLines.isNotEmpty()
+        val hasChatListener = chatLines.isNotEmpty()
         val hasBroadcastUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "FUNCTION_BROADCAST_MESSAGE" }
-        val hasAnyListener = hasJoinListener
+        val hasAnyListener = hasJoinListener || hasChatListener
         val listenersCode = if (hasAnyListener) {
             "return java.util.Collections.<Object>singletonList(this);"
         } else {
@@ -966,15 +991,22 @@ private object BlockJavaSourceGenerator {
         } else {
             ""
         }
-        val quitHandlerCode = ""
-        val hasSendMessageUsage = normalizedBlocks.any {
-            val type = it.type.uppercase(Locale.ROOT)
-            type == "ACTION_SEND_MESSAGE" || type == "FUNCTION_SEND_MESSAGE"
+        val chatHandlerCode = if (hasChatListener) {
+            """
+    @org.macaroon3145.api.event.Subscribe
+    public void onPlayerChat(org.macaroon3145.api.event.PlayerChatEvent event) {
+        ${chatLines.joinToString("\n        ")}
+    }
+            """.trimIndent()
+        } else {
+            ""
         }
+        val quitHandlerCode = ""
         val hasMathAddUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_ADD" }
         val hasMathSubUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_SUB" }
         val hasMathMulUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_MUL" }
         val hasMathDivUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "MATH_DIV" }
+        val hasChatEventUsage = normalizedBlocks.any { it.type.uppercase(Locale.ROOT) == "EVENT_ON_PLAYER_CHAT" }
         val onlinePlayersFieldCode = ""
         val addValuesFunctionCode = if (hasMathAddUsage) {
             """
@@ -1062,10 +1094,20 @@ private object BlockJavaSourceGenerator {
         } else {
             ""
         }
-        val sendMessageFunctionCode = if (hasSendMessageUsage) {
+        val asBooleanFunctionCode = if (hasChatEventUsage) {
             """
-    private void sendMessage(String message) {
-        System.out.println(message);
+    private boolean asBoolean(Object value) {
+        if (value instanceof Boolean) {
+            return (Boolean) value;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).doubleValue() != 0.0;
+        }
+        if (value == null) {
+            return false;
+        }
+        String raw = String.valueOf(value).trim();
+        return raw.equalsIgnoreCase("true");
     }
             """.trimIndent()
         } else {
@@ -1101,6 +1143,8 @@ public final class $className implements org.macaroon3145.api.plugin.AerogelPlug
 
 $joinHandlerCode
 
+$chatHandlerCode
+
 $quitHandlerCode
 
     $addValuesFunctionCode
@@ -1113,7 +1157,7 @@ $quitHandlerCode
 
     $asNumberFunctionCode
 
-    $sendMessageFunctionCode
+    $asBooleanFunctionCode
 
     $broadcastMessageFunctionCode
 }

@@ -1,7 +1,8 @@
 const NODE_LIBRARY = {
   events: [
     { type: 'EVENT_ON_ENABLE', title: 'PluginEnableEvent' },
-    { type: 'EVENT_ON_PLAYER_JOIN', title: 'PlayerJoinEvent' }
+    { type: 'EVENT_ON_PLAYER_JOIN', title: 'PlayerJoinEvent' },
+    { type: 'EVENT_ON_PLAYER_CHAT', title: 'PlayerChatEvent' }
   ],
   functions: [
     { type: 'FUNCTION_SEND_MESSAGE', title: 'Player.sendMessage', defaultMessage: 'Hello from function' },
@@ -10,13 +11,14 @@ const NODE_LIBRARY = {
   operations: [
     { type: 'MATH_ADD', title: '+' },
     { type: 'MATH_SUB', title: '-' },
-    { type: 'MATH_MUL', title: '*' },
-    { type: 'MATH_DIV', title: '/' }
+    { type: 'MATH_MUL', title: '×' },
+    { type: 'MATH_DIV', title: '÷' }
   ],
   variables: [
-    { type: 'VAR_TEXT', title: '문자열 변수', defaultValue: 'hello' },
-    { type: 'VAR_INTEGER', title: '정수 변수', defaultValue: '0' },
-    { type: 'VAR_DECIMAL', title: '실수 변수', defaultValue: '0.0' }
+    { type: 'VAR_TEXT', title: '문자열', defaultValue: 'hello' },
+    { type: 'VAR_INTEGER', title: '정수', defaultValue: '0' },
+    { type: 'VAR_DECIMAL', title: '실수', defaultValue: '0.0' },
+    { type: 'VAR_BOOLEAN', title: '논리형', defaultValue: 'false' }
   ]
 };
 
@@ -66,13 +68,28 @@ const BLOCK_NODE_WIDTH = 260;
 const BLOCK_NODE_ESTIMATED_HEIGHT = 132;
 const GRID_SIZE = 24;
 const WORKSPACE_STORAGE_KEY = 'aerogel.blockEditor.workspaces.v1';
-const GEMINI_API_KEY_STORAGE_KEY = 'aerogel.blockEditor.geminiApiKey.v1';
 const PRIVATE_KEY = new URLSearchParams(window.location.search).get('privatekey') || '';
 const HISTORY_LIMIT = 200;
-const GEMINI_GENERATE_MODEL = 'gemini-3.1-flash-lite-preview';
-const AUTO_CREATE_STREAM_IDLE_TIMEOUT_MS = 15000;
-const AUTO_CREATE_STREAM_TOTAL_TIMEOUT_MS = 90000;
-const GEMINI_SOLUTION_MODEL = 'gemini-2.5-flash';
+const AI_MODEL_CACHE_NAME = 'aerogel.blockEditor.aiModels.v1';
+const LOCAL_EMBED_MODEL_ID = 'Xenova/bge-small-en-v1.5';
+const LOCAL_GENERATE_MODEL_ID = 'onnx-community/Qwen2.5-0.5B-Instruct';
+const TRANSFORMERS_JS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+const AI_MODEL_ASSET_LIST = [
+  'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/config.json',
+  'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer.json',
+  'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer_config.json',
+  'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/special_tokens_map.json',
+  'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/config.json',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/generation_config.json',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer_config.json',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/special_tokens_map.json',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/added_tokens.json',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/merges.txt',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/vocab.json',
+  'https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/onnx/model_quantized.onnx'
+];
 const historyState = {
   undo: [],
   redo: [],
@@ -109,26 +126,64 @@ const renderPresenceOverrides = {
 };
 const SHOW_SELF_PRESENCE_DEBUG = false;
 const autoCreateState = {
-  apiKey: '',
-  authenticated: false,
-  loginInFlight: false,
-  autoLoginTried: false,
-  lastVerifiedKey: '',
   generateInFlight: false,
   targetWorkspaceId: null,
   targetOriginWorld: null
 };
 const actionBarState = {
   timer: null,
+  progressHideTimer: null,
   logs: [],
   expanded: false,
-  lastProgressMessage: ''
+  lastProgressMessage: '',
+  progressVisible: false,
+  progressPercent: 0,
+  progressLabel: ''
 };
 const minimapState = {
   bounds: null,
   scale: 1,
   offsetX: 0,
   offsetY: 0
+};
+const hoverTooltipState = {
+  el: null,
+  target: null
+};
+const graphDecisionState = {
+  timer: null,
+  mlInFlight: false,
+  mlQueued: false,
+  lastFingerprint: '',
+  lastPublished: null,
+  rule: null,
+  ml: null
+};
+const aiModelState = {
+  prefetchInFlight: false,
+  prefetchDone: false,
+  downloadedBytes: 0,
+  downloadedCount: 0,
+  totalCount: AI_MODEL_ASSET_LIST.length,
+  error: ''
+};
+const localAiRuntimeState = {
+  loading: false,
+  ready: false,
+  error: '',
+  transformers: null,
+  embedder: null,
+  generator: null,
+  prototypeReady: false,
+  goodPrototype: null,
+  badPrototype: null
+};
+const aiLoadProgressState = {
+  active: false,
+  downloadRatio: 0,
+  runtimeRatio: 0,
+  lastPercent: 0,
+  finished: false
 };
 
 const el = {
@@ -157,8 +212,6 @@ const el = {
   confirmDialogOkBtn: document.getElementById('confirmDialogOkBtn'),
   autoCreateDialog: document.getElementById('autoCreateDialog'),
   autoCreateDialogTitle: document.getElementById('autoCreateDialogTitle'),
-  autoCreateApiKeyInput: document.getElementById('autoCreateApiKeyInput'),
-  autoCreateLoginBtn: document.getElementById('autoCreateLoginBtn'),
   autoCreateAuthStatus: document.getElementById('autoCreateAuthStatus'),
   autoCreatePromptInput: document.getElementById('autoCreatePromptInput'),
   autoCreateCancelBtn: document.getElementById('autoCreateCancelBtn'),
@@ -169,6 +222,9 @@ const el = {
   actionBar: document.getElementById('actionBar'),
   actionBarToggle: document.getElementById('actionBarToggle'),
   actionBarMessage: document.getElementById('actionBarMessage'),
+  actionBarProgress: document.getElementById('actionBarProgress'),
+  actionBarProgressFill: document.getElementById('actionBarProgressFill'),
+  actionBarProgressLabel: document.getElementById('actionBarProgressLabel'),
   actionBarLogs: document.getElementById('actionBarLogs'),
   minimapCanvas: document.getElementById('minimapCanvas'),
   canvas: document.getElementById('canvas'),
@@ -193,17 +249,9 @@ function ensureActionBarStructure() {
   } else if (!head.contains(el.actionBarMessage)) {
     head.appendChild(el.actionBarMessage);
   }
-  if (!(el.actionBarToggle instanceof HTMLButtonElement)) {
-    const toggle = document.createElement('button');
-    toggle.id = 'actionBarToggle';
-    toggle.className = 'action-bar-toggle';
-    toggle.type = 'button';
-    toggle.setAttribute('aria-expanded', 'false');
-    toggle.setAttribute('aria-label', '로그 펼치기');
-    head.appendChild(toggle);
-    el.actionBarToggle = toggle;
-  } else if (!head.contains(el.actionBarToggle)) {
-    head.appendChild(el.actionBarToggle);
+  if (el.actionBarToggle instanceof HTMLElement) {
+    el.actionBarToggle.remove();
+    el.actionBarToggle = null;
   }
   if (!(el.actionBarLogs instanceof HTMLElement)) {
     const logs = document.createElement('div');
@@ -214,11 +262,127 @@ function ensureActionBarStructure() {
   } else if (!el.actionBar.contains(el.actionBarLogs)) {
     el.actionBar.appendChild(el.actionBarLogs);
   }
+  if (!(el.actionBarProgress instanceof HTMLElement)) {
+    const progress = document.createElement('div');
+    progress.id = 'actionBarProgress';
+    progress.className = 'action-bar-progress hidden';
+    const track = document.createElement('div');
+    track.className = 'action-bar-progress-track';
+    const fill = document.createElement('div');
+    fill.id = 'actionBarProgressFill';
+    fill.className = 'action-bar-progress-fill';
+    track.appendChild(fill);
+    const label = document.createElement('div');
+    label.id = 'actionBarProgressLabel';
+    label.className = 'action-bar-progress-label';
+    label.textContent = '0%';
+    progress.appendChild(track);
+    progress.appendChild(label);
+    if (el.actionBarLogs && el.actionBarLogs.parentElement === el.actionBar) {
+      el.actionBar.insertBefore(progress, el.actionBarLogs);
+    } else {
+      el.actionBar.appendChild(progress);
+    }
+    el.actionBarProgress = progress;
+    el.actionBarProgressFill = fill;
+    el.actionBarProgressLabel = label;
+  }
+}
+
+function renderActionBarProgress() {
+  ensureActionBarStructure();
+  if (!(el.actionBarProgress instanceof HTMLElement)) return;
+  const visible = !!actionBarState.progressVisible;
+  el.actionBarProgress.classList.toggle('hidden', !visible);
+  const percent = Math.max(0, Math.min(100, Number(actionBarState.progressPercent || 0)));
+  if (el.actionBarProgressFill instanceof HTMLElement) {
+    el.actionBarProgressFill.style.width = `${percent.toFixed(1)}%`;
+  }
+  if (el.actionBarProgressLabel instanceof HTMLElement) {
+    el.actionBarProgressLabel.textContent = `${Math.round(percent)}%`;
+  }
+}
+
+function setActionBarProgress(percent, label = '', options = {}) {
+  const reset = !!options.reset;
+  actionBarState.progressVisible = true;
+  const next = Math.max(0, Math.min(100, Number(percent || 0)));
+  actionBarState.progressPercent = reset
+    ? next
+    : Math.max(Math.max(0, Math.min(100, Number(actionBarState.progressPercent || 0))), next);
+  actionBarState.progressLabel = String(label || '');
+  renderActionBarProgress();
+}
+
+function hideActionBarProgress() {
+  if (actionBarState.progressHideTimer) {
+    clearTimeout(actionBarState.progressHideTimer);
+    actionBarState.progressHideTimer = null;
+  }
+  actionBarState.progressVisible = false;
+  actionBarState.progressPercent = 0;
+  actionBarState.progressLabel = '';
+  renderActionBarProgress();
+}
+
+function resetUnifiedAiLoadProgress() {
+  aiLoadProgressState.active = false;
+  aiLoadProgressState.downloadRatio = 0;
+  aiLoadProgressState.runtimeRatio = 0;
+  aiLoadProgressState.lastPercent = 0;
+  aiLoadProgressState.finished = false;
+}
+
+function beginUnifiedAiLoadProgress() {
+  if (aiLoadProgressState.active) return;
+  aiLoadProgressState.active = true;
+  aiLoadProgressState.downloadRatio = 0;
+  aiLoadProgressState.runtimeRatio = 0;
+  aiLoadProgressState.lastPercent = 0;
+  aiLoadProgressState.finished = false;
+  showActionBar('AI 모델 준비 중...', '', 0, { progress: 0, progressReset: true, keepProgress: true });
+}
+
+function updateUnifiedAiLoadProgress(part, ratio, statusMessage = '') {
+  beginUnifiedAiLoadProgress();
+  const r = Math.max(0, Math.min(1, Number(ratio || 0)));
+  if (part === 'download') {
+    aiLoadProgressState.downloadRatio = Math.max(aiLoadProgressState.downloadRatio, r);
+  } else if (part === 'runtime') {
+    aiLoadProgressState.runtimeRatio = Math.max(aiLoadProgressState.runtimeRatio, r);
+  }
+  const weighted = (aiLoadProgressState.downloadRatio * 0.75) + (aiLoadProgressState.runtimeRatio * 0.25);
+  const percent = Math.max(aiLoadProgressState.lastPercent, Math.round(weighted * 100));
+  aiLoadProgressState.lastPercent = percent;
+  setActionBarProgress(percent, '');
+  if (statusMessage) {
+    showActionBar(statusMessage, '', 0, { keepProgress: true });
+  }
+}
+
+function finalizeUnifiedAiLoadProgress(sizeText = '') {
+  if (aiLoadProgressState.finished) return;
+  aiLoadProgressState.finished = true;
+  aiLoadProgressState.downloadRatio = 1;
+  aiLoadProgressState.runtimeRatio = 1;
+  aiLoadProgressState.lastPercent = 100;
+  showActionBar(`AI 모델 준비 완료${sizeText}`, 'ok', 1200, { progress: 100, progressLabel: '완료' });
+  setTimeout(() => {
+    resetUnifiedAiLoadProgress();
+  }, 1400);
 }
 
 function setResult(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   console.info(`[AerogelStudio] ${text}`);
+}
+
+function waitForNextUiTick() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      setTimeout(resolve, 0);
+    });
+  });
 }
 
 function hasActiveTextSelection() {
@@ -230,24 +394,504 @@ function hasActiveTextSelection() {
   }
 }
 
-function readStoredGeminiApiKey() {
+function formatBytes(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return '0B';
+  if (num < 1024) return `${Math.round(num)}B`;
+  if (num < 1024 * 1024) return `${(num / 1024).toFixed(1)}KB`;
+  if (num < 1024 * 1024 * 1024) return `${(num / (1024 * 1024)).toFixed(1)}MB`;
+  return `${(num / (1024 * 1024 * 1024)).toFixed(2)}GB`;
+}
+
+function fileNameFromUrl(url) {
+  const raw = String(url || '');
+  const idx = raw.lastIndexOf('/');
+  if (idx < 0) return raw;
+  return raw.slice(idx + 1) || raw;
+}
+
+async function downloadAssetWithProgress(url, onProgress) {
+  const response = await fetch(url, { method: 'GET' });
+  if (!response.ok) throw new Error(`다운로드 실패 (${response.status})`);
+  const total = Number(response.headers.get('content-length') || 0);
+  const readable = response.body;
+  if (!readable || typeof readable.getReader !== 'function') {
+    const buf = await response.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    if (typeof onProgress === 'function') onProgress(bytes.byteLength, bytes.byteLength, 1);
+    return {
+      bytes,
+      totalBytes: bytes.byteLength,
+      headers: response.headers
+    };
+  }
+
+  const reader = readable.getReader();
+  const chunks = [];
+  let loaded = 0;
+  let done = false;
+  while (!done) {
+    const read = await reader.read();
+    done = !!read.done;
+    if (done) break;
+    const value = read.value;
+    if (!(value instanceof Uint8Array)) continue;
+    chunks.push(value);
+    loaded += value.byteLength;
+    if (typeof onProgress === 'function') {
+      const ratio = total > 0 ? Math.max(0, Math.min(1, loaded / total)) : 0;
+      onProgress(loaded, total, ratio);
+    }
+  }
+  const merged = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  if (typeof onProgress === 'function') onProgress(loaded, total, 1);
+  return {
+    bytes: merged,
+    totalBytes: loaded,
+    headers: response.headers
+  };
+}
+
+function averageVectors(vectors) {
+  if (!Array.isArray(vectors) || vectors.length === 0) return null;
+  const first = Array.isArray(vectors[0]) ? vectors[0] : null;
+  if (!first || first.length === 0) return null;
+  const out = new Array(first.length).fill(0);
+  for (const v of vectors) {
+    if (!Array.isArray(v) || v.length !== out.length) continue;
+    for (let i = 0; i < out.length; i += 1) out[i] += Number(v[i] || 0);
+  }
+  for (let i = 0; i < out.length; i += 1) out[i] /= Math.max(1, vectors.length);
+  return out;
+}
+
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || a.length !== b.length) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    const av = Number(a[i] || 0);
+    const bv = Number(b[i] || 0);
+    dot += av * bv;
+    na += av * av;
+    nb += bv * bv;
+  }
+  if (na <= 0 || nb <= 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+async function extractEmbeddingVector(embedder, text) {
+  const out = await embedder(String(text || ''), { pooling: 'mean', normalize: true });
+  const data = out?.data;
+  if (!data || typeof data.length !== 'number') return null;
+  return Array.from(data);
+}
+
+async function ensureLocalAiRuntime(options = {}) {
+  const silent = !!options.silent;
+  if (localAiRuntimeState.ready) return true;
+  if (localAiRuntimeState.loading) return false;
+  localAiRuntimeState.loading = true;
+  localAiRuntimeState.error = '';
+  showActionBar('로컬 ONNX 런타임 로드 중...', '', 0, { keepProgress: true });
+  beginUnifiedAiLoadProgress();
+  updateUnifiedAiLoadProgress('runtime', 0.06, '로컬 ONNX 런타임 로드 중...');
   try {
-    return localStorage.getItem(GEMINI_API_KEY_STORAGE_KEY) || '';
-  } catch {
-    return '';
+    updateUnifiedAiLoadProgress('runtime', 0.18, 'transformers 로딩');
+    const tfm = await import(TRANSFORMERS_JS_CDN);
+    const env = tfm?.env || {};
+    const browserCacheAvailable = !!window.caches && typeof window.caches.open === 'function';
+    env.allowRemoteModels = true;
+    env.allowLocalModels = false;
+    env.useBrowserCache = browserCacheAvailable;
+    env.useFSCache = false;
+    if (env?.backends?.onnx?.wasm) {
+      // Keep UI responsive during heavy inference by proxying wasm execution to a worker.
+      env.backends.onnx.wasm.proxy = true;
+    }
+    const supportsWebGpu = !!navigator.gpu;
+    const preferredDevice = supportsWebGpu ? 'webgpu' : 'wasm';
+
+    updateUnifiedAiLoadProgress('runtime', 0.55, '임베딩 모델 로드');
+    let embedder;
+    try {
+      embedder = await tfm.pipeline('feature-extraction', LOCAL_EMBED_MODEL_ID, {
+        dtype: 'q8',
+        device: preferredDevice
+      });
+    } catch {
+      embedder = await tfm.pipeline('feature-extraction', LOCAL_EMBED_MODEL_ID, {
+        dtype: 'q8',
+        device: 'wasm'
+      });
+    }
+    updateUnifiedAiLoadProgress('runtime', 0.82, '생성 모델 로드');
+    let generator;
+    try {
+      generator = await tfm.pipeline('text-generation', LOCAL_GENERATE_MODEL_ID, {
+        dtype: 'q8',
+        model_file_name: 'model',
+        device: preferredDevice
+      });
+    } catch {
+      generator = await tfm.pipeline('text-generation', LOCAL_GENERATE_MODEL_ID, {
+        dtype: 'q8',
+        model_file_name: 'model',
+        device: 'wasm'
+      });
+    }
+
+    localAiRuntimeState.transformers = tfm;
+    localAiRuntimeState.embedder = embedder;
+    localAiRuntimeState.generator = generator;
+    localAiRuntimeState.ready = true;
+    updateUnifiedAiLoadProgress('runtime', 1, '런타임 로드 완료');
+    refreshAutoCreateGenerateEnabled();
+    if (!(el.autoCreateDialog?.classList?.contains('hidden'))) {
+      setAutoCreateAuthStatus('로컬 AI 준비 완료', 'ok');
+    }
+    if (aiModelState.prefetchDone) {
+      finalizeUnifiedAiLoadProgress(aiModelState.downloadedBytes > 0 ? ` (${formatBytes(aiModelState.downloadedBytes)})` : '');
+    } else if (!silent) {
+      showActionBar('로컬 런타임 준비 완료 (다운로드 진행 중)', '', 0, { keepProgress: true });
+    }
+    return true;
+  } catch (error) {
+    localAiRuntimeState.error = error?.message || 'unknown error';
+    refreshAutoCreateGenerateEnabled();
+    resetUnifiedAiLoadProgress();
+    if (!silent) {
+      showActionBar(`로컬 AI 로드 실패: ${localAiRuntimeState.error}`, 'error', 3000);
+    } else {
+      showActionBar(`로컬 AI 로드 실패: ${localAiRuntimeState.error}`, 'error', 1400, { progress: Number.NaN });
+    }
+    return false;
+  } finally {
+    localAiRuntimeState.loading = false;
   }
 }
 
-function writeStoredGeminiApiKey(key) {
-  try {
-    const value = String(key || '').trim();
-    if (!value) {
-      localStorage.removeItem(GEMINI_API_KEY_STORAGE_KEY);
+function buildLocalRiskText(snapshot, ruleResult) {
+  const blocks = Array.isArray(snapshot?.blocks) ? snapshot.blocks : [];
+  const links = Array.isArray(snapshot?.links) ? snapshot.links : [];
+  const issues = Array.isArray(ruleResult?.issues) ? ruleResult.issues : [];
+  const warnings = Array.isArray(ruleResult?.warnings) ? ruleResult.warnings : [];
+  const nodeTypeCount = new Map();
+  for (const node of blocks) {
+    const t = String(node?.type || 'UNKNOWN');
+    nodeTypeCount.set(t, (nodeTypeCount.get(t) || 0) + 1);
+  }
+  const topTypes = Array.from(nodeTypeCount.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([k, v]) => `${k}:${v}`)
+    .join(', ');
+  const topIssue = issues.slice(0, 5).map((it) => `${it.code}:${it.message}`).join(' | ');
+  const topWarn = warnings.slice(0, 5).map((it) => `${it.code}:${it.message}`).join(' | ');
+  return [
+    `nodes=${blocks.length}, links=${links.length}`,
+    `canRun=${ruleResult?.canRun ? 'yes' : 'no'}`,
+    `types=${topTypes}`,
+    `issues=${topIssue || 'none'}`,
+    `warnings=${topWarn || 'none'}`
+  ].join('\n');
+}
+
+function buildRenderedAabbSnapshot(limit = 120) {
+  const items = [];
+  for (const node of state.blocks.slice(0, limit)) {
+    const rect = nodeRectOf(node);
+    items.push({
+      id: node.id,
+      type: node.type,
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    });
+  }
+  return items;
+}
+
+async function ensureLocalRiskPrototypes() {
+  if (localAiRuntimeState.prototypeReady) return true;
+  const embedder = localAiRuntimeState.embedder;
+  if (!embedder) return false;
+  const goodCases = [
+    'nodes=3 links=2 canRun=yes issues=none warnings=none event connected to action and required inputs linked',
+    'nodes=6 links=7 canRun=yes issues=none warnings=none valid type links and reachable actions',
+    'clean execution chain with event root and message/player inputs satisfied'
+  ];
+  const badCases = [
+    'canRun=no invalid_link_type type mismatch between output and input',
+    'canRun=no dangling_link link points to missing node',
+    'warnings unreachable_action and missing event root with sparse links',
+    'required input missing player or message and execution disconnected'
+  ];
+  const goodVectors = [];
+  for (const text of goodCases) {
+    const v = await extractEmbeddingVector(embedder, text);
+    if (v) goodVectors.push(v);
+  }
+  const badVectors = [];
+  for (const text of badCases) {
+    const v = await extractEmbeddingVector(embedder, text);
+    if (v) badVectors.push(v);
+  }
+  localAiRuntimeState.goodPrototype = averageVectors(goodVectors);
+  localAiRuntimeState.badPrototype = averageVectors(badVectors);
+  localAiRuntimeState.prototypeReady = !!localAiRuntimeState.goodPrototype && !!localAiRuntimeState.badPrototype;
+  return localAiRuntimeState.prototypeReady;
+}
+
+async function runLocalModelRiskAssist(snapshot, ruleResult) {
+  if (!localAiRuntimeState.ready) return null;
+  if (!localAiRuntimeState.embedder) return null;
+  const protoReady = await ensureLocalRiskPrototypes();
+  if (!protoReady) return null;
+  const text = buildLocalRiskText(snapshot, ruleResult);
+  const vector = await extractEmbeddingVector(localAiRuntimeState.embedder, text);
+  if (!vector) return null;
+  const goodSim = cosineSimilarity(vector, localAiRuntimeState.goodPrototype);
+  const badSim = cosineSimilarity(vector, localAiRuntimeState.badPrototype);
+  const risk = clamp01(sigmoid((badSim - goodSim) * 6.5));
+  let reason = '유사 사례 기반 낮은 위험';
+  if (risk >= 0.65) reason = '유사 사례 기반 높은 실패 위험';
+  else if (risk >= 0.45) reason = '유사 사례 기반 보통 실패 위험';
+  return {
+    failProbability: Number(risk.toFixed(4)),
+    reason,
+    sims: {
+      good: Number(goodSim.toFixed(4)),
+      bad: Number(badSim.toFixed(4))
+    }
+  };
+}
+
+function cleanGeneratedText(value) {
+  return String(value || '')
+    .replace(/<\s*pad\s*>/gi, ' ')
+    .replace(/<\s*\/s\s*>/gi, ' ')
+    .replace(/<\s*s\s*>/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function collectGeneratorTexts(value, out, depth = 0) {
+  if (depth > 6 || !out) return;
+  if (typeof value === 'string') {
+    const cleaned = cleanGeneratedText(value);
+    if (cleaned) out.push(cleaned);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectGeneratorTexts(item, out, depth + 1);
+    return;
+  }
+  const directKeys = ['generated_text', 'summary_text', 'text', 'content', 'answer', 'output'];
+  for (const key of directKeys) {
+    if (key in value) collectGeneratorTexts(value[key], out, depth + 1);
+  }
+  for (const key of Object.keys(value)) {
+    if (directKeys.includes(key)) continue;
+    collectGeneratorTexts(value[key], out, depth + 1);
+  }
+}
+
+function textFromGeneratorOutput(output) {
+  const candidates = [];
+  collectGeneratorTexts(output, candidates, 0);
+  if (!candidates.length) return '';
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates[0] || '';
+}
+
+async function generateWithLocalModel(promptText, maxNewTokens = 180) {
+  const ready = localAiRuntimeState.ready || await ensureLocalAiRuntime({ silent: true });
+  if (!ready || !localAiRuntimeState.generator) {
+    throw new Error(localAiRuntimeState.error || '로컬 생성 모델을 사용할 수 없습니다.');
+  }
+  const rawPrompt = String(promptText || '');
+  const MAX_LOCAL_PROMPT_CHARS = 5200;
+  const prompt = rawPrompt.length > MAX_LOCAL_PROMPT_CHARS
+    ? `${rawPrompt.slice(0, 2200)}\n[...truncated...]\n${rawPrompt.slice(-800)}`
+    : rawPrompt;
+  const output = await localAiRuntimeState.generator(prompt, {
+    max_new_tokens: maxNewTokens,
+    min_new_tokens: 4,
+    do_sample: false,
+    temperature: 0.1,
+    return_full_text: false
+  });
+  const text = textFromGeneratorOutput(output);
+  if (!text) throw new Error('로컬 생성 모델 출력이 비어 있습니다.');
+  return text;
+}
+
+function normalizeAiActionAliases(text) {
+  const raw = String(text || '').toLowerCase();
+  if (!raw.trim()) return '';
+  let normalized = raw;
+  normalized = normalized.replace(/실행\s*연결|exec\s*연결|실행\s*포트/g, ' connect_exec ');
+  normalized = normalized.replace(/메시지\s*연결|message\s*연결|텍스트\s*연결/g, ' connect_message ');
+  normalized = normalized.replace(/플레이어\s*연결|player\s*연결/g, ' connect_player ');
+  normalized = normalized.replace(/math\s*a\s*input|a\s*입력|connect\s*a/g, ' connect_math_a ');
+  normalized = normalized.replace(/math\s*b\s*input|b\s*입력|connect\s*b/g, ' connect_math_b ');
+  normalized = normalized.replace(/수학\s*입력|수학\s*연결|a\/b\s*입력|math\s*inputs?/g, ' connect_math_a connect_math_b ');
+  return normalized;
+}
+
+function extractAiActionsFromText(text, allowedActions) {
+  const allowed = Array.isArray(allowedActions) ? allowedActions : [];
+  if (!allowed.length) return [];
+  const out = [];
+  const seen = new Set();
+  const push = (action) => {
+    if (!allowed.includes(action) || seen.has(action)) return;
+    seen.add(action);
+    out.push(action);
+  };
+
+  const parsed = extractJsonObjectFromText(text);
+  if (Array.isArray(parsed?.actions)) {
+    for (const item of parsed.actions) {
+      push(String(item || '').trim());
+    }
+  }
+
+  const normalizedText = normalizeAiActionAliases(text);
+  for (const action of allowed) {
+    const pattern = new RegExp(`\\b${action.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}\\b`, 'i');
+    if (pattern.test(normalizedText)) push(action);
+  }
+  return out;
+}
+
+function extractAiActionPlan(text, allowedActions) {
+  const allowed = Array.isArray(allowedActions) ? allowedActions : [];
+  const out = [];
+  const parsed = extractJsonObjectFromText(text);
+  const pushStep = (stepLike) => {
+    const type = typeof stepLike === 'string' ? stepLike : stepLike?.type;
+    const t = String(type || '').trim();
+    if (!allowed.includes(t)) return;
+    if (typeof stepLike === 'string') {
+      out.push({ type: t, source: '', sourceNodeId: '', sourceNodeIdA: '', sourceNodeIdB: '' });
       return;
     }
-    localStorage.setItem(GEMINI_API_KEY_STORAGE_KEY, value);
-  } catch {
-    // ignore storage errors
+    out.push({
+      type: t,
+      source: String(stepLike?.source || '').trim(),
+      sourceNodeId: String(stepLike?.sourceNodeId || '').trim(),
+      sourceNodeIdA: String(stepLike?.sourceNodeIdA || '').trim(),
+      sourceNodeIdB: String(stepLike?.sourceNodeIdB || '').trim()
+    });
+  };
+
+  if (Array.isArray(parsed?.actions)) {
+    for (const action of parsed.actions) {
+      if (typeof action === 'string') pushStep(action);
+      if (action && typeof action === 'object') pushStep(action);
+    }
+  }
+  if (out.length > 0) return out;
+  return extractAiActionsFromText(text, allowed)
+    .map((type) => ({ type, source: '', sourceNodeId: '', sourceNodeIdA: '', sourceNodeIdB: '' }));
+}
+
+async function ensureAiModelAssets(options = {}) {
+  const silent = !!options.silent;
+  const force = !!options.force;
+  if (!force && aiModelState.prefetchDone) return true;
+  if (aiModelState.prefetchInFlight) return false;
+  aiModelState.prefetchInFlight = true;
+  aiModelState.error = '';
+  beginUnifiedAiLoadProgress();
+  updateUnifiedAiLoadProgress('download', 0.01, 'AI 모델 다운로드 준비 중...');
+  try {
+    const cacheSupported = !!window.caches && typeof window.caches.open === 'function';
+    let cache = null;
+    if (cacheSupported) {
+      cache = await window.caches.open(AI_MODEL_CACHE_NAME);
+    } else {
+      if (!silent) showActionBar('AI 모델 캐시 미지원 환경: 직접 다운로드 모드', '', 2200);
+    }
+    let downloadedCount = 0;
+    let downloadedBytes = 0;
+    for (let i = 0; i < AI_MODEL_ASSET_LIST.length; i += 1) {
+      const url = AI_MODEL_ASSET_LIST[i];
+      const fileName = fileNameFromUrl(url);
+      const cached = cache && !force ? await cache.match(url) : null;
+      if (cached) {
+        downloadedCount += 1;
+        const ratio = downloadedCount / Math.max(1, AI_MODEL_ASSET_LIST.length);
+        updateUnifiedAiLoadProgress('download', ratio, `모델 확인 ${downloadedCount}/${AI_MODEL_ASSET_LIST.length}`);
+        continue;
+      }
+      if (!silent) {
+        showActionBar(`AI 모델 다운로드 ${i + 1}/${AI_MODEL_ASSET_LIST.length}`, '', 0, { keepProgress: true });
+      }
+      let lastProgressAt = 0;
+      const asset = await downloadAssetWithProgress(url, (loaded, total, ratio) => {
+        const now = Date.now();
+        if ((now - lastProgressAt) < 80 && ratio < 1) return;
+        lastProgressAt = now;
+        const boundedRatio = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
+        const overallRatio = (downloadedCount + boundedRatio) / Math.max(1, AI_MODEL_ASSET_LIST.length);
+        updateUnifiedAiLoadProgress('download', overallRatio, `모델 다운로드 ${i + 1}/${AI_MODEL_ASSET_LIST.length}`);
+      });
+      const size = Number(asset.totalBytes || 0);
+      if (cache) {
+        const cachedResponse = new Response(asset.bytes, {
+          headers: asset.headers
+        });
+        await cache.put(url, cachedResponse);
+      }
+      downloadedBytes += Math.max(0, size);
+      downloadedCount += 1;
+      const ratio = downloadedCount / Math.max(1, AI_MODEL_ASSET_LIST.length);
+      updateUnifiedAiLoadProgress('download', ratio, `모델 다운로드 ${downloadedCount}/${AI_MODEL_ASSET_LIST.length}`);
+      aiModelState.downloadedCount = downloadedCount;
+      aiModelState.downloadedBytes = downloadedBytes;
+    }
+    aiModelState.prefetchDone = true;
+    aiModelState.downloadedCount = downloadedCount;
+    aiModelState.downloadedBytes = downloadedBytes;
+    const sizeText = downloadedBytes > 0 ? ` (${formatBytes(downloadedBytes)})` : '';
+    updateUnifiedAiLoadProgress('download', 1, '모델 다운로드 완료');
+    if (localAiRuntimeState.ready) {
+      finalizeUnifiedAiLoadProgress(sizeText);
+    } else if (localAiRuntimeState.loading) {
+      if (!silent) {
+        showActionBar('모델 다운로드 완료 (런타임 로드 진행 중)', '', 0, { keepProgress: true });
+      }
+    } else if (!silent) {
+      showActionBar(`AI 모델 다운로드 완료${sizeText}`, 'ok', 0, { progress: Number.NaN, keepProgress: true });
+    } else {
+      // Silent prefetch only: clear progress UI instead of leaving "준비 중" state visible.
+      hideActionBarProgress();
+      resetUnifiedAiLoadProgress();
+      if (el.actionBar instanceof HTMLElement) {
+        el.actionBar.classList.add('hidden');
+      }
+    }
+    return true;
+  } catch (error) {
+    aiModelState.error = error?.message || 'unknown error';
+    resetUnifiedAiLoadProgress();
+    if (!silent) {
+      showActionBar(`AI 모델 다운로드 실패: ${aiModelState.error}`, 'error', 3200);
+    }
+    return false;
+  } finally {
+    aiModelState.prefetchInFlight = false;
   }
 }
 
@@ -277,10 +921,9 @@ function appendActionBarLog(message, kind = '') {
 
 function setActionBarExpanded(expanded) {
   ensureActionBarStructure();
-  actionBarState.expanded = !!expanded;
-  if (el.actionBar) el.actionBar.classList.toggle('expanded', actionBarState.expanded);
-  if (el.actionBarToggle) el.actionBarToggle.setAttribute('aria-expanded', actionBarState.expanded ? 'true' : 'false');
-  if (el.actionBarLogs) el.actionBarLogs.classList.toggle('hidden', !actionBarState.expanded);
+  actionBarState.expanded = false;
+  if (el.actionBar) el.actionBar.classList.remove('expanded');
+  if (el.actionBarLogs) el.actionBarLogs.classList.add('hidden');
 }
 
 function showActionBar(message, kind = '', duration = 2200, options = {}) {
@@ -302,16 +945,31 @@ function showActionBar(message, kind = '', duration = 2200, options = {}) {
       appendActionBarLog(message, kind);
     }
   }
+  if (Object.prototype.hasOwnProperty.call(options, 'progress')) {
+    const progressValue = Number(options.progress);
+    if (Number.isFinite(progressValue)) {
+      setActionBarProgress(progressValue, options.progressLabel || '', { reset: !!options.progressReset });
+      if (progressValue >= 100) {
+        if (actionBarState.progressHideTimer) {
+          clearTimeout(actionBarState.progressHideTimer);
+          actionBarState.progressHideTimer = null;
+        }
+        actionBarState.progressHideTimer = setTimeout(() => {
+          hideActionBarProgress();
+        }, 700);
+      }
+    } else {
+      hideActionBarProgress();
+    }
+  } else if (duration > 0 && !options.keepProgress) {
+    hideActionBarProgress();
+  }
   if (actionBarState.timer) {
     clearTimeout(actionBarState.timer);
     actionBarState.timer = null;
   }
   if (duration > 0) {
     actionBarState.timer = setTimeout(() => {
-      if (actionBarState.expanded) {
-        actionBarState.timer = null;
-        return;
-      }
       el.actionBar.classList.add('hidden');
       actionBarState.timer = null;
     }, duration);
@@ -327,7 +985,7 @@ function withPrivateKey(path) {
 }
 
 function isEventType(type) {
-  return type === 'EVENT_ON_ENABLE' || type === 'EVENT_ON_PLAYER_JOIN';
+  return type === 'EVENT_ON_ENABLE' || type === 'EVENT_ON_PLAYER_JOIN' || type === 'EVENT_ON_PLAYER_CHAT';
 }
 
 function isActionType(type) {
@@ -351,11 +1009,11 @@ function isExecInputType(type) {
 }
 
 function isDataOutputType(type) {
-  return type === 'VAR_TEXT' || type === 'VAR_INTEGER' || type === 'VAR_DECIMAL' || type === 'MATH_ADD' || type === 'MATH_SUB' || type === 'MATH_MUL' || type === 'MATH_DIV';
+  return type === 'VAR_TEXT' || type === 'VAR_INTEGER' || type === 'VAR_DECIMAL' || type === 'VAR_BOOLEAN' || type === 'MATH_ADD' || type === 'MATH_SUB' || type === 'MATH_MUL' || type === 'MATH_DIV';
 }
 
 function isDataInputType(type) {
-  return type === 'FUNCTION_SEND_MESSAGE' || type === 'FUNCTION_BROADCAST_MESSAGE' || type === 'EVENT_ON_PLAYER_JOIN' || type === 'MATH_ADD' || type === 'MATH_SUB' || type === 'MATH_MUL' || type === 'MATH_DIV';
+  return type === 'FUNCTION_SEND_MESSAGE' || type === 'FUNCTION_BROADCAST_MESSAGE' || type === 'EVENT_ON_PLAYER_JOIN' || type === 'EVENT_ON_PLAYER_CHAT' || type === 'MATH_ADD' || type === 'MATH_SUB' || type === 'MATH_MUL' || type === 'MATH_DIV';
 }
 
 function canStartLink(type) {
@@ -366,10 +1024,28 @@ function isDataKind(kind) {
   return kind === 'data' || String(kind).startsWith('data-');
 }
 
+function linkFamily(kind) {
+  const k = String(kind || 'exec');
+  if (isDataKind(k)) return 'data';
+  if (k === 'exec') return 'exec';
+  if (k === 'player') return 'player';
+  if (k === 'context') return 'context';
+  return k;
+}
+
+function linkFamilyByPortClass(portClass, fallbackKind = 'exec') {
+  const p = String(portClass || '');
+  if (p === 'in-player' || p === 'out-player') return 'player';
+  if (p === 'in-exec' || p === 'out-exec') return 'exec';
+  if (p === 'in-cancel' || p.startsWith('in-data') || p.startsWith('out-data')) return 'data';
+  return linkFamily(fallbackKind);
+}
+
 function linkKindFromType(type) {
   if (type === 'VAR_TEXT') return 'data-text';
   if (type === 'VAR_INTEGER') return 'data-int';
   if (type === 'VAR_DECIMAL') return 'data-decimal';
+  if (type === 'VAR_BOOLEAN') return 'data-bool';
   if (type === 'MATH_ADD') return 'data-any';
   if (type === 'MATH_MUL') return 'data-number';
   if (type === 'MATH_DIV') return 'data-number';
@@ -387,6 +1063,8 @@ function targetPortClassForLink(kind, toType, preferredPortClass = '') {
   if (isDataKind(kind) && toType === 'FUNCTION_SEND_MESSAGE') return 'in-data';
   if (isDataKind(kind) && toType === 'FUNCTION_BROADCAST_MESSAGE') return 'in-data';
   if (isDataKind(kind) && toType === 'EVENT_ON_PLAYER_JOIN') return 'in-data';
+  if (toType === 'EVENT_ON_PLAYER_CHAT' && kind === 'data-bool') return 'in-cancel';
+  if (isDataKind(kind) && toType === 'EVENT_ON_PLAYER_CHAT') return 'in-data';
   if (kind === 'player' && toType === 'FUNCTION_SEND_MESSAGE') return 'in-player';
   return 'in-exec';
 }
@@ -396,7 +1074,7 @@ function isNumericDataKind(kind) {
 }
 
 function canLinkKindToType(kind, toType) {
-  if (kind === 'data-text' || kind === 'data-int' || kind === 'data-decimal' || kind === 'data-any' || kind === 'data') {
+  if (kind === 'data-text' || kind === 'data-int' || kind === 'data-decimal' || kind === 'data-bool' || kind === 'data-any' || kind === 'data') {
     if (toType === 'MATH_SUB' || toType === 'MATH_MUL' || toType === 'MATH_DIV') return isNumericDataKind(kind);
     return isDataInputType(toType);
   }
@@ -408,6 +1086,22 @@ function canLinkKindToType(kind, toType) {
   if (kind === 'player') return toType === 'FUNCTION_SEND_MESSAGE';
   if (kind === 'context') return false;
   return false;
+}
+
+function canLinkKindToPort(kind, toType, toPortClass = '', sourceId = '') {
+  const isNumericMathTarget = toType === 'MATH_SUB' || toType === 'MATH_MUL' || toType === 'MATH_DIV';
+  const canTypeLink = (kind === 'data-any' && isNumericMathTarget)
+    ? canNodeOutputBeNumeric(sourceId)
+    : canLinkKindToType(kind, toType);
+  if (!canTypeLink) return false;
+  const portClass = String(toPortClass || '');
+  if (portClass === 'in-exec') return kind === 'exec';
+  if (portClass === 'in-player') return kind === 'player';
+  if (portClass === 'in-data' || portClass === 'in-data-a' || portClass === 'in-data-b') return isDataKind(kind);
+  if (toType === 'EVENT_ON_PLAYER_CHAT' && toPortClass === 'in-cancel') {
+    return kind === 'data-bool';
+  }
+  return true;
 }
 
 function canNodeOutputBeNumeric(nodeId, depth = 0, seen = new Set()) {
@@ -436,6 +1130,402 @@ function canLinkFromSourceToTarget(sourceId, sourceKind, targetType) {
   return canLinkKindToType(sourceKind, targetType);
 }
 
+function isRuntimeLinkCompatible(fromNode, toNode, kind, toPortClass) {
+  return !runtimeLinkIncompatibilityReason(fromNode, toNode, kind, toPortClass);
+}
+
+function runtimeLinkIncompatibilityReason(fromNode, toNode, kind, toPortClass) {
+  if (!fromNode || !toNode) return '존재하지 않는 노드와 연결됨';
+  if (!canLinkKindToPort(kind, toNode.type, toPortClass, fromNode.id)) return '포트 타입이 호환되지 않음';
+
+  // Generated code consumes player input only for sendMessage from join/chat event player output.
+  if (kind === 'player') {
+    const sourceType = String(fromNode.type || '');
+    const ok = toNode.type === 'FUNCTION_SEND_MESSAGE'
+      && toPortClass === 'in-player'
+      && (sourceType === 'EVENT_ON_PLAYER_JOIN' || sourceType === 'EVENT_ON_PLAYER_CHAT');
+    return ok ? '' : '이 player 연결은 실행 코드에서 사용되지 않음';
+  }
+
+  return '';
+}
+
+function buildLinkErrorDiagnostics() {
+  const invalidIndexes = new Set();
+  const reasonByIndex = new Map();
+  const causeNodeIdByIndex = new Map();
+  const familyByIndex = new Map();
+  const outgoingByNodeId = new Map();
+
+  for (let i = 0; i < state.links.length; i += 1) {
+    const link = state.links[i];
+    const fromNode = state.blocks.find((it) => it.id === link.from);
+    const toNode = state.blocks.find((it) => it.id === link.to);
+    if (!fromNode || !toNode) continue;
+    if (!outgoingByNodeId.has(link.from)) outgoingByNodeId.set(link.from, []);
+    outgoingByNodeId.get(link.from).push(i);
+
+    const kind = link.kind || linkKindFromType(fromNode.type);
+    const toPort = targetPortClassForLink(kind, toNode.type, link.toPortClass || '');
+    familyByIndex.set(i, linkFamilyByPortClass(toPort, kind));
+
+    const directReason = runtimeLinkIncompatibilityReason(fromNode, toNode, kind, toPort);
+    if (directReason) {
+      invalidIndexes.add(i);
+      reasonByIndex.set(i, directReason);
+      causeNodeIdByIndex.set(i, fromNode.id);
+    }
+  }
+
+  const queue = Array.from(invalidIndexes).map((idx) => ({
+    linkIndex: idx,
+    family: familyByIndex.get(idx) || 'exec',
+    rootCauseNodeId: causeNodeIdByIndex.get(idx) || null
+  }));
+  while (queue.length) {
+    const entry = queue.shift();
+    const brokenLink = state.links[entry.linkIndex];
+    if (!brokenLink) continue;
+    const brokenTargetNode = state.blocks.find((it) => it.id === brokenLink.to);
+    const nextIndexes = outgoingByNodeId.get(brokenLink.to) || [];
+    for (const nextIndex of nextIndexes) {
+      const nextFamily = familyByIndex.get(nextIndex) || 'exec';
+      if (!canPropagateErrorAcrossFamily(entry.family, nextFamily, brokenTargetNode?.type || '')) continue;
+      if (invalidIndexes.has(nextIndex)) continue;
+      invalidIndexes.add(nextIndex);
+      reasonByIndex.set(nextIndex, `${titleOf(brokenTargetNode?.type || '')} 노드 입력 오류가 연쇄 전파됨`);
+      causeNodeIdByIndex.set(nextIndex, entry.rootCauseNodeId || brokenTargetNode?.id || null);
+      queue.push({
+        linkIndex: nextIndex,
+        family: nextFamily,
+        rootCauseNodeId: entry.rootCauseNodeId || brokenTargetNode?.id || null
+      });
+    }
+  }
+
+  return { invalidIndexes, reasonByIndex, causeNodeIdByIndex };
+}
+
+function canPropagateErrorAcrossFamily(sourceFamily, nextFamily, targetNodeType) {
+  // Same-family propagation is the default.
+  if (sourceFamily === nextFamily) {
+    // EVENT_ON_PLAYER_JOIN의 입력(message) 오류는 message 출력(data)까지 오염시키지 않고
+    // 실행(exec) 흐름에만 영향을 주도록 순서 기반으로 제한한다.
+    if (sourceFamily === 'data' && targetNodeType === 'EVENT_ON_PLAYER_JOIN') return false;
+    return true;
+  }
+
+  // Node-level execution dependencies: data/player 쪽 오류가 실행 단계로 번질 수 있는 노드들.
+  const bridgeToExec = nextFamily === 'exec' && sourceFamily !== 'exec';
+  if (bridgeToExec) {
+    return isActionType(targetNodeType) || targetNodeType === 'EVENT_ON_PLAYER_JOIN';
+  }
+  return false;
+}
+
+function hasIncomingToResolvedPort(nodeId, portClass) {
+  for (const link of state.links) {
+    if (String(link?.to || '') !== nodeId) continue;
+    const fromNode = state.blocks.find((n) => n.id === link.from);
+    const toNode = state.blocks.find((n) => n.id === link.to);
+    if (!fromNode || !toNode) continue;
+    const kind = link.kind || linkKindFromType(fromNode.type);
+    const resolvedPort = targetPortClassForLink(kind, toNode.type, link.toPortClass || '');
+    if (resolvedPort === portClass) return true;
+  }
+  return false;
+}
+
+function missingRequiredInputLabels(node) {
+  if (!node) return [];
+  if (node.type === 'FUNCTION_SEND_MESSAGE' || node.type === 'FUNCTION_BROADCAST_MESSAGE') {
+    const missing = [];
+    if (!hasIncomingToResolvedPort(node.id, 'in-data')) missing.push('message');
+    if (node.type === 'FUNCTION_SEND_MESSAGE' && !hasIncomingToResolvedPort(node.id, 'in-player')) missing.push('player');
+    return missing;
+  }
+  if (node.type === 'MATH_ADD' || node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV') {
+    const missing = [];
+    if (!hasIncomingToResolvedPort(node.id, 'in-data-a')) missing.push('A');
+    if (!hasIncomingToResolvedPort(node.id, 'in-data-b')) missing.push('B');
+    return missing;
+  }
+  return [];
+}
+
+function buildNodeAiRiskMap() {
+  const map = new Map();
+  const linkDiagnostics = buildLinkErrorDiagnostics();
+  const globalFailProb = clamp01(Number(graphDecisionState?.ml?.failProbability ?? 0));
+  const globalFactor = 0.6 + (0.8 * globalFailProb);
+
+  const hasInvalidLinkByNode = new Map();
+  const hasPropagatedLinkByNode = new Map();
+  for (let index = 0; index < state.links.length; index += 1) {
+    if (!linkDiagnostics.invalidIndexes.has(index)) continue;
+    const link = state.links[index];
+    const reason = String(linkDiagnostics.reasonByIndex.get(index) || '');
+    const propagated = reason.includes('연쇄 전파');
+    const fromId = String(link?.from || '');
+    const toId = String(link?.to || '');
+    if (fromId) {
+      hasInvalidLinkByNode.set(fromId, true);
+      if (propagated) hasPropagatedLinkByNode.set(fromId, true);
+    }
+    if (toId) {
+      hasInvalidLinkByNode.set(toId, true);
+      if (propagated) hasPropagatedLinkByNode.set(toId, true);
+    }
+  }
+
+  for (const node of state.blocks) {
+    const nodeId = String(node?.id || '');
+    if (!nodeId) continue;
+    const incomingExec = state.links.some((it) => it.to === nodeId && ((it.kind || 'exec') === 'exec'));
+    const linkedAny = state.links.some((it) => it.from === nodeId || it.to === nodeId);
+    const missingRequired = missingRequiredInputLabels(node);
+    let score = 0;
+    if (hasInvalidLinkByNode.get(nodeId)) score += 0.75;
+    if (hasPropagatedLinkByNode.get(nodeId)) score += 0.25;
+    if (isActionType(node.type) && !incomingExec) score += 0.95;
+    if (!linkedAny) score += 0.18;
+    if (missingRequired.length > 0) score += 0.95;
+    score = clamp01(score * globalFactor);
+    if (score < 0.55) continue;
+    const level = score >= 0.75 ? 'high' : 'warn';
+    const label = level === 'high' ? '높음' : '보통';
+    const reason = missingRequired.length > 0
+      ? `필요한 입력이 없음: ${missingRequired.join(', ')}`
+      : (hasInvalidLinkByNode.get(nodeId)
+        ? '연결 오류 또는 연쇄 영향이 감지됨'
+        : (isActionType(node.type) && !incomingExec ? '실행 연결 없음' : '구조가 불안정함'));
+    map.set(nodeId, { score, level, label, reason });
+  }
+
+  return map;
+}
+
+function nodeDistanceSq(a, b) {
+  const dx = (a?.x || 0) - (b?.x || 0);
+  const dy = (a?.y || 0) - (b?.y || 0);
+  return (dx * dx) + (dy * dy);
+}
+
+async function applyAiAutoFixForNode(nodeId) {
+  const node = state.blocks.find((it) => it.id === nodeId);
+  if (!node) {
+    showActionBar('AI 자동 수정 실패: 대상 노드를 찾지 못했습니다.', 'error', 2600);
+    return 0;
+  }
+  let applied = 0;
+
+  const sourcePortClassFromKind = (kind) => {
+    if (kind === 'exec') return 'out-exec';
+    if (kind === 'player') return 'out-player';
+    if (kind === 'data-text') return 'out-data-text';
+    if (kind === 'data-int') return 'out-data-int';
+    if (kind === 'data-decimal') return 'out-data-decimal';
+    if (kind === 'data-bool') return 'out-data-bool';
+    if (kind === 'data-any') return 'out-data-any';
+    if (kind === 'data-number') return 'out-data-number';
+    return '';
+  };
+
+  const tryConnectFromChosenNode = (sourceNodeId, targetPortClass, expectedFamily = '') => {
+    const sourceId = String(sourceNodeId || '').trim();
+    const targetPort = String(targetPortClass || '').trim();
+    if (!sourceId || !targetPort) return false;
+    const source = state.blocks.find((it) => it.id === sourceId);
+    if (!source || source.id === node.id) return false;
+    const kind = linkKindFromType(source.type);
+    if (expectedFamily === 'exec' && kind !== 'exec') return false;
+    if (expectedFamily === 'player' && kind !== 'player') return false;
+    if (expectedFamily === 'data' && !isDataKind(kind)) return false;
+    const fromPortClass = sourcePortClassFromKind(kind);
+    if (!fromPortClass) return false;
+    if (!canLinkKindToPort(kind, node.type, targetPort, source.id)) return false;
+    const before = state.links.length;
+    addLink(source.id, node.id, kind, fromPortClass, targetPort);
+    return state.links.length > before;
+  };
+
+  const ensureExecConnection = (sourceNodeId = '') => {
+    const hasExec = state.links.some((it) => it.to === node.id && ((it.kind || 'exec') === 'exec'));
+    if (hasExec || !isActionType(node.type)) return false;
+    if (tryConnectFromChosenNode(sourceNodeId, 'in-exec', 'exec')) {
+      applied += 1;
+      return true;
+    }
+    return false;
+  };
+
+  const ensureMessageInput = (sourceNodeId = '') => {
+    if (!(node.type === 'FUNCTION_SEND_MESSAGE' || node.type === 'FUNCTION_BROADCAST_MESSAGE')) return;
+    if (hasIncomingToResolvedPort(node.id, 'in-data')) return;
+    if (tryConnectFromChosenNode(sourceNodeId, 'in-data', 'data')) {
+      applied += 1;
+      return true;
+    }
+    return false;
+  };
+
+  const ensurePlayerInput = (sourceNodeId = '') => {
+    if (node.type !== 'FUNCTION_SEND_MESSAGE') return;
+    if (hasIncomingToResolvedPort(node.id, 'in-player')) return;
+    if (tryConnectFromChosenNode(sourceNodeId, 'in-player', 'player')) {
+      applied += 1;
+      return true;
+    }
+    return false;
+  };
+
+  const ensureMathInput = (sourceNodeId = '', targetPortClass = '') => {
+    if (!(node.type === 'MATH_ADD' || node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV')) return;
+    const port = String(targetPortClass || '');
+    if (port !== 'in-data-a' && port !== 'in-data-b') return false;
+    if (hasIncomingToResolvedPort(node.id, port)) return false;
+    if (tryConnectFromChosenNode(sourceNodeId, port, 'data')) {
+      applied += 1;
+      return true;
+    }
+    return false;
+  };
+
+  const allActions = ['connect_exec', 'connect_message', 'connect_player', 'connect_math_a', 'connect_math_b'];
+  const missing = missingRequiredInputLabels(node);
+  showActionBar('AI 자동 수정: 그래프 분석 중...', '', 0, { keepProgress: true });
+  await waitForNextUiTick();
+  const existingContext = buildExistingAutoFixContext(node.id, 20, 36);
+  const availableSourceNodeIds = (Array.isArray(existingContext?.nodes) ? existingContext.nodes : [])
+    .map((n) => String(n?.id || '').trim())
+    .filter(Boolean)
+    .slice(0, 32);
+
+  const runAction = (step) => {
+    const action = String(step?.type || step || '');
+    const commonSourceNodeId = String(
+      step?.sourceNodeId
+      || step?.sourceNode
+      || step?.sourceId
+      || step?.fromNodeId
+      || ''
+    );
+    const sourceNodeIdA = String(step?.sourceNodeIdA || step?.sourceA || commonSourceNodeId || '');
+    const sourceNodeIdB = String(step?.sourceNodeIdB || step?.sourceB || commonSourceNodeId || '');
+    if (action === 'connect_exec') {
+      const ok = ensureExecConnection(commonSourceNodeId);
+      return { ok, reason: ok ? '' : `connect_exec 실패(sourceNodeId=${commonSourceNodeId || 'empty'})` };
+    }
+    if (action === 'connect_message') {
+      const ok = ensureMessageInput(commonSourceNodeId);
+      return { ok, reason: ok ? '' : `connect_message 실패(sourceNodeId=${commonSourceNodeId || 'empty'})` };
+    }
+    if (action === 'connect_player') {
+      const ok = ensurePlayerInput(commonSourceNodeId);
+      return { ok, reason: ok ? '' : `connect_player 실패(sourceNodeId=${commonSourceNodeId || 'empty'})` };
+    }
+    if (action === 'connect_math_a') {
+      const ok = ensureMathInput(sourceNodeIdA, 'in-data-a');
+      return { ok, reason: ok ? '' : `connect_math_a 실패(sourceNodeId=${sourceNodeIdA || 'empty'})` };
+    }
+    if (action === 'connect_math_b') {
+      const ok = ensureMathInput(sourceNodeIdB, 'in-data-b');
+      return { ok, reason: ok ? '' : `connect_math_b 실패(sourceNodeId=${sourceNodeIdB || 'empty'})` };
+    }
+    return { ok: false, reason: `unknown action: ${action}` };
+  };
+
+  let plannedActions = [];
+  try {
+    showActionBar('AI 자동 수정: 모델 추론 중...', '', 0, { keepProgress: true });
+    await waitForNextUiTick();
+    const prompt = [
+      'You are an auto-fix planner for a visual block editor.',
+      'Return JSON only.',
+      `Allowed actions: ${allActions.join(', ')}`,
+      'You must pick sourceNodeId from Existing graph context JSON. Do not infer nearest nodes.',
+      'Every connect_* action must include sourceNodeId.',
+      'Input port order rule: ports.inputs order means visual top-to-bottom order.',
+      `Target node type: ${node.type}`,
+      `Target input ports (top->bottom): ${inputPortOrderText(node.type)}`,
+      `Missing required inputs: ${missing.join(', ') || 'none'}`,
+      `Has incoming exec link: ${state.links.some((it) => it.to === node.id && ((it.kind || 'exec') === 'exec')) ? 'yes' : 'no'}`,
+      `Valid sourceNodeId candidates: ${availableSourceNodeIds.join(', ') || 'none'}`,
+      `Existing graph context JSON: ${JSON.stringify(existingContext)}`,
+      'Example: {"actions":[{"type":"connect_exec","sourceNodeId":"n12"},{"type":"connect_message","sourceNodeId":"n31"}]}',
+      'No prose, no markdown, JSON only.'
+    ].join('\n');
+    const generated = await generateWithLocalModel(prompt, 96);
+    showActionBar('AI 자동 수정: 출력 해석 중...', '', 0, { keepProgress: true });
+    await waitForNextUiTick();
+    plannedActions = extractAiActionPlan(generated, allActions);
+  } catch (error) {
+    showActionBar(`AI 자동 수정 실패: ${error?.message || '모델 출력 실패'}`, 'error', 3000);
+    return 0;
+  }
+
+  if (plannedActions.length === 0) {
+    showActionBar('AI 자동 수정 실패: 유효한 액션을 생성하지 못했습니다.', 'error', 3000);
+    return 0;
+  }
+
+  showActionBar('AI 자동 수정: 변경 적용 중...', '', 0, { keepProgress: true });
+  await waitForNextUiTick();
+  let appliedByAction = 0;
+  const failedReasons = [];
+  for (const step of plannedActions) {
+    const result = runAction(step);
+    if (result?.ok) appliedByAction += 1;
+    else if (result?.reason) failedReasons.push(result.reason);
+  }
+
+  if (applied > 0) {
+    scheduleCollaborativePublish(true);
+    schedulePresencePublish(true);
+    showActionBar(`AI 자동 수정 적용: ${applied}개`, 'ok', 1800);
+  } else {
+    const reasonText = failedReasons.slice(0, 2).join(' / ');
+    showActionBar(`AI 자동 수정 실패: 적용 가능한 수정이 없습니다. (액션 ${plannedActions.length}개, 적용 ${appliedByAction}개${reasonText ? `, 원인: ${reasonText}` : ''})`, 'error', 3800);
+  }
+  return applied;
+}
+
+function getLinkIndexesForPort(nodeId, portType, portClass) {
+  if (!nodeId || !portType || !portClass) return [];
+  const indexes = [];
+  for (let index = 0; index < state.links.length; index += 1) {
+    const link = state.links[index];
+    if (portType === 'out') {
+      const resolvedFromPort = link.fromPortClass || '';
+      if (link.from === nodeId && resolvedFromPort === portClass) indexes.push(index);
+      continue;
+    }
+    if (link.to !== nodeId) continue;
+    const fromNode = state.blocks.find((n) => n.id === link.from);
+    const toNode = state.blocks.find((n) => n.id === link.to);
+    if (!fromNode || !toNode) continue;
+    const kind = link.kind || linkKindFromType(fromNode.type);
+    const toPort = targetPortClassForLink(kind, toNode.type, link.toPortClass || '');
+    if (toPort === portClass) indexes.push(index);
+  }
+  return indexes;
+}
+
+function moveViewportToNode(nodeId) {
+  const node = state.blocks.find((it) => it.id === nodeId);
+  if (!node) return false;
+  const nodeHeight = measureNodeHeightFromDom(nodeId) || estimateNodeHeight(node);
+  const worldX = node.x + (BLOCK_NODE_WIDTH / 2);
+  const worldY = node.y + (nodeHeight / 2);
+  state.panX = (el.workspace.clientWidth / 2) - (worldX * state.scale);
+  state.panY = (el.workspace.clientHeight / 2) - (worldY * state.scale);
+  state.selectedId = nodeId;
+  state.selectedCommentId = null;
+  renderCanvas();
+  schedulePresencePublish(true);
+  return true;
+}
+
 function canLinkTypes(fromType, toType) {
   return canLinkKindToType(linkKindFromType(fromType), toType);
 }
@@ -451,9 +1541,11 @@ function titleOf(type) {
 function typeLabelOf(type) {
   if (type === 'EVENT_ON_ENABLE') return '플러그인이 활성화될 때';
   if (type === 'EVENT_ON_PLAYER_JOIN') return '플레이어가 접속할 때';
+  if (type === 'EVENT_ON_PLAYER_CHAT') return '플레이어가 채팅할 때';
   if (type === 'VAR_TEXT') return '텍스트 값을 저장해 두는 칸';
   if (type === 'VAR_INTEGER') return '소수점 없는 숫자를 저장해 두는 칸';
   if (type === 'VAR_DECIMAL') return '소수점 있는 숫자를 저장해 두는 칸';
+  if (type === 'VAR_BOOLEAN') return '참/거짓 값을 저장해 두는 칸';
   if (type === 'FUNCTION_SEND_MESSAGE') return '플레이어에게 메시지를 보내는 함수';
   if (type === 'FUNCTION_BROADCAST_MESSAGE') return '모든 플레이어에게 메시지를 보내는 함수';
   if (type === 'MATH_ADD') return '두 값을 더하거나 이어 붙이는 연산';
@@ -463,14 +1555,22 @@ function typeLabelOf(type) {
   return type;
 }
 
-function createNode(type, x, y) {
+function buildDefaultNodeParams(type) {
   const functionDef = NODE_LIBRARY.functions.find((it) => it.type === type);
   const variableDef = NODE_LIBRARY.variables.find((it) => it.type === type);
   const params = {};
   if (functionDef) params.message = functionDef.defaultMessage;
-  if (type === 'EVENT_ON_PLAYER_JOIN') params.message = '';
+  if (type === 'EVENT_ON_PLAYER_JOIN' || type === 'EVENT_ON_PLAYER_CHAT') params.message = '';
   if (variableDef) {
     params.value = variableDef.defaultValue;
+  }
+  return params;
+}
+
+function createNode(type, x, y, paramsOverride = null) {
+  const params = buildDefaultNodeParams(type);
+  if (paramsOverride && typeof paramsOverride === 'object') {
+    Object.assign(params, paramsOverride);
   }
   const node = {
     id: `n${state.nextId++}`,
@@ -531,6 +1631,287 @@ function colorForClient(clientId) {
   }
   const hue = Math.abs(hash) % 360;
   return `hsl(${hue} 72% 62%)`;
+}
+
+function buildGraphDecisionSnapshot() {
+  return {
+    workspaceId: state.currentWorkspaceId || '',
+    nodeCount: state.blocks.length,
+    linkCount: state.links.length,
+    blocks: state.blocks.map((node) => ({
+      id: node.id,
+      type: node.type,
+      params: node.params || {}
+    })),
+    links: state.links.map((link) => ({
+      from: link.from,
+      to: link.to,
+      kind: link.kind || 'exec',
+      fromPortClass: link.fromPortClass || '',
+      toPortClass: link.toPortClass || ''
+    }))
+  };
+}
+
+function evaluateGraphRules() {
+  const issues = [];
+  const warnings = [];
+  const blockById = new Map();
+  const duplicateIds = new Set();
+  for (const block of state.blocks) {
+    if (!block?.id) continue;
+    if (blockById.has(block.id)) {
+      duplicateIds.add(block.id);
+      continue;
+    }
+    blockById.set(block.id, block);
+  }
+  if (duplicateIds.size > 0) {
+    issues.push({
+      code: 'duplicate_node_id',
+      severity: 'error',
+      message: `중복 노드 ID: ${Array.from(duplicateIds).join(', ')}`
+    });
+  }
+
+  const incomingExecCount = new Map();
+  for (const link of state.links) {
+    const fromNode = blockById.get(link.from);
+    const toNode = blockById.get(link.to);
+    if (!fromNode || !toNode) {
+      issues.push({
+        code: 'dangling_link',
+        severity: 'error',
+        message: `존재하지 않는 노드로 연결됨 (${link.from} -> ${link.to})`
+      });
+      continue;
+    }
+    const kind = link.kind || linkKindFromType(fromNode.type);
+    const toPortClass = resolveLinkToPortClass(link, toNode);
+    const runtimeIssue = runtimeLinkIncompatibilityReason(fromNode, toNode, kind, toPortClass);
+    if (runtimeIssue) {
+      issues.push({
+        code: 'invalid_link_type',
+        severity: 'error',
+        message: `실행 불가 연결 (${titleOf(fromNode.type)} -> ${titleOf(toNode.type)}): ${runtimeIssue}`
+      });
+      continue;
+    }
+    if (kind === 'exec') {
+      incomingExecCount.set(link.to, (incomingExecCount.get(link.to) || 0) + 1);
+    }
+  }
+
+  const hasEventNode = state.blocks.some((node) => isEventType(node.type));
+  if (!hasEventNode && state.blocks.length > 0) {
+    warnings.push({
+      code: 'missing_event_root',
+      severity: 'warn',
+      message: '이벤트 시작 노드가 없어 실행 체인이 시작되지 않을 수 있습니다.'
+    });
+  }
+
+  for (const node of state.blocks) {
+    if (isActionType(node.type) && !incomingExecCount.get(node.id)) {
+      warnings.push({
+        code: 'unreachable_action',
+        severity: 'warn',
+        message: `${titleOf(node.type)} 노드가 실행 체인에 연결되지 않았습니다.`
+      });
+    }
+  }
+
+  return {
+    version: 'rule-v1',
+    canRun: issues.length === 0,
+    issues,
+    warnings,
+    checkedAt: Date.now()
+  };
+}
+
+function clamp01(v) {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(1, v));
+}
+
+function sigmoid(x) {
+  const t = Number.isFinite(x) ? x : 0;
+  return 1 / (1 + Math.exp(-t));
+}
+
+function buildMlGraphFeatures(snapshot, ruleResult) {
+  const blocks = Array.isArray(snapshot?.blocks) ? snapshot.blocks : [];
+  const links = Array.isArray(snapshot?.links) ? snapshot.links : [];
+  const nodeCount = Math.max(1, Number(snapshot?.nodeCount || blocks.length || 0));
+  const linkCount = Math.max(0, Number(snapshot?.linkCount || links.length || 0));
+  const issues = Array.isArray(ruleResult?.issues) ? ruleResult.issues : [];
+  const warnings = Array.isArray(ruleResult?.warnings) ? ruleResult.warnings : [];
+
+  const eventIds = new Set();
+  const actionIds = new Set();
+  for (const node of blocks) {
+    const t = String(node?.type || '');
+    if (isEventType(t)) eventIds.add(String(node.id || ''));
+    if (isActionType(t)) actionIds.add(String(node.id || ''));
+  }
+
+  const outgoingExec = new Map();
+  const incomingExec = new Map();
+  for (const link of links) {
+    const from = String(link?.from || '');
+    const to = String(link?.to || '');
+    const kind = String(link?.kind || 'exec');
+    if (!from || !to || kind !== 'exec') continue;
+    if (!outgoingExec.has(from)) outgoingExec.set(from, []);
+    outgoingExec.get(from).push(to);
+    incomingExec.set(to, (incomingExec.get(to) || 0) + 1);
+  }
+
+  const reached = new Set();
+  const queue = Array.from(eventIds);
+  while (queue.length) {
+    const nodeId = queue.shift();
+    if (!nodeId || reached.has(nodeId)) continue;
+    reached.add(nodeId);
+    const next = outgoingExec.get(nodeId) || [];
+    for (const nextId of next) {
+      if (!reached.has(nextId)) queue.push(nextId);
+    }
+  }
+
+  let reachedAction = 0;
+  for (const actionId of actionIds) {
+    if (reached.has(actionId)) reachedAction += 1;
+  }
+
+  const invalidLinkIssues = issues.filter((it) => String(it?.code || '') === 'invalid_link_type').length;
+  const danglingIssues = issues.filter((it) => String(it?.code || '') === 'dangling_link').length;
+  const unreachableWarn = warnings.filter((it) => String(it?.code || '') === 'unreachable_action').length;
+  const missingRootWarn = warnings.filter((it) => String(it?.code || '') === 'missing_event_root').length;
+  const orphanAction = Math.max(0, actionIds.size - reachedAction);
+
+  return {
+    issueRatio: clamp01(issues.length / Math.max(1, nodeCount)),
+    warningRatio: clamp01(warnings.length / Math.max(1, nodeCount)),
+    invalidLinkRatio: clamp01(invalidLinkIssues / Math.max(1, linkCount)),
+    danglingRatio: clamp01(danglingIssues / Math.max(1, linkCount)),
+    sparseRatio: clamp01((nodeCount - linkCount) / Math.max(1, nodeCount)),
+    orphanActionRatio: clamp01(orphanAction / Math.max(1, actionIds.size || 1)),
+    unreachableWarnRatio: clamp01(unreachableWarn / Math.max(1, actionIds.size || 1)),
+    missingRoot: missingRootWarn > 0 ? 1 : 0,
+    reachability: clamp01(reachedAction / Math.max(1, actionIds.size || 1)),
+    hasRuleError: issues.length > 0 ? 1 : 0,
+    nodeScale: clamp01(nodeCount / 40),
+    linkDensity: clamp01(linkCount / Math.max(1, nodeCount * 2))
+  };
+}
+
+async function runMlAssistHeuristic(snapshot, ruleResult) {
+  const f = buildMlGraphFeatures(snapshot, ruleResult);
+  // Tiny local classifier (logistic inference) tuned for conservative failure prediction.
+  const z = (
+    -0.35
+    + (2.35 * f.issueRatio)
+    + (1.8 * f.invalidLinkRatio)
+    + (1.2 * f.danglingRatio)
+    + (0.95 * f.warningRatio)
+    + (0.75 * f.orphanActionRatio)
+    + (0.65 * f.unreachableWarnRatio)
+    + (0.6 * f.sparseRatio)
+    + (0.45 * f.missingRoot)
+    - (1.25 * f.reachability)
+    - (0.35 * f.linkDensity)
+    + (0.2 * f.nodeScale)
+  );
+  const failProb = clamp01(sigmoid(z));
+  const score = Math.round((1 - failProb) * 100);
+  const confidenceBand = Math.abs(0.5 - failProb);
+  const confidence = confidenceBand >= 0.3 ? 'high' : (confidenceBand >= 0.16 ? 'medium' : 'low');
+  const reasons = [];
+  if (f.invalidLinkRatio > 0.08) reasons.push('타입 불일치 링크 비율이 높음');
+  if (f.orphanActionRatio > 0.3) reasons.push('실행 체인에 연결되지 않은 액션이 많음');
+  if (f.missingRoot > 0) reasons.push('이벤트 시작 노드가 부족함');
+  if (f.reachability < 0.45) reasons.push('이벤트 기준 도달 가능한 실행 경로가 적음');
+
+  let localModel = null;
+  try {
+    localModel = await runLocalModelRiskAssist(snapshot, ruleResult);
+  } catch (error) {
+  }
+  const mergedFail = localModel
+    ? clamp01((failProb * 0.58) + (localModel.failProbability * 0.42))
+    : failProb;
+  const mergedScore = Math.round((1 - mergedFail) * 100);
+  const mergedBand = Math.abs(0.5 - mergedFail);
+  const mergedConfidence = mergedBand >= 0.3 ? 'high' : (mergedBand >= 0.16 ? 'medium' : 'low');
+  if (localModel?.reason) reasons.push(localModel.reason);
+
+  return {
+    version: 'ml-local-v2',
+    source: localModel ? 'local-logistic+onnx-embed' : 'local-logistic',
+    confidence: mergedConfidence,
+    score: mergedScore,
+    failProbability: Number(mergedFail.toFixed(4)),
+    reasons,
+    features: f,
+    localModel,
+    checkedAt: Date.now()
+  };
+}
+
+function publishGraphDecision() {
+  const payload = {
+    workspaceId: state.currentWorkspaceId || '',
+    rule: graphDecisionState.rule,
+    ml: graphDecisionState.ml,
+    updatedAt: Date.now()
+  };
+  graphDecisionState.lastPublished = payload;
+  window.__AEROGEL_GRAPH_DECISION__ = payload;
+  window.dispatchEvent(new CustomEvent('aerogel:graph-decision', { detail: payload }));
+}
+
+async function runGraphDecisionNow() {
+  const snapshot = buildGraphDecisionSnapshot();
+  const fingerprint = JSON.stringify(snapshot);
+  graphDecisionState.lastFingerprint = fingerprint;
+  graphDecisionState.rule = evaluateGraphRules();
+  publishGraphDecision();
+
+  if (graphDecisionState.mlInFlight) {
+    graphDecisionState.mlQueued = true;
+    return;
+  }
+  graphDecisionState.mlInFlight = true;
+  try {
+    const mlResult = await runMlAssistHeuristic(snapshot, graphDecisionState.rule);
+    if (graphDecisionState.lastFingerprint !== fingerprint) return;
+    graphDecisionState.ml = mlResult;
+    publishGraphDecision();
+  } finally {
+    graphDecisionState.mlInFlight = false;
+    if (graphDecisionState.mlQueued) {
+      graphDecisionState.mlQueued = false;
+      runGraphDecisionNow();
+    }
+  }
+}
+
+function scheduleGraphDecision(immediate = false) {
+  if (immediate) {
+    if (graphDecisionState.timer) {
+      clearTimeout(graphDecisionState.timer);
+      graphDecisionState.timer = null;
+    }
+    runGraphDecisionNow();
+    return;
+  }
+  if (graphDecisionState.timer) return;
+  graphDecisionState.timer = setTimeout(() => {
+    graphDecisionState.timer = null;
+    runGraphDecisionNow();
+  }, 40);
 }
 
 function removeNode(nodeId) {
@@ -629,13 +2010,15 @@ function addLink(fromId, toId, kind, fromPortClass, toPortClass) {
   if (!fromNode || !toNode) return;
   const resolvedKind = kind || linkKindFromType(fromNode.type);
   if (!canLinkFromSourceToTarget(fromId, resolvedKind, toNode.type)) return;
-  if (hasDuplicateLink(fromId, toId, resolvedKind, fromPortClass, toPortClass)) return;
+  const resolvedToPortClass = toPortClass || targetPortClassForLink(resolvedKind, toNode.type, '');
+  if (!canLinkKindToPort(resolvedKind, toNode.type, resolvedToPortClass, fromId)) return;
+  if (hasDuplicateLink(fromId, toId, resolvedKind, fromPortClass, resolvedToPortClass)) return;
   state.links.push({
     from: fromId,
     to: toId,
     kind: resolvedKind,
     fromPortClass: fromPortClass || 'out',
-    toPortClass: toPortClass || ''
+    toPortClass: resolvedToPortClass
   });
   commitHistoryState();
 }
@@ -671,9 +2054,11 @@ function resolveLinkTargetFromClient(clientX, clientY) {
     );
     const acceptOk = (sourceKind === 'exec' && accept === 'exec')
       || (isDataKind(sourceKind) && accept === 'data')
+      || (sourceKind === 'data-bool' && accept === 'data-bool')
       || (sourceKind === 'player' && accept === 'player');
     if (!acceptOk) return null;
     if (!(targetNode && canLinkFromSourceToTarget(sourceId, sourceKind, targetNode.type))) return null;
+    if (!canLinkKindToPort(sourceKind, targetNode.type, targetPortClass, sourceId)) return null;
     return { id: targetId, port: targetPortClass };
   }
 
@@ -683,6 +2068,7 @@ function resolveLinkTargetFromClient(clientX, clientY) {
     const targetNode = state.blocks.find((it) => it.id === targetNodeId);
     if (targetNode && canLinkFromSourceToTarget(sourceId, sourceKind, targetNode.type)) {
       const port = targetPortClassForLink(sourceKind, targetNode.type);
+      if (!canLinkKindToPort(sourceKind, targetNode.type, port, sourceId)) return null;
       return { id: targetNodeId, port };
     }
   }
@@ -719,8 +2105,10 @@ function renderLinksLayer() {
   svg.setAttribute('class', 'links-layer');
   svg.setAttribute('width', '100%');
   svg.setAttribute('height', '100%');
+  const linkDiagnostics = buildLinkErrorDiagnostics();
 
-  for (const link of state.links) {
+  for (let index = 0; index < state.links.length; index += 1) {
+    const link = state.links[index];
     const draftPortClass = state.connectionDraft?.fromPortClass || '';
     const linkKind = link.kind || 'exec';
     const linkPortClass = link.fromPortClass || `out-${linkKind}`;
@@ -737,18 +2125,19 @@ function renderLinksLayer() {
     const kind = link.kind || linkKindFromType(fromNode.type);
     const fromPort = link.fromPortClass || `out-${kind}`;
     const toPort = targetPortClassForLink(kind, toNode.type, link.toPortClass || '');
+    const isInvalidLink = linkDiagnostics.invalidIndexes.has(index);
     const from = getPortCenterWorld(link.from, fromPort);
     const to = getPortCenterWorld(link.to, toPort);
     if (!from || !to) continue;
     const d = linkPath(from, to);
 
     const back = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    back.setAttribute('class', isDraftSourceLink ? 'link-outline-back' : 'link-back');
+    back.setAttribute('class', isDraftSourceLink ? 'link-outline-back' : (isInvalidLink ? 'link-invalid-back' : 'link-back'));
     back.setAttribute('d', d);
     svg.appendChild(back);
 
     const front = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    front.setAttribute('class', isDraftSourceLink ? 'link-outline-front' : 'link-front');
+    front.setAttribute('class', isDraftSourceLink ? 'link-outline-front' : (isInvalidLink ? 'link-invalid-front' : 'link-front'));
     front.setAttribute('d', d);
     svg.appendChild(front);
   }
@@ -927,7 +2316,7 @@ function renderComment(comment) {
   el.canvas.appendChild(box);
 }
 
-function renderNode(node) {
+function renderNode(node, nodeAiRiskMap = new Map()) {
   const hasIncomingExec = state.links.some((it) => it.to === node.id && ((it.kind || 'exec') === 'exec'));
   const hasIncomingData = state.links.some((it) => it.to === node.id && isDataKind(it.kind || 'exec'));
   const hasIncomingPlayer = state.links.some((it) => it.to === node.id && ((it.kind || 'exec') === 'player'));
@@ -958,11 +2347,41 @@ function renderNode(node) {
   const head = document.createElement('div');
   head.className = 'block-head';
   head.innerHTML = `
-    <div>
+    <div class="block-head-meta">
       <div class="block-title">${titleOf(node.type)}</div>
       <div class="block-type">${typeLabelOf(node.type)}</div>
     </div>
   `;
+  const badgeBox = document.createElement('div');
+  badgeBox.className = 'block-head-badges';
+  if (isEventType(node.type)) {
+    const orderBadge = document.createElement('div');
+    orderBadge.className = 'exec-order-badge';
+    orderBadge.innerHTML = `
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <path d="M4 2.2a.8.8 0 0 1 1.6 0v.35h5.15c.63 0 .96.75.53 1.2L9.7 5.42l1.57 1.65c.43.45.1 1.2-.53 1.2H5.6V13a.8.8 0 1 1-1.6 0z" fill="currentColor" transform="translate(1.05 0.7)"></path>
+      </svg>
+    `;
+    orderBadge.dataset.tooltip = '시작점';
+    badgeBox.appendChild(orderBadge);
+  }
+  const aiRisk = nodeAiRiskMap.get(node.id);
+  if (aiRisk) {
+    const aiBadge = document.createElement('div');
+    aiBadge.className = `ai-risk-badge ${aiRisk.level}`;
+    aiBadge.innerHTML = `
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <path d="M8 3.3v6.2" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
+        <circle cx="8" cy="12.6" r="1.25" fill="currentColor"></circle>
+      </svg>
+    `;
+    aiBadge.dataset.tooltip = `판단 리스크: ${aiRisk.label}`;
+    aiBadge.dataset.tooltipReason = `이유: ${aiRisk.reason}`;
+    badgeBox.appendChild(aiBadge);
+  }
+  if (badgeBox.childElementCount > 0) {
+    head.appendChild(badgeBox);
+  }
 
   const pinRow = document.createElement('div');
   pinRow.className = 'pin-row';
@@ -980,28 +2399,103 @@ function renderNode(node) {
     valueLabel.style.marginTop = '0';
 
     const isTextVariable = node.type === 'VAR_TEXT';
-    const valueInput = document.createElement(isTextVariable ? 'textarea' : 'input');
-    valueInput.value = node.params?.value || '';
-    if (isTextVariable) {
-      valueInput.classList.add('text-variable-input');
-      valueInput.rows = 1;
-      valueInput.style.overflow = 'hidden';
-      valueInput.style.resize = 'none';
-      const resizeTextArea = () => {
-        valueInput.style.height = 'auto';
-        valueInput.style.height = `${valueInput.scrollHeight}px`;
-      };
-      requestAnimationFrame(resizeTextArea);
-      valueInput.addEventListener('input', resizeTextArea);
-    }
-    valueInput.addEventListener('input', () => {
-      node.params = node.params || {};
-      node.params.value = valueInput.value;
-      scheduleCollaborativePublish(true);
-    });
+    const isBooleanVariable = node.type === 'VAR_BOOLEAN';
+    let valueInput = null;
+    if (isBooleanVariable) {
+      const raw = String(node.params?.value || '').trim().toLowerCase();
+      const getNormalized = () => (raw === 'true' ? 'true' : 'false');
+      const picker = document.createElement('div');
+      picker.className = 'boolean-variable-picker';
 
-    body.appendChild(valueLabel);
-    body.appendChild(valueInput);
+      const trigger = document.createElement('button');
+      trigger.type = 'button';
+      trigger.className = 'boolean-variable-trigger';
+
+      const menu = document.createElement('div');
+      menu.className = 'boolean-variable-menu hidden';
+
+      const options = [
+        { value: 'true', label: '참' },
+        { value: 'false', label: '거짓' }
+      ];
+      let selectedValue = getNormalized();
+
+      const refreshTriggerLabel = () => {
+        trigger.textContent = selectedValue === 'true' ? '참' : '거짓';
+      };
+      const closeMenu = () => {
+        picker.classList.remove('open');
+        menu.classList.add('hidden');
+      };
+      const openMenu = () => {
+        picker.classList.add('open');
+        menu.classList.remove('hidden');
+      };
+
+      for (const option of options) {
+        const optionButton = document.createElement('button');
+        optionButton.type = 'button';
+        optionButton.className = 'boolean-variable-option';
+        optionButton.textContent = option.label;
+        if (option.value === selectedValue) optionButton.classList.add('active');
+        optionButton.addEventListener('click', (event) => {
+          event.preventDefault();
+          selectedValue = option.value;
+          node.params = node.params || {};
+          node.params.value = selectedValue;
+          for (const button of menu.querySelectorAll('.boolean-variable-option')) {
+            button.classList.toggle('active', button === optionButton);
+          }
+          refreshTriggerLabel();
+          closeMenu();
+          scheduleCollaborativePublish(true);
+        });
+        menu.appendChild(optionButton);
+      }
+
+      trigger.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (picker.classList.contains('open')) {
+          closeMenu();
+        } else {
+          openMenu();
+        }
+      });
+      picker.addEventListener('focusout', () => {
+        requestAnimationFrame(() => {
+          if (!picker.contains(document.activeElement)) closeMenu();
+        });
+      });
+
+      refreshTriggerLabel();
+      picker.appendChild(trigger);
+      picker.appendChild(menu);
+      body.appendChild(valueLabel);
+      body.appendChild(picker);
+    } else {
+      valueInput = document.createElement(isTextVariable ? 'textarea' : 'input');
+      valueInput.value = node.params?.value || '';
+      if (isTextVariable) {
+        valueInput.classList.add('text-variable-input');
+        valueInput.rows = 1;
+        valueInput.style.overflow = 'hidden';
+        valueInput.style.resize = 'none';
+        const resizeTextArea = () => {
+          valueInput.style.height = 'auto';
+          valueInput.style.height = `${valueInput.scrollHeight}px`;
+        };
+        requestAnimationFrame(resizeTextArea);
+        valueInput.addEventListener('input', resizeTextArea);
+      }
+      valueInput.addEventListener('input', () => {
+        node.params = node.params || {};
+        node.params.value = valueInput.value;
+        scheduleCollaborativePublish(true);
+      });
+      body.appendChild(valueLabel);
+      body.appendChild(valueInput);
+    }
   }
 
   nodeEl.appendChild(head);
@@ -1021,7 +2515,7 @@ function renderNode(node) {
 
     const inData = document.createElement('div');
     inData.className = `port in in-data${hasIncomingData ? ' connected' : ''}`;
-    inData.title = 'message 입력';
+    inData.dataset.tooltip = 'message 입력';
     inData.dataset.portType = 'in';
     inData.dataset.accept = 'data';
     inData.dataset.portClass = 'in-data';
@@ -1035,6 +2529,33 @@ function renderNode(node) {
     inItem.appendChild(inData);
     inItem.appendChild(inLabel);
     leftPinGroup.appendChild(inItem);
+  } else if (node.type === 'EVENT_ON_PLAYER_CHAT') {
+    leftPinGroup.classList.add('stack');
+    const appendChatInput = (label, portClass) => {
+      const connected = state.links.some((it) => it.to === node.id && isDataKind(it.kind || 'exec') && (it.toPortClass || '') === portClass);
+      const inItem = document.createElement('div');
+      inItem.className = 'pin-in-item';
+
+      const inPort = document.createElement('div');
+      inPort.className = `port in ${portClass}${connected ? ' connected' : ''}`;
+      inPort.dataset.tooltip = `${label} 입력`;
+      inPort.dataset.portType = 'in';
+      inPort.dataset.accept = portClass === 'in-cancel' ? 'data-bool' : 'data';
+      inPort.dataset.portClass = portClass;
+      inPort.dataset.nodeId = node.id;
+      const candidateAllowed = portClass === 'in-cancel' ? sourceKind === 'data-bool' : isDataKind(sourceKind);
+      if (isCandidateTarget && candidateAllowed) inPort.classList.add('candidate');
+
+      const inLabel = document.createElement('div');
+      inLabel.className = 'pin-label';
+      inLabel.textContent = label;
+
+      inItem.appendChild(inPort);
+      inItem.appendChild(inLabel);
+      leftPinGroup.appendChild(inItem);
+    };
+    appendChatInput('message', 'in-data');
+    appendChatInput('취소', 'in-cancel');
   } else if (node.type === 'FUNCTION_SEND_MESSAGE' || node.type === 'FUNCTION_BROADCAST_MESSAGE') {
     leftPinGroup.classList.add('stack');
 
@@ -1044,7 +2565,7 @@ function renderNode(node) {
 
       const inPort = document.createElement('div');
       inPort.className = `port in ${extraClass}${connected ? ' connected' : ''}`;
-      inPort.title = `${label} 입력`;
+      inPort.dataset.tooltip = `${label} 입력`;
       inPort.dataset.portType = 'in';
       inPort.dataset.accept = accept;
       inPort.dataset.portClass = extraClass;
@@ -1077,7 +2598,7 @@ function renderNode(node) {
       inItem.className = 'pin-in-item';
       const inPort = document.createElement('div');
       inPort.className = `port in ${portClass}${connected ? ' connected' : ''}`;
-      inPort.title = `${label} 입력`;
+      inPort.dataset.tooltip = `${label} 입력`;
       inPort.dataset.portType = 'in';
       inPort.dataset.accept = 'data';
       inPort.dataset.portClass = portClass;
@@ -1099,7 +2620,7 @@ function renderNode(node) {
     const inPort = document.createElement('div');
     const outlinedInput = state.connectionDraft && state.linkingActive && (state.connectionDraft.previousTargets || []).includes(node.id);
     inPort.className = `port in in-exec${hasIncomingExec ? ' connected' : ''}${outlinedInput ? ' outline' : ''}`;
-    inPort.title = '실행 입력';
+    inPort.dataset.tooltip = '실행 입력';
     inPort.dataset.portType = 'in';
     inPort.dataset.accept = 'exec';
     inPort.dataset.portClass = 'in-exec';
@@ -1128,7 +2649,7 @@ function renderNode(node) {
       && state.connectionDraft?.fromPortClass === outPortClass;
     const connectedOnThisPort = hasOutgoingByPort(outPortClass, kind);
     outPort.className = `port out ${outPortClass}${connectedOnThisPort ? ' connected' : ''}${linkingFromThis ? ' linking outline' : ''}`;
-    outPort.title = isDataKind(kind)
+    outPort.dataset.tooltip = isDataKind(kind)
       ? '데이터 출력'
       : (kind === 'player' ? 'player 출력' : (kind === 'context' ? '컨텍스트 출력' : '실행 출력'));
     outPort.dataset.portType = 'out';
@@ -1169,12 +2690,19 @@ function renderNode(node) {
     appendOutPort('다음', 'exec');
     appendOutPort('player', 'player');
     appendOutPort('message', 'data-text');
+  } else if (node.type === 'EVENT_ON_PLAYER_CHAT') {
+    rightPinGroup.classList.add('stack');
+    appendOutPort('다음', 'exec');
+    appendOutPort('player', 'player');
+    appendOutPort('message', 'data-text');
   } else if (node.type === 'VAR_TEXT') {
     appendOutPort('값', 'data-text');
   } else if (node.type === 'VAR_INTEGER') {
     appendOutPort('값', 'data-int');
   } else if (node.type === 'VAR_DECIMAL') {
     appendOutPort('값', 'data-decimal');
+  } else if (node.type === 'VAR_BOOLEAN') {
+    appendOutPort('값', 'data-bool');
   } else if (node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV') {
     appendOutPort('값', 'data-number');
   } else if (node.type === 'MATH_ADD') {
@@ -1836,11 +3364,12 @@ function renderCanvas() {
   el.workspace.style.backgroundSize = `${24 * state.scale}px ${24 * state.scale}px, ${24 * state.scale}px ${24 * state.scale}px, auto`;
 
   el.canvas.innerHTML = '';
+  const nodeAiRiskMap = buildNodeAiRiskMap();
   for (const comment of state.comments) {
     renderComment(comment);
   }
   for (const block of state.blocks) {
-    renderNode(block);
+    renderNode(block, nodeAiRiskMap);
   }
   if (state.commentDraft) {
     const draft = state.commentDraft;
@@ -1895,6 +3424,132 @@ function toWorldPosition(clientX, clientY) {
 
 function hideContextMenu() {
   el.contextMenu.classList.add('hidden');
+}
+
+function ensureHoverTooltipElement() {
+  if (hoverTooltipState.el instanceof HTMLElement) return hoverTooltipState.el;
+  const tip = document.createElement('div');
+  tip.className = 'hover-tooltip hidden';
+  tip.innerHTML = '<div class="hover-tooltip-title"></div><div class="hover-tooltip-reason empty"></div>';
+  document.body.appendChild(tip);
+  hoverTooltipState.el = tip;
+  return tip;
+}
+
+function showHoverTooltip(text, clientX, clientY, target = null, reason = '') {
+  const message = String(text || '').trim();
+  if (!message) {
+    hideHoverTooltip();
+    return;
+  }
+  const tip = ensureHoverTooltipElement();
+  const titleEl = tip.querySelector('.hover-tooltip-title');
+  const reasonEl = tip.querySelector('.hover-tooltip-reason');
+  if (titleEl instanceof HTMLElement) {
+    titleEl.textContent = message;
+  } else {
+    tip.textContent = message;
+  }
+  const normalizedReason = String(reason || '').trim();
+  if (reasonEl instanceof HTMLElement) {
+    if (normalizedReason) {
+      reasonEl.textContent = normalizedReason;
+      reasonEl.classList.remove('empty');
+    } else {
+      reasonEl.textContent = '';
+      reasonEl.classList.add('empty');
+    }
+  }
+  tip.classList.remove('hidden');
+  hoverTooltipState.target = target;
+
+  const offset = 14;
+  const margin = 8;
+  const tipWidth = Math.max(1, tip.offsetWidth || 160);
+  const tipHeight = Math.max(1, tip.offsetHeight || 28);
+  let anchorX = clientX;
+  let anchorY = clientY;
+  if (target instanceof Element) {
+    const rect = target.getBoundingClientRect();
+    anchorX = rect.left + (rect.width / 2);
+    anchorY = rect.bottom;
+  }
+  let left = anchorX - (tipWidth / 2);
+  let top = anchorY + offset;
+  if (left < margin) left = margin;
+  if (left + tipWidth + margin > window.innerWidth) {
+    left = Math.max(margin, window.innerWidth - tipWidth - margin);
+  }
+  if (top + tipHeight + margin > window.innerHeight) {
+    if (target instanceof Element) {
+      const rect = target.getBoundingClientRect();
+      top = Math.max(margin, rect.top - tipHeight - offset);
+    } else {
+      top = Math.max(margin, anchorY - tipHeight - offset);
+    }
+  }
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+}
+
+function hideHoverTooltip() {
+  const tip = hoverTooltipState.el;
+  if (!(tip instanceof HTMLElement)) return;
+  tip.classList.add('hidden');
+  hoverTooltipState.target = null;
+}
+
+function migrateNativeTitleAttributes(root = document) {
+  if (!(root instanceof Document || root instanceof Element)) return;
+  const nodes = root.querySelectorAll('[title]');
+  for (const node of nodes) {
+    if (!(node instanceof HTMLElement)) continue;
+    const nativeTitle = node.getAttribute('title');
+    if (nativeTitle && !node.dataset.tooltip) {
+      node.dataset.tooltip = nativeTitle;
+    }
+    node.removeAttribute('title');
+  }
+}
+
+function describePortIssue(target) {
+  if (!(target instanceof HTMLElement)) return '';
+  const portType = target.dataset.portType || '';
+  const portClass = target.dataset.portClass || '';
+  const nodeId = target.dataset.nodeId || '';
+  if (!portType || !portClass || !nodeId) return '';
+  const node = state.blocks.find((it) => it.id === nodeId);
+  if (!node) return '';
+
+  const linkDiagnostics = buildLinkErrorDiagnostics();
+  const checkLinkByIndex = (index) => {
+    if (!linkDiagnostics.invalidIndexes.has(index)) return '';
+    const reason = String(linkDiagnostics.reasonByIndex.get(index) || '').trim();
+    return reason || '실행 불가 연결';
+  };
+
+  for (const index of getLinkIndexesForPort(nodeId, portType, portClass)) {
+    const reason = checkLinkByIndex(index);
+    if (reason) return `이유: ${reason}`;
+  }
+
+  if (state.connectionDraft && state.linkingActive && portType === 'in') {
+    const fromId = state.connectionDraft.from || '';
+    const fromNode = state.blocks.find((it) => it.id === fromId);
+    if (!fromNode) return '';
+    const kind = state.connectionDraft.kind || linkKindFromType(fromNode.type);
+    if (fromId === nodeId) return '이유: 같은 노드에는 연결할 수 없음';
+    if (!canLinkFromSourceToTarget(fromId, kind, node.type)) return '이유: 노드 타입이 호환되지 않음';
+    if (!canLinkKindToPort(kind, node.type, portClass, fromId)) {
+      if (portClass === 'in-cancel') return '이유: 취소 입력은 논리형만 연결 가능';
+      return '이유: 포트 타입이 호환되지 않음';
+    }
+    if (!isRuntimeLinkCompatible(fromNode, node, kind, portClass)) {
+      return '이유: 이 연결은 실행 코드에서 무시됨';
+    }
+  }
+
+  return '';
 }
 
 function placeContextMenu(clientX, clientY, margin = 8) {
@@ -1954,21 +3609,6 @@ function showContextMenu(clientX, clientY, options = {}) {
   const renderMenuItems = (keyword) => {
     const q = keyword.trim().toLowerCase();
     body.innerHTML = '';
-    if (!connectFromId) {
-      const toolsTitle = document.createElement('div');
-      toolsTitle.className = 'context-title';
-      toolsTitle.textContent = '도구';
-      body.appendChild(toolsTitle);
-      const autoCreateBtn = document.createElement('button');
-      autoCreateBtn.type = 'button';
-      autoCreateBtn.className = 'context-item';
-      autoCreateBtn.textContent = '해결책 제시';
-      autoCreateBtn.addEventListener('click', () => {
-        hideContextMenu();
-        openAutoCreateDialog(state.currentWorkspaceId, { x: state.contextMenuWorld.x, y: state.contextMenuWorld.y });
-      });
-      body.appendChild(autoCreateBtn);
-    }
     const filtered = !q ? allItems : allItems.filter((it) => {
       return it.title.toLowerCase().includes(q)
         || it.type.toLowerCase().includes(q)
@@ -2014,6 +3654,7 @@ function showContextMenu(clientX, clientY, options = {}) {
       empty.textContent = connectFromId ? '연결 가능한 노드가 없습니다.' : '검색 결과가 없습니다.';
       body.appendChild(empty);
     }
+
   };
 
   search.addEventListener('input', () => renderMenuItems(search.value));
@@ -2097,6 +3738,32 @@ function showNodeContextMenu(clientX, clientY, nodeId) {
   });
   el.contextMenu.appendChild(deleteBtn);
 
+  const aiRiskMap = buildNodeAiRiskMap();
+  if (aiRiskMap.has(nodeId)) {
+    const toolsTitle = document.createElement('div');
+    toolsTitle.className = 'context-title';
+    toolsTitle.textContent = '도구';
+    el.contextMenu.appendChild(toolsTitle);
+
+    const aiFixBtn = document.createElement('button');
+    aiFixBtn.type = 'button';
+    aiFixBtn.className = 'context-item';
+    aiFixBtn.textContent = '자동 수정 제안';
+    aiFixBtn.addEventListener('click', async () => {
+      hideContextMenu();
+      showActionBar('AI 자동 수정 분석 중...', '', 0, { keepProgress: true });
+      await waitForNextUiTick();
+      applyAiAutoFixForNode(nodeId)
+        .catch((error) => {
+          showActionBar(`AI 자동 수정 실패: ${error?.message || 'unknown error'}`, 'error', 3200);
+        })
+        .finally(() => {
+          renderCanvas();
+        });
+    });
+    el.contextMenu.appendChild(aiFixBtn);
+  }
+
   placeContextMenu(clientX, clientY);
 }
 
@@ -2140,6 +3807,26 @@ function showPortContextMenu(clientX, clientY, nodeId, portType, portClass) {
     renderCanvas();
   });
   el.contextMenu.appendChild(disconnectBtn);
+
+  const linkDiagnostics = buildLinkErrorDiagnostics();
+  const connectedIndexes = getLinkIndexesForPort(nodeId, portType, portClass);
+  const invalidConnectedIndexes = connectedIndexes.filter((index) => linkDiagnostics.invalidIndexes.has(index));
+  if (invalidConnectedIndexes.length > 0) {
+    const causeNodeId = invalidConnectedIndexes
+      .map((index) => linkDiagnostics.causeNodeIdByIndex.get(index))
+      .find((id) => typeof id === 'string' && id);
+    if (causeNodeId) {
+      const moveToCauseBtn = document.createElement('button');
+      moveToCauseBtn.type = 'button';
+      moveToCauseBtn.className = 'context-item';
+      moveToCauseBtn.textContent = '원인 노드로 이동';
+      moveToCauseBtn.addEventListener('click', () => {
+        hideContextMenu();
+        moveViewportToNode(causeNodeId);
+      });
+      el.contextMenu.appendChild(moveToCauseBtn);
+    }
+  }
 
   placeContextMenu(clientX, clientY);
 }
@@ -2251,7 +3938,7 @@ function setAutoCreateAuthStatus(message, kind = '') {
 }
 
 function refreshAutoCreateGenerateEnabled() {
-  const ready = autoCreateState.authenticated
+  const ready = (localAiRuntimeState.ready || localAiRuntimeState.loading)
     && !autoCreateState.generateInFlight
     && el.autoCreatePromptInput.value.trim().length > 0;
   el.autoCreateGenerateBtn.disabled = !ready;
@@ -2296,14 +3983,14 @@ function openAutoCreateDialog(targetWorkspaceId = null, targetOriginWorld = null
     ? { x: targetOriginWorld.x, y: targetOriginWorld.y }
     : null;
   el.autoCreateDialog.classList.remove('hidden');
-  el.autoCreateApiKeyInput.value = autoCreateState.apiKey || '';
-  setAutoCreateAuthStatus(autoCreateState.authenticated ? '로그인 완료' : '로그인 필요', autoCreateState.authenticated ? 'ok' : '');
+  if (localAiRuntimeState.ready) {
+    setAutoCreateAuthStatus('로컬 AI 준비 완료', 'ok');
+  } else {
+    setAutoCreateAuthStatus('로컬 AI 준비 중...');
+  }
   refreshAutoCreateGenerateEnabled();
   resizeAutoCreatePromptInput();
   el.autoCreatePromptInput.focus();
-  if (!autoCreateState.authenticated && autoCreateState.apiKey) {
-    tryAutoLoginWithStoredGeminiKey().catch(() => {});
-  }
 }
 
 function extractJsonObjectFromText(text) {
@@ -2326,128 +4013,6 @@ function extractJsonObjectFromText(text) {
   }
 }
 
-function responseTextFromGemini(data) {
-  const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
-  const parts = [];
-  for (const candidate of candidates) {
-    const contentParts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
-    for (const part of contentParts) {
-      if (typeof part?.text === 'string') parts.push(part.text);
-    }
-  }
-  return parts.join('\n').trim();
-}
-
-async function verifyAutoCreateLogin() {
-  const key = el.autoCreateApiKeyInput.value.trim();
-  if (!key) {
-    setAutoCreateAuthStatus('Gemini API Key를 입력하세요.', 'error');
-    autoCreateState.authenticated = false;
-    writeStoredGeminiApiKey('');
-    refreshAutoCreateGenerateEnabled();
-    return;
-  }
-  autoCreateState.loginInFlight = true;
-  autoCreateState.apiKey = key;
-  writeStoredGeminiApiKey(key);
-  setAutoCreateAuthStatus('로그인 확인 중...');
-  el.autoCreateLoginBtn.disabled = true;
-  try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`);
-    if (!response.ok) {
-      throw new Error(`인증 실패 (${response.status})`);
-    }
-    autoCreateState.authenticated = true;
-    setAutoCreateAuthStatus('로그인 완료', 'ok');
-  } catch (error) {
-    autoCreateState.authenticated = false;
-    setAutoCreateAuthStatus(`로그인 실패: ${error?.message || 'unknown error'}`, 'error');
-  } finally {
-    autoCreateState.loginInFlight = false;
-    autoCreateState.lastVerifiedKey = autoCreateState.authenticated ? key : '';
-    el.autoCreateLoginBtn.disabled = false;
-    refreshAutoCreateGenerateEnabled();
-  }
-}
-
-async function tryAutoLoginWithStoredGeminiKey() {
-  if (autoCreateState.autoLoginTried) return;
-  autoCreateState.autoLoginTried = true;
-  const key = String(autoCreateState.apiKey || '').trim();
-  if (!key) return;
-  if (autoCreateState.authenticated && autoCreateState.lastVerifiedKey === key) return;
-  if (autoCreateState.loginInFlight) return;
-  el.autoCreateApiKeyInput.value = key;
-  await verifyAutoCreateLogin();
-}
-
-function shouldAllowTouchExistingNodes(promptText) {
-  const text = String(promptText || '').toLowerCase();
-  if (!text) return false;
-  return (
-    text.includes('기존 노드 수정')
-    || text.includes('기존 노드 변경')
-    || text.includes('기존 노드 건드려')
-    || text.includes('기존 노드에 연결')
-    || text.includes('기존 노드랑 연결')
-    || text.includes('기존 노드 재배치')
-    || text.includes('modify existing')
-    || text.includes('edit existing')
-    || text.includes('update existing')
-    || text.includes('connect to existing')
-    || text.includes('없애')
-    || text.includes('삭제')
-    || text.includes('지워')
-    || text.includes('제거')
-    || text.includes('바꿔')
-    || text.includes('변경')
-    || text.includes('수정')
-    || text.includes('기존')
-    || text.includes('기본 메세지')
-    || text.includes('기본 메시지')
-    || text.includes('remove')
-    || text.includes('delete')
-    || text.includes('change')
-    || text.includes('replace')
-  );
-}
-
-function createAutoCreateStreamSession(originX, originY, allowTouchExisting = false) {
-  return {
-    originX,
-    originY,
-    allowTouchExisting,
-    idMap: new Map(),
-    createdLocalNodeIds: new Set(),
-    createdLocalGroupIds: new Set(),
-    localNodeToRemoteId: new Map(),
-    localGroupToRemoteId: new Map(),
-    nodeGroupIntentByLocalNodeId: new Map(),
-    groupMemberRemoteNodeIds: new Map(),
-    nodeCount: 0,
-    linkCount: 0,
-    linkSpecCount: 0,
-    groupCount: 0,
-    modifiedCount: 0,
-    fallbackNodeIndex: 0,
-    fallbackGroupIndex: 0,
-    pendingLinks: [],
-    seenRemoteNodeIds: new Set(),
-    seenRemoteGroupIds: new Set(),
-    seenLines: new Set(),
-    lineBuffer: '',
-    lastUiAt: 0,
-    phaseMessage: '자동 생성 중입니다',
-    parsedEntryCount: 0,
-    ndjsonViolation: false,
-    textSeen: false,
-    incompleteTail: false,
-    noTextChunkLogged: false,
-    rawPayloadSamples: [],
-    rawTextSamples: []
-  };
-}
-
 function rectsOverlap(a, b, gap = 0) {
   return !(
     (a.x + a.width + gap) <= b.x
@@ -2465,6 +4030,7 @@ function estimateNodeHeight(node) {
   }
   if (node.type === 'FUNCTION_SEND_MESSAGE' || node.type === 'FUNCTION_BROADCAST_MESSAGE') return 150;
   if (node.type === 'EVENT_ON_PLAYER_JOIN') return 144;
+  if (node.type === 'EVENT_ON_PLAYER_CHAT') return 168;
   if (node.type === 'EVENT_ON_ENABLE') return 134;
   if (node.type === 'MATH_ADD' || node.type === 'MATH_SUB' || node.type === 'MATH_MUL' || node.type === 'MATH_DIV') return 136;
   return BLOCK_NODE_ESTIMATED_HEIGHT;
@@ -2478,12 +4044,13 @@ function measureNodeHeightFromDom(nodeId) {
 }
 
 function nodeRectOf(node) {
+  const measuredSize = measureNodeSizeInWorld(node.id);
   const measuredHeight = measureNodeHeightFromDom(node.id);
   return {
     x: node.x,
     y: node.y,
-    width: BLOCK_NODE_WIDTH,
-    height: measuredHeight || estimateNodeHeight(node)
+    width: Number.isFinite(measuredSize?.width) && measuredSize.width > 0 ? measuredSize.width : BLOCK_NODE_WIDTH,
+    height: measuredHeight || (Number.isFinite(measuredSize?.height) && measuredSize.height > 0 ? measuredSize.height : estimateNodeHeight(node))
   };
 }
 
@@ -2562,6 +4129,131 @@ function autoArrangeCreatedNodes(session) {
   }
 }
 
+function findAvailableNodePosition(type, x, y, paramsOverride = null, minGap = 14) {
+  const baseX = snapGrid(x);
+  const baseY = snapGrid(y);
+  const probeParams = buildDefaultNodeParams(type);
+  if (paramsOverride && typeof paramsOverride === 'object') {
+    Object.assign(probeParams, paramsOverride);
+  }
+  const probeNode = { id: '_probe', type, x: baseX, y: baseY, params: probeParams };
+  const height = estimateNodeHeight(probeNode);
+  const existingRects = state.blocks.map((it) => nodeRectOf(it));
+  const overlapArea = (a, b, gap = 0) => {
+    const ax1 = a.x - gap;
+    const ay1 = a.y - gap;
+    const ax2 = a.x + a.width + gap;
+    const ay2 = a.y + a.height + gap;
+    const bx1 = b.x;
+    const by1 = b.y;
+    const bx2 = b.x + b.width;
+    const by2 = b.y + b.height;
+    const w = Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1));
+    const h = Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1));
+    return w * h;
+  };
+  const overlapSum = (candidate) => {
+    let sum = 0;
+    for (const rect of existingRects) {
+      sum += overlapArea(candidate, rect, minGap);
+    }
+    return sum;
+  };
+  const candidateScore = (candidate) => {
+    const overlap = overlapSum(candidate);
+    const dx = Math.abs(candidate.x - baseX);
+    const dy = Math.abs(candidate.y - baseY);
+    // Stable and readable layout: no overlap first, then shorter move, then axis-aligned placements.
+    const upperPenalty = candidate.y < baseY ? 180 : 0;
+    const leftPenalty = candidate.x < baseX ? 140 : 0;
+    const axisPenalty = (candidate.x !== baseX && candidate.y !== baseY) ? 56 : 0;
+    return (overlap * 100000000) + (dx + dy) + upperPenalty + leftPenalty + axisPenalty;
+  };
+  const origin = { x: baseX, y: baseY, width: BLOCK_NODE_WIDTH, height };
+  if (overlapSum(origin) <= 0) return { x: baseX, y: baseY };
+
+  // 1) Prefer nearby placement first (grid-step search around origin).
+  const nearOffsets = buildSearchOffsets(GRID_SIZE, 12);
+  let nearBest = null;
+  let nearBestScore = Number.POSITIVE_INFINITY;
+  let nearBestClean = null;
+  let nearBestCleanScore = Number.POSITIVE_INFINITY;
+  const betterTie = (a, b) => (a.y - b.y) || (a.x - b.x);
+  for (const off of nearOffsets) {
+    const candidate = {
+      x: snapGrid(baseX + off.x),
+      y: snapGrid(baseY + off.y),
+      width: BLOCK_NODE_WIDTH,
+      height
+    };
+    const score = candidateScore(candidate);
+    if (score < nearBestScore || (score === nearBestScore && nearBest && betterTie(candidate, nearBest) < 0)) {
+      nearBest = candidate;
+      nearBestScore = score;
+    }
+    if (overlapSum(candidate) <= 0) {
+      if (score < nearBestCleanScore || (score === nearBestCleanScore && nearBestClean && betterTie(candidate, nearBestClean) < 0)) {
+        nearBestClean = candidate;
+        nearBestCleanScore = score;
+      }
+    }
+  }
+  if (nearBestClean) return { x: nearBestClean.x, y: nearBestClean.y };
+
+  // Radial placement around origin: left/right/up/down + diagonal expansion.
+  const stepX = BLOCK_NODE_WIDTH + minGap + GRID_SIZE;
+  const stepY = height + minGap + GRID_SIZE;
+  let bestAny = null;
+  let bestAnyScore = Number.POSITIVE_INFINITY;
+  let bestClean = null;
+  let bestCleanScore = Number.POSITIVE_INFINITY;
+  const consider = (candidate) => {
+    const overlap = overlapSum(candidate);
+    const score = candidateScore(candidate);
+    if (score < bestAnyScore || (score === bestAnyScore && bestAny && betterTie(candidate, bestAny) < 0)) {
+      bestAny = candidate;
+      bestAnyScore = score;
+    }
+    if (overlap <= 0) {
+      if (score < bestCleanScore || (score === bestCleanScore && bestClean && betterTie(candidate, bestClean) < 0)) {
+        bestClean = candidate;
+        bestCleanScore = score;
+      }
+    }
+  };
+  for (let ring = 1; ring <= 120; ring += 1) {
+    const points = [
+      { x: baseX + (ring * stepX), y: baseY },
+      { x: baseX - (ring * stepX), y: baseY },
+      { x: baseX, y: baseY + (ring * stepY) },
+      { x: baseX, y: baseY - (ring * stepY) },
+      { x: baseX + (ring * stepX), y: baseY + (ring * stepY) },
+      { x: baseX - (ring * stepX), y: baseY + (ring * stepY) },
+      { x: baseX + (ring * stepX), y: baseY - (ring * stepY) },
+      { x: baseX - (ring * stepX), y: baseY - (ring * stepY) }
+    ];
+    for (const p of points) {
+      const candidate = {
+        x: snapGrid(p.x),
+        y: snapGrid(p.y),
+        width: BLOCK_NODE_WIDTH,
+        height
+      };
+      consider(candidate);
+    }
+  }
+  if (bestClean) return { x: bestClean.x, y: bestClean.y };
+  if (nearBest) return { x: nearBest.x, y: nearBest.y };
+  if (bestAny) return { x: bestAny.x, y: bestAny.y };
+  // Extremely dense fallback.
+  return { x: snapGrid(baseX + (stepX * 8)), y: snapGrid(baseY + stepY) };
+}
+
+function createNodeAvoidingOverlap(type, x, y, paramsOverride = null) {
+  const pos = findAvailableNodePosition(type, x, y, paramsOverride);
+  return createNode(type, pos.x, pos.y, paramsOverride);
+}
+
 function autoArrangeCreatedGroups(session) {
   const createdGroups = state.comments.filter((it) => session.createdLocalGroupIds.has(it.id));
   if (!createdGroups.length) return;
@@ -2638,20 +4330,6 @@ function autoArrangeCreatedContent(session) {
   autoArrangeCreatedGroups(session);
 }
 
-function pushRawSample(bucket, value, limit = 12) {
-  const text = String(value || '').trim();
-  if (!text) return;
-  bucket.push(text.length > 800 ? `${text.slice(0, 800)} ...(truncated)` : text);
-  if (bucket.length > limit) bucket.shift();
-}
-
-function readRemoteNodeId(value) {
-  if (value === null || value === undefined) return '';
-  const raw = String(value).trim();
-  if (!raw) return '';
-  return raw;
-}
-
 function portSchemaForNodeType(type) {
   if (type === 'EVENT_ON_ENABLE') {
     return {
@@ -2665,6 +4343,19 @@ function portSchemaForNodeType(type) {
   if (type === 'EVENT_ON_PLAYER_JOIN') {
     return {
       inputs: [{ portClass: 'in-data', accept: 'data' }],
+      outputs: [
+        { portClass: 'out-exec', linkKind: 'exec' },
+        { portClass: 'out-player', linkKind: 'player' },
+        { portClass: 'out-data-text', linkKind: 'data-text' }
+      ]
+    };
+  }
+  if (type === 'EVENT_ON_PLAYER_CHAT') {
+    return {
+      inputs: [
+        { portClass: 'in-data', accept: 'data' },
+        { portClass: 'in-cancel', accept: 'data-bool' }
+      ],
       outputs: [
         { portClass: 'out-exec', linkKind: 'exec' },
         { portClass: 'out-player', linkKind: 'player' },
@@ -2736,600 +4427,93 @@ function portSchemaForNodeType(type) {
   if (type === 'VAR_DECIMAL') {
     return { inputs: [], outputs: [{ portClass: 'out-data-decimal', linkKind: 'data-decimal' }] };
   }
+  if (type === 'VAR_BOOLEAN') {
+    return { inputs: [], outputs: [{ portClass: 'out-data-bool', linkKind: 'data-bool' }] };
+  }
   return { inputs: [], outputs: [] };
 }
 
-function buildExistingAutoCreateContext(maxNodes = 160, maxGroups = 80) {
-  const nodes = state.blocks.slice(0, maxNodes).map((node) => ({
+function inputPortOrderText(type) {
+  const schema = portSchemaForNodeType(type);
+  const inputs = Array.isArray(schema?.inputs) ? schema.inputs : [];
+  if (!inputs.length) return '없음';
+  return inputs
+    .map((port, index) => `${index + 1}:${String(port?.portClass || '')}`)
+    .join(' -> ');
+}
+
+function buildExistingAutoFixContext(targetNodeId, maxNodes = 48, maxLinks = 96) {
+  const target = state.blocks.find((node) => node.id === targetNodeId) || null;
+  const adjacency = new Map();
+  for (const link of state.links) {
+    const a = String(link.from || '');
+    const b = String(link.to || '');
+    if (!a || !b) continue;
+    if (!adjacency.has(a)) adjacency.set(a, new Set());
+    if (!adjacency.has(b)) adjacency.set(b, new Set());
+    adjacency.get(a).add(b);
+    adjacency.get(b).add(a);
+  }
+
+  const selectedNodeIds = new Set();
+  const queue = [{ id: String(targetNodeId || ''), depth: 0 }];
+  while (queue.length) {
+    const item = queue.shift();
+    if (!item?.id || selectedNodeIds.has(item.id)) continue;
+    selectedNodeIds.add(item.id);
+    if (item.depth >= 2) continue;
+    const neighbors = adjacency.get(item.id);
+    if (!neighbors) continue;
+    for (const nextId of neighbors) {
+      if (selectedNodeIds.has(nextId)) continue;
+      queue.push({ id: nextId, depth: item.depth + 1 });
+    }
+  }
+
+  const scored = state.blocks.map((node) => ({
+    node,
+    inNeighborhood: selectedNodeIds.has(node.id) ? 1 : 0,
+    dist: target ? nodeDistanceSq(node, target) : 0
+  }));
+  scored.sort((a, b) => {
+    if (a.inNeighborhood !== b.inNeighborhood) return b.inNeighborhood - a.inNeighborhood;
+    return a.dist - b.dist;
+  });
+
+  const selectedNodes = scored.slice(0, maxNodes).map((item) => item.node);
+  const selectedIds = new Set(selectedNodes.map((node) => node.id));
+  const nodes = selectedNodes.map((node) => ({
     id: node.id,
-    type: node.type,
+    t: node.type,
     x: Math.round(node.x),
     y: Math.round(node.y),
-    params: node.params || {},
-    ports: portSchemaForNodeType(node.type)
+    params: (() => {
+      const src = node.params && typeof node.params === 'object' ? node.params : {};
+      const entries = Object.entries(src).slice(0, 2);
+      const out = {};
+      for (const [k, v] of entries) out[k] = String(v ?? '').slice(0, 48);
+      return out;
+    })(),
+    in: portSchemaForNodeType(node.type).inputs.map((p) => p.portClass),
+    out: portSchemaForNodeType(node.type).outputs.map((p) => p.portClass)
   }));
-  const groups = state.comments.slice(0, maxGroups).map((group) => ({
-    id: group.id,
-    x: Math.round(group.x),
-    y: Math.round(group.y),
-    width: Math.round(group.width),
-    height: Math.round(group.height),
-    title: String(group.title || '')
-  }));
-  return { nodes, groups };
-}
-
-function resolveRemoteNodeRef(session, value) {
-  const raw = readRemoteNodeId(value);
-  if (!raw) return '';
-  return session.idMap.get(raw)
-    || (session.createdLocalNodeIds.has(raw) ? raw : (session.allowTouchExisting ? raw : ''));
-}
-
-function appendRawFailureLogs(session) {
-  if (!session) return;
-  if (Array.isArray(session.rawTextSamples) && session.rawTextSamples.length > 0) {
-    for (const sample of session.rawTextSamples) {
-      appendActionBarLog(sample);
-    }
-    return;
-  }
-  if (Array.isArray(session.rawPayloadSamples) && session.rawPayloadSamples.length > 0) {
-    for (const sample of session.rawPayloadSamples) {
-      appendActionBarLog(sample);
-    }
-  }
-}
-
-function applyAutoCreateStreamNode(session, spec) {
-  if (!spec || typeof spec !== 'object') return false;
-  const remoteId = readRemoteNodeId(spec.id);
-  if (session.allowTouchExisting && remoteId) {
-    const existing = state.blocks.find((it) => it.id === remoteId && !session.createdLocalNodeIds.has(it.id));
-    if (existing) {
-      if (Number.isFinite(spec.x)) existing.x = Math.round(spec.x);
-      if (Number.isFinite(spec.y)) existing.y = Math.round(spec.y);
-      if (spec.params && typeof spec.params === 'object') {
-        existing.params = existing.params || {};
-        for (const [key, value] of Object.entries(spec.params)) {
-          existing.params[key] = String(value ?? '');
-        }
-      }
-      session.idMap.set(remoteId, existing.id);
-      session.seenRemoteNodeIds.add(remoteId);
-      session.modifiedCount += 1;
-      return true;
-    }
-  }
-  if (remoteId && session.seenRemoteNodeIds.has(remoteId)) return false;
-  const type = typeof spec.type === 'string' ? spec.type : '';
-  const allowedTypes = new Set(
-    [...NODE_LIBRARY.events, ...NODE_LIBRARY.functions, ...NODE_LIBRARY.operations, ...NODE_LIBRARY.variables]
-      .map((it) => it.type)
-  );
-  if (!allowedTypes.has(type)) return false;
-
-  const index = session.fallbackNodeIndex++;
-  const colSize = 3;
-  const fallbackX = session.originX + ((index % colSize) * 260);
-  const fallbackY = session.originY + (Math.floor(index / colSize) * 170);
-  const node = {
-    id: `n${state.nextId++}`,
-    type,
-    x: Number.isFinite(spec.x) ? Math.round(session.originX + spec.x) : Math.round(fallbackX),
-    y: Number.isFinite(spec.y) ? Math.round(session.originY + spec.y) : Math.round(fallbackY),
-    params: {}
-  };
-  const functionDef = NODE_LIBRARY.functions.find((it) => it.type === type);
-  const variableDef = NODE_LIBRARY.variables.find((it) => it.type === type);
-  if (functionDef) node.params.message = functionDef.defaultMessage;
-  if (type === 'EVENT_ON_PLAYER_JOIN') node.params.message = '';
-  if (variableDef) node.params.value = variableDef.defaultValue;
-  if (spec.params && typeof spec.params === 'object') {
-    for (const [key, value] of Object.entries(spec.params)) {
-      node.params[key] = String(value ?? '');
-    }
-  }
-  state.blocks.push(node);
-  session.createdLocalNodeIds.add(node.id);
-  if (remoteId) {
-    session.idMap.set(remoteId, node.id);
-    session.seenRemoteNodeIds.add(remoteId);
-    session.localNodeToRemoteId.set(node.id, remoteId);
-  }
-  const groupId = readRemoteNodeId(spec.groupId);
-  if (groupId) session.nodeGroupIntentByLocalNodeId.set(node.id, groupId);
-  session.nodeCount += 1;
-  state.selectedId = node.id;
-  state.selectedCommentId = null;
-  return true;
-}
-
-function applyAutoCreateStreamGroup(session, spec) {
-  if (!spec || typeof spec !== 'object') return false;
-  const remoteId = typeof spec.id === 'string' ? spec.id.trim() : '';
-  if (session.allowTouchExisting && remoteId) {
-    const existing = state.comments.find((it) => it.id === remoteId && !session.createdLocalGroupIds.has(it.id));
-    if (existing) {
-      if (Number.isFinite(spec.x)) existing.x = Math.round(spec.x);
-      if (Number.isFinite(spec.y)) existing.y = Math.round(spec.y);
-      if (Number.isFinite(spec.width)) existing.width = Math.max(180, Math.round(spec.width));
-      if (Number.isFinite(spec.height)) existing.height = Math.max(120, Math.round(spec.height));
-      if (typeof spec.title === 'string' && spec.title.trim()) existing.title = spec.title.trim();
-      if (typeof spec.description === 'string' && spec.description.trim()) existing.description = spec.description.trim();
-      session.seenRemoteGroupIds.add(remoteId);
-      session.localGroupToRemoteId.set(existing.id, remoteId);
-      if (Array.isArray(spec.nodeIds)) {
-        const ids = spec.nodeIds
-          .map((it) => readRemoteNodeId(it))
-          .filter((it) => !!it);
-        if (ids.length) session.groupMemberRemoteNodeIds.set(remoteId, new Set(ids));
-      }
-      session.modifiedCount += 1;
-      return true;
-    }
-  }
-  if (remoteId && session.seenRemoteGroupIds.has(remoteId)) return false;
-  const index = session.fallbackGroupIndex++;
-  const fallbackX = session.originX + ((index % 2) * 420) - 120;
-  const fallbackY = session.originY + (Math.floor(index / 2) * 260) - 80;
-  const comment = {
-    id: `c${state.nextCommentId++}`,
-    x: Number.isFinite(spec.x) ? Math.round(session.originX + spec.x) : Math.round(fallbackX),
-    y: Number.isFinite(spec.y) ? Math.round(session.originY + spec.y) : Math.round(fallbackY),
-    width: Math.max(180, Number.isFinite(spec.width) ? Math.round(spec.width) : 520),
-    height: Math.max(120, Number.isFinite(spec.height) ? Math.round(spec.height) : 260),
-    title: typeof spec.title === 'string' && spec.title.trim() ? spec.title.trim() : '그룹 제목',
-    description: typeof spec.description === 'string' && spec.description.trim() ? spec.description.trim() : '설명'
-  };
-  state.comments.push(comment);
-  session.createdLocalGroupIds.add(comment.id);
-  if (remoteId) {
-    session.seenRemoteGroupIds.add(remoteId);
-    session.localGroupToRemoteId.set(comment.id, remoteId);
-    if (Array.isArray(spec.nodeIds)) {
-      const ids = spec.nodeIds
-        .map((it) => readRemoteNodeId(it))
-        .filter((it) => !!it);
-      if (ids.length) session.groupMemberRemoteNodeIds.set(remoteId, new Set(ids));
-    }
-  }
-  session.groupCount += 1;
-  return true;
-}
-
-function tryApplyAutoCreateStreamLink(session, spec) {
-  if (!spec || typeof spec !== 'object') return false;
-  session.linkSpecCount += 1;
-  const from = resolveRemoteNodeRef(session, spec.from);
-  const to = resolveRemoteNodeRef(session, spec.to);
-  if (typeof from !== 'string' || typeof to !== 'string' || from === to) return false;
-  const fromNode = state.blocks.find((it) => it.id === from);
-  const toNode = state.blocks.find((it) => it.id === to);
-  if (!fromNode || !toNode) return false;
-  const kind = typeof spec.linkKind === 'string' && spec.linkKind.trim()
-    ? spec.linkKind.trim()
-    : (typeof spec.kind === 'string' && spec.kind.trim() ? spec.kind.trim() : linkKindFromType(fromNode.type));
-  if (!canLinkFromSourceToTarget(from, kind, toNode.type)) return true;
-  const fromPortClass = typeof spec.fromPortClass === 'string' && spec.fromPortClass.trim()
-    ? spec.fromPortClass.trim()
-    : `out-${kind}`;
-  const toPortClass = typeof spec.toPortClass === 'string' && spec.toPortClass.trim()
-    ? spec.toPortClass.trim()
-    : targetPortClassForLink(kind, toNode.type, '');
-  if (hasDuplicateLink(from, to, kind, fromPortClass, toPortClass)) return true;
-  state.links.push({ from, to, kind, fromPortClass, toPortClass });
-  session.linkCount += 1;
-  return true;
-}
-
-function flushPendingAutoCreateStreamLinks(session) {
-  if (!session.pendingLinks.length) return;
-  const remain = [];
-  for (const spec of session.pendingLinks) {
-    if (!tryApplyAutoCreateStreamLink(session, spec)) {
-      remain.push(spec);
-    }
-  }
-  session.pendingLinks = remain;
-}
-
-function logPendingAutoCreateLinks(session) {
-  if (!session || !Array.isArray(session.pendingLinks) || session.pendingLinks.length === 0) return;
-  appendActionBarLog(`링크 적용 실패 ${session.pendingLinks.length}개`);
-  for (const spec of session.pendingLinks.slice(0, 12)) {
-    const from = readRemoteNodeId(spec?.from) || '?';
-    const to = readRemoteNodeId(spec?.to) || '?';
-    const kind = String(spec?.kind || '?');
-    appendActionBarLog(`미적용 링크: ${from} -> ${to} (${kind})`);
-  }
-}
-
-function logAutoCreateLinkSummary(session) {
-  if (!session) return;
-  appendActionBarLog(`링크 라인 ${session.linkSpecCount}개 / 적용 ${session.linkCount}개 / 수정 ${session.modifiedCount}개`);
-}
-
-function renderAutoCreateStreamProgress(session, force = false) {
-  const now = performance.now();
-  if (!force && (now - session.lastUiAt) < 90) return;
-  session.lastUiAt = now;
-  renderCanvas();
-  scheduleCollaborativePublish(true);
-  const progressMessage = `${session.phaseMessage}... 노드 ${session.nodeCount}개, 연결 ${session.linkCount}개, 그룹 ${session.groupCount}개, 수정 ${session.modifiedCount}개`;
-  showActionBar(progressMessage, '', 0, { log: false });
-}
-
-function applyAutoCreateStreamEntry(session, entry) {
-  if (!entry || typeof entry !== 'object') return false;
-  const kind = typeof entry.kind === 'string' ? entry.kind : '';
-  const looksLikeLink = typeof entry.from === 'string' && typeof entry.to === 'string'
-    && (typeof entry.fromPortClass === 'string' || typeof entry.toPortClass === 'string' || typeof entry.linkKind === 'string');
-  if (kind === 'thinking') {
-    const message = typeof entry.message === 'string' ? entry.message.trim() : '';
-    if (message) session.phaseMessage = `생각: ${message}`;
-    return true;
-  }
-  if (kind === 'status') {
-    const message = typeof entry.message === 'string' ? entry.message.trim() : '';
-    if (message) session.phaseMessage = message;
-    return true;
-  }
-  if (kind === 'node') return applyAutoCreateStreamNode(session, entry);
-  if (kind === 'group') return applyAutoCreateStreamGroup(session, entry);
-  if (kind === 'link' || looksLikeLink) {
-    if (tryApplyAutoCreateStreamLink(session, entry)) return true;
-    session.pendingLinks.push(entry);
-    return false;
-  }
-  if (Array.isArray(entry.nodes)) {
-    let changed = false;
-    for (const node of entry.nodes) changed = applyAutoCreateStreamNode(session, node) || changed;
-    if (Array.isArray(entry.links)) {
-      for (const link of entry.links) {
-        if (!tryApplyAutoCreateStreamLink(session, link)) session.pendingLinks.push(link);
-      }
-    }
-    if (Array.isArray(entry.groups)) {
-      for (const group of entry.groups) changed = applyAutoCreateStreamGroup(session, group) || changed;
-    }
-    return changed;
-  }
-  return false;
-}
-
-function responseTextPartsFromGemini(data) {
-  const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
-  const parts = [];
-  for (const candidate of candidates) {
-    const contentParts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
-    for (const part of contentParts) {
-      if (typeof part?.text === 'string' && part.text) parts.push(part.text);
-    }
-  }
-  return parts;
-}
-
-function splitConcatenatedJsonObjects(text) {
-  const source = String(text || '').trim();
-  if (!source) return [];
-  const chunks = [];
-  let start = -1;
-  let depth = 0;
-  let inString = false;
-  let escaping = false;
-  for (let i = 0; i < source.length; i += 1) {
-    const ch = source[i];
-    if (inString) {
-      if (escaping) {
-        escaping = false;
-      } else if (ch === '\\') {
-        escaping = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === '{') {
-      if (depth === 0) start = i;
-      depth += 1;
-      continue;
-    }
-    if (ch === '}') {
-      if (depth > 0) depth -= 1;
-      if (depth === 0 && start >= 0) {
-        chunks.push(source.slice(start, i + 1));
-        start = -1;
-      }
-    }
-  }
-  return chunks.length ? chunks : [source];
-}
-
-function processGeminiSseDataBlock(dataBlockText, session, onEntry) {
-  const lines = String(dataBlockText || '')
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-  for (const line of lines) {
-    if (line === '[DONE]') continue;
-    const payloadChunks = splitConcatenatedJsonObjects(line);
-    for (const chunk of payloadChunks) {
-      pushRawSample(session.rawPayloadSamples, chunk);
-      let payload;
-      try {
-        payload = JSON.parse(chunk);
-      } catch {
-        continue;
-      }
-      const textParts = responseTextPartsFromGemini(payload);
-      for (const part of textParts) {
-        pushRawSample(session.rawTextSamples, part);
-        ingestAutoCreateNdjsonChunk(session, part, onEntry);
-      }
-    }
-  }
-}
-
-function ingestAutoCreateNdjsonChunk(session, textChunk, onEntry) {
-  if (!textChunk) return;
-  session.textSeen = true;
-  session.lineBuffer += String(textChunk).replace(/\r/g, '');
-  let nl = session.lineBuffer.indexOf('\n');
-  while (nl >= 0) {
-    const rawLine = session.lineBuffer.slice(0, nl).trim();
-    session.lineBuffer = session.lineBuffer.slice(nl + 1);
-    if (rawLine && rawLine !== '```' && rawLine !== '```json' && !session.seenLines.has(rawLine)) {
-      session.seenLines.add(rawLine);
-      appendActionBarLog(rawLine);
-      try {
-        const parsed = JSON.parse(rawLine);
-        session.parsedEntryCount += 1;
-        onEntry(parsed);
-      } catch {
-        session.ndjsonViolation = true;
-      }
-    }
-    nl = session.lineBuffer.indexOf('\n');
-  }
-}
-
-function finalizeAutoCreateNdjson(session, onEntry) {
-  const tail = session.lineBuffer.trim();
-  session.lineBuffer = '';
-  if (!tail || tail === '```' || tail === '```json') return;
-  if (session.seenLines.has(tail)) return;
-  session.seenLines.add(tail);
-  appendActionBarLog(tail);
-  try {
-    session.parsedEntryCount += 1;
-    onEntry(JSON.parse(tail));
-  } catch {
-    // Streaming tail can be truncated; treat as incomplete, not malformed NDJSON.
-    session.incompleteTail = true;
-  }
-}
-
-async function requestAutoGeneratedBlueprintStream(promptText, allowTouchExisting, session, retryMode = false) {
-  const key = autoCreateState.apiKey;
-  if (!key || !autoCreateState.authenticated) {
-    throw new Error('먼저 Gemini API Key 로그인 후 다시 시도하세요.');
-  }
-  const systemPrompt = [
-    '너는 블록 에디터 자동 생성기다.',
-    '반드시 NDJSON 형식으로만 출력한다. 한 줄에 JSON 객체 하나만 출력하고, 코드펜스/설명문을 절대 쓰지 않는다.',
-    '지원 라인 형식:',
-    '{"kind":"thinking","message":"요청을 해석하고 필요한 노드 구성을 판단하는 중입니다"}',
-    '{"kind":"status","message":"노드 배치를 계획하는 중입니다"}',
-    '{"kind":"node","id":"a","type":"EVENT_ON_ENABLE","x":0,"y":0,"groupId":"g1","params":{}}',
-    '{"kind":"link","from":"a","to":"b","linkKind":"exec","fromPortClass":"out-exec","toPortClass":"in-exec"}',
-    '{"kind":"group","id":"g1","x":-80,"y":-60,"width":560,"height":280,"title":"초기화 흐름","description":"플러그인 시작 시 메시지 전송","nodeIds":["a","b"]}',
-    '{"kind":"done"}',
-    '허용 타입: EVENT_ON_ENABLE, EVENT_ON_PLAYER_JOIN, FUNCTION_SEND_MESSAGE, FUNCTION_BROADCAST_MESSAGE, MATH_ADD, MATH_SUB, MATH_MUL, MATH_DIV, VAR_TEXT, VAR_INTEGER, VAR_DECIMAL',
-    '링크 타입은 linkKind 필드에 넣고, 값은 exec, player, data-text, data-int, data-decimal, data-any, data-number 중 하나를 사용한다.',
-    '포트명은 반드시 표준 포트명만 사용한다. 별칭/축약/오타는 금지한다.',
-    '표준 fromPortClass: out-exec, out-player, out-data-text, out-data-int, out-data-decimal, out-data-any, out-data-number',
-    '표준 toPortClass: in-exec, in-player, in-data, in-data-a, in-data-b',
-    'FUNCTION_SEND_MESSAGE/FUNCTION_BROADCAST_MESSAGE의 메시지 입력은 in-data 계열로 연결한다.',
-    '링크를 출력하기 전에 self-check: fromPortClass/toPortClass가 표준 목록에 없으면 해당 링크를 출력하지 않는다.',
-    '타입/포트 규칙에 맞지 않는 연결은 만들지 않는다.',
-    '그룹 소속을 명확히 표현한다: node에는 groupId를 넣고, group에는 nodeIds 배열을 넣는다.',
-    'nodes/links/groups는 생성 순서대로 출력하고, 연결에 필요한 노드는 먼저 출력한다.',
-    '출력 시작 직후 thinking 라인을 먼저 출력하고, 이어서 status 라인으로 진행 단계를 중간중간 알린다.',
-    'groups 생성 여부는 AI가 판단한다.',
-    '노드가 적고 단순한 흐름이면 group 없이 구성하고, 노드가 많거나 의미 단위가 분명하면 group을 사용해 가독성을 높인다.',
-    '변수 규칙: 문자열/정수/실수 값이 필요하면 반드시 VAR_TEXT/VAR_INTEGER/VAR_DECIMAL 노드를 만들고 링크로 전달한다.',
-    '함수 입력에 값을 직접 박아 넣지 말고, 변수 노드로 분리해서 연결한다.',
-    '기존 노드와 연결/수정 시 기존 컨텍스트의 ports 정보를 반드시 따른다.',
-    '기존 노드를 수정할 때는 node/group 라인의 id에 기존 id를 그대로 사용한다. 이 경우 새로 생성하지 않고 기존 항목을 수정한다.',
-    retryMode
-      ? '직전 응답이 형식 오류였다. 이번 응답은 반드시 NDJSON 라인만 출력하고, 한 줄도 예외를 두지 않는다.'
-      : '형식 오류 없이 NDJSON 규칙을 엄격히 지킨다.',
-    allowTouchExisting
-      ? '기존 노드와 신규 노드 중 어떤 방식이 더 적절한지 AI가 판단한다. 필요한 경우 기존 노드를 수정/재연결하고, 필요하면 새 노드를 추가한다.'
-      : '기본 정책: 현재 작업 내용은 보존하고, 기존 노드는 가능한 한 건드리지 않는다. 새 노드/새 그룹을 중심으로 추가 구성한다.'
-  ].join('\n');
-
-  const existingContext = allowTouchExisting ? buildExistingAutoCreateContext() : null;
-  const userPrompt = [
-    `설명: ${promptText}`,
-    allowTouchExisting && existingContext
-      ? `기존 항목 컨텍스트(JSON): ${JSON.stringify(existingContext)}`
-      : '',
-    '좌표는 대략적으로 배치해도 된다.',
-    'group 생성 여부는 요청 의도와 복잡도를 보고 스스로 판단한다.',
-    '응답은 반드시 NDJSON 라인만 출력한다.',
-    '생성 중간에는 status 라인을 수시로 출력해 현재 단계를 알려준다.',
-    '마지막 done 전에 링크 포트명을 다시 검증하고, 표준 포트명이 아닌 링크는 제거한다.',
-    retryMode ? '다시 말하지만 NDJSON 한 줄 JSON 규칙을 절대 어기지 마라.' : ''
-  ].join('\n');
-
-  const abortController = new AbortController();
-  let timeoutReason = '';
-  let idleTimer = null;
-  const totalTimer = setTimeout(() => {
-    timeoutReason = 'AUTO_CREATE_TIMEOUT_TOTAL';
-    abortController.abort();
-  }, AUTO_CREATE_STREAM_TOTAL_TIMEOUT_MS);
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      timeoutReason = 'AUTO_CREATE_TIMEOUT_IDLE';
-      abortController.abort();
-    }, AUTO_CREATE_STREAM_IDLE_TIMEOUT_MS);
-  };
-  resetIdleTimer();
-
-  let response;
-  try {
-    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_GENERATE_MODEL)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: systemPrompt }]
-        },
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: userPrompt }]
-          }
-        ],
-        generationConfig: {
-          temperature: 0.2,
-          responseMimeType: 'text/plain'
-        }
-      }),
-      signal: abortController.signal
+  const links = [];
+  for (const link of state.links) {
+    if (links.length >= maxLinks) break;
+    if (!selectedIds.has(link.from) || !selectedIds.has(link.to)) continue;
+    links.push({
+      f: link.from,
+      t: link.to,
+      k: String(link.kind || ''),
+      fp: String(link.fromPortClass || ''),
+      tp: String(link.toPortClass || '')
     });
-  } catch (error) {
-    if (idleTimer) clearTimeout(idleTimer);
-    clearTimeout(totalTimer);
-    if (error?.name === 'AbortError') {
-      const timeoutError = new Error(timeoutReason || '스트림 응답 대기 시간 초과');
-      timeoutError.code = timeoutReason || 'AUTO_CREATE_TIMEOUT';
-      throw timeoutError;
-    }
-    throw error;
   }
-  if (!response.ok) {
-    if (idleTimer) clearTimeout(idleTimer);
-    clearTimeout(totalTimer);
-    throw new Error(`생성 실패 (${response.status})`);
-  }
-  if (!response.body) {
-    if (idleTimer) clearTimeout(idleTimer);
-    clearTimeout(totalTimer);
-    throw new Error('스트리밍을 지원하지 않는 응답입니다.');
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let sseBuffer = '';
-  const onEntry = (entry) => {
-    if (!entry || (entry.kind === 'done')) return;
-    const changed = applyAutoCreateStreamEntry(session, entry);
-    flushPendingAutoCreateStreamLinks(session);
-    if (changed) renderAutoCreateStreamProgress(session);
+  return {
+    targetNodeId: String(targetNodeId || ''),
+    nodes,
+    links
   };
-  try {
-    while (true) {
-      let readResult;
-      try {
-        readResult = await reader.read();
-      } catch (error) {
-        if (error?.name === 'AbortError') {
-          const timeoutError = new Error(timeoutReason || '스트림 응답 대기 시간 초과');
-          timeoutError.code = timeoutReason || 'AUTO_CREATE_TIMEOUT';
-          throw timeoutError;
-        }
-        throw error;
-      }
-      const { done, value } = readResult;
-      if (done) break;
-      resetIdleTimer();
-      sseBuffer += decoder.decode(value, { stream: true });
-      let sep = sseBuffer.indexOf('\n\n');
-      while (sep >= 0) {
-        const block = sseBuffer.slice(0, sep);
-        sseBuffer = sseBuffer.slice(sep + 2);
-        const lines = block.split('\n');
-        let dataLines = '';
-        for (const line of lines) {
-          if (line.startsWith('data:')) {
-            dataLines += `${line.slice(5).trimStart()}\n`;
-          }
-        }
-        const payloadText = dataLines.trim();
-        if (payloadText && payloadText !== '[DONE]') {
-          processGeminiSseDataBlock(payloadText, session, onEntry);
-        }
-        sep = sseBuffer.indexOf('\n\n');
-      }
-    }
-    const remainText = decoder.decode();
-    if (remainText) sseBuffer += remainText;
-    if (sseBuffer) {
-      const lines = sseBuffer.split('\n');
-      let dataLines = '';
-      for (const line of lines) {
-        if (line.startsWith('data:')) {
-          dataLines += `${line.slice(5).trimStart()}\n`;
-        }
-      }
-      const payloadText = dataLines.trim();
-      if (payloadText && payloadText !== '[DONE]') {
-        processGeminiSseDataBlock(payloadText, session, onEntry);
-      }
-    }
-    finalizeAutoCreateNdjson(session, onEntry);
-    flushPendingAutoCreateStreamLinks(session);
-    autoArrangeCreatedContent(session);
-    logAutoCreateLinkSummary(session);
-    logPendingAutoCreateLinks(session);
-    renderAutoCreateStreamProgress(session, true);
-    if (session.parsedEntryCount === 0) {
-      appendRawFailureLogs(session);
-      const emptyError = new Error('AI 출력 0건');
-      emptyError.code = 'NDJSON_EMPTY';
-      throw emptyError;
-    }
-    if (session.ndjsonViolation || (session.textSeen && session.parsedEntryCount === 0)) {
-      appendRawFailureLogs(session);
-      const formatError = new Error(session.ndjsonViolation ? 'NDJSON 형식 오류' : 'NDJSON 응답이 잘려 유효 라인을 만들지 못함');
-      formatError.code = session.ndjsonViolation ? 'NDJSON_INVALID' : 'NDJSON_INCOMPLETE';
-      throw formatError;
-    }
-    return {
-      nodeCount: session.nodeCount,
-      linkCount: session.linkCount,
-      groupCount: session.groupCount,
-      modifiedCount: session.modifiedCount
-    };
-  } finally {
-    if (idleTimer) clearTimeout(idleTimer);
-    clearTimeout(totalTimer);
-  }
-}
-
-function buildSolutionContextSnapshot(maxNodes = 120) {
-  const nodes = state.blocks.slice(0, maxNodes).map((node) => ({
-    id: node.id,
-    type: node.type,
-    params: node.params || {}
-  }));
-  const links = state.links.slice(0, 240).map((link) => ({
-    from: link.from,
-    to: link.to,
-    kind: link.kind || 'exec'
-  }));
-  return { nodeCount: state.blocks.length, linkCount: state.links.length, nodes, links };
 }
 
 function normalizeSolutionLines(text) {
@@ -3341,37 +4525,137 @@ function normalizeSolutionLines(text) {
     .slice(0, 8);
 }
 
-async function requestAiSolutions(promptText) {
-  const key = autoCreateState.apiKey;
-  if (!key || !autoCreateState.authenticated) {
-    throw new Error('먼저 Gemini API Key 로그인 후 다시 시도하세요.');
-  }
-  const context = buildSolutionContextSnapshot();
-  const systemPrompt = [
-    '너는 블록 에디터 해결책 제시 도우미다.',
-    '절대 블록을 생성/수정하지 말고, 사용자에게 실행 가능한 해결 단계만 제시한다.',
-    '응답은 한국어 불릿 리스트 최대 6개로 짧고 명확하게 작성한다.',
-    '가능하면 EVENT_ON_*, FUNCTION_*, MATH_*, VAR_* 타입명을 포함한다.'
-  ].join('\n');
-  const userPrompt = [
-    `요청: ${promptText}`,
-    `현재 블록 상태(JSON): ${JSON.stringify(context)}`
-  ].join('\n');
+function fallbackGenerationSpec(promptText) {
+  const text = String(promptText || '');
+  const lower = text.toLowerCase();
+  const wantsChat = /채팅|chat/.test(text);
+  const wantsJoin = /접속|join/.test(text);
+  const wantsBroadcast = /브로드캐스트|broadcast|전체/.test(text);
+  const wantsMath = /계산|수학|더하|빼|곱|나누|\+|-|×|÷|\//.test(text);
+  const cancelTrue = /취소.*(참|true|yes)|막아|차단/.test(lower);
+  const cancelFalse = /취소.*(거짓|false|no)|허용/.test(lower);
+  return {
+    intent: wantsChat ? 'chat' : (wantsJoin ? 'join' : 'enable'),
+    useBroadcast: wantsBroadcast || !wantsChat,
+    useEventMessage: wantsChat,
+    useMath: wantsMath,
+    cancel: cancelTrue ? true : (cancelFalse ? false : null),
+    message: text.trim().slice(0, 80) || 'Hello from AI'
+  };
+}
 
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_SOLUTION_MODEL)}:generateContent?key=${encodeURIComponent(key)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-      generationConfig: { temperature: 0.3 }
-    })
-  });
-  if (!response.ok) throw new Error(`해결책 생성 실패 (${response.status})`);
-  const payload = await response.json();
-  const lines = normalizeSolutionLines(responseTextFromGemini(payload));
-  if (!lines.length) throw new Error('유효한 해결책 응답이 없습니다.');
-  return lines;
+async function inferLocalGenerationSpec(promptText) {
+  const fallback = fallbackGenerationSpec(promptText);
+  try {
+    const renderedAabb = buildRenderedAabbSnapshot(40).map((it) => ({
+      id: it.id,
+      t: it.type,
+      x: it.x,
+      y: it.y,
+      w: it.width,
+      h: it.height
+    }));
+    const prompt = [
+      'You are a block-editor generation planner.',
+      'Return JSON only.',
+      'intent: one of chat, join, enable.',
+      'useBroadcast/useEventMessage/useMath: boolean.',
+      'cancel: true, false, or null.',
+      'message: short string.',
+      'Format:',
+      '{"intent":"chat","useBroadcast":false,"useEventMessage":true,"useMath":false,"cancel":null,"message":"..."}',
+      `Rendered node AABB (JSON): ${JSON.stringify(renderedAabb)}`,
+      `Request: ${promptText}`
+    ].join('\n');
+    const generated = await generateWithLocalModel(prompt, 120);
+    const parsed = extractJsonObjectFromText(generated) || {};
+    const intent = ['chat', 'join', 'enable'].includes(String(parsed.intent || '')) ? parsed.intent : fallback.intent;
+    const useBroadcast = typeof parsed.useBroadcast === 'boolean' ? parsed.useBroadcast : fallback.useBroadcast;
+    const useEventMessage = typeof parsed.useEventMessage === 'boolean' ? parsed.useEventMessage : fallback.useEventMessage;
+    const useMath = typeof parsed.useMath === 'boolean' ? parsed.useMath : fallback.useMath;
+    const cancel = (parsed.cancel === true || parsed.cancel === false || parsed.cancel === null) ? parsed.cancel : fallback.cancel;
+    const message = String(parsed.message || fallback.message || 'Hello from AI').slice(0, 120);
+    const spec = { intent, useBroadcast, useEventMessage, useMath, cancel, message };
+    return spec;
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function resolveAutoCreateOriginWorld() {
+  if (autoCreateState.targetOriginWorld && Number.isFinite(autoCreateState.targetOriginWorld.x) && Number.isFinite(autoCreateState.targetOriginWorld.y)) {
+    return { x: autoCreateState.targetOriginWorld.x, y: autoCreateState.targetOriginWorld.y };
+  }
+  const centerX = ((el.workspace?.clientWidth || 0) * 0.45 - state.panX) / Math.max(0.0001, state.scale);
+  const centerY = ((el.workspace?.clientHeight || 0) * 0.4 - state.panY) / Math.max(0.0001, state.scale);
+  return { x: centerX, y: centerY };
+}
+
+function applyLocalGeneratedFlow(spec) {
+  const origin = resolveAutoCreateOriginWorld();
+  const ox = snapGrid(origin.x);
+  const oy = snapGrid(origin.y);
+  const createdNodes = [];
+  const beforeNodeCount = state.blocks.length;
+  const beforeLinkCount = state.links.length;
+
+  const eventType = spec.intent === 'chat'
+    ? 'EVENT_ON_PLAYER_CHAT'
+    : (spec.intent === 'join' ? 'EVENT_ON_PLAYER_JOIN' : 'EVENT_ON_ENABLE');
+  const functionType = (spec.useBroadcast || eventType === 'EVENT_ON_ENABLE')
+    ? 'FUNCTION_BROADCAST_MESSAGE'
+    : 'FUNCTION_SEND_MESSAGE';
+  const eventNode = createNodeAvoidingOverlap(eventType, ox, oy);
+  if (!eventNode) return { nodeCount: 0, linkCount: 0 };
+  createdNodes.push(eventNode);
+
+  const fnNode = createNodeAvoidingOverlap(functionType, ox + 360, oy);
+  if (!fnNode) return { nodeCount: 0, linkCount: 0 };
+  createdNodes.push(fnNode);
+  addLink(eventNode.id, fnNode.id, 'exec', 'out-exec', 'in-exec');
+
+  if (functionType === 'FUNCTION_SEND_MESSAGE') {
+    addLink(eventNode.id, fnNode.id, 'player', 'out-player', 'in-player');
+  }
+
+  if (spec.useMath) {
+    const a = createNodeAvoidingOverlap('VAR_INTEGER', ox + 60, oy + 126, { value: '1' });
+    const b = createNodeAvoidingOverlap('VAR_INTEGER', ox + 60, oy + 198, { value: '2' });
+    const op = createNodeAvoidingOverlap('MATH_ADD', ox + 210, oy + 162);
+    if (a && b && op) {
+      createdNodes.push(a, b, op);
+      addLink(a.id, op.id, 'data-int', 'out-data-int', 'in-data-a');
+      addLink(b.id, op.id, 'data-int', 'out-data-int', 'in-data-b');
+      addLink(op.id, fnNode.id, 'data-any', 'out-data-any', 'in-data');
+    }
+  } else {
+    // Prefer explicit text variable over direct message->message wiring for readability.
+    const msgValue = String(spec.message || 'Hello from AI');
+    const msg = createNodeAvoidingOverlap('VAR_TEXT', ox + 60, oy + 144, { value: msgValue });
+    if (msg) {
+      createdNodes.push(msg);
+      addLink(msg.id, fnNode.id, 'data-text', 'out-data-text', 'in-data');
+    }
+  }
+
+  if (eventType === 'EVENT_ON_PLAYER_CHAT' && (spec.cancel === true || spec.cancel === false)) {
+    const cancelNode = createNodeAvoidingOverlap('VAR_BOOLEAN', ox + 48, oy - 96, { value: spec.cancel ? 'true' : 'false' });
+    if (cancelNode) {
+      createdNodes.push(cancelNode);
+      addLink(cancelNode.id, eventNode.id, 'data-bool', 'out-data-bool', 'in-cancel');
+    }
+  }
+
+  const nodeCount = Math.max(0, state.blocks.length - beforeNodeCount);
+  const linkCount = Math.max(0, state.links.length - beforeLinkCount);
+  if (createdNodes.length > 0) {
+    // Ensure generated changes are snapshotted/persisted/realtime-published as one final state.
+    commitHistoryState();
+    scheduleWorkspacePersist(true);
+    scheduleCollaborativePublish(true);
+    schedulePresencePublish(true);
+  }
+  return { nodeCount, linkCount };
 }
 
 async function runAutoCreateFromDialog() {
@@ -3380,33 +4664,38 @@ async function runAutoCreateFromDialog() {
     setAutoCreateAuthStatus('설명을 입력하세요.', 'error');
     return;
   }
-  if (!autoCreateState.authenticated) {
-    setAutoCreateAuthStatus('먼저 로그인하세요.', 'error');
-    return;
-  }
 
   autoCreateState.generateInFlight = true;
   refreshAutoCreateGenerateEnabled();
   actionBarState.logs = [];
   renderActionBarLogs();
-  showActionBar('AI 해결책을 생성 중입니다...', '', 0);
+  if (!aiModelState.prefetchDone) {
+    await ensureAiModelAssets({ silent: false });
+  }
+  showActionBar('AI 생성/수정을 준비 중입니다...', '', 0);
   try {
-    const solutions = await requestAiSolutions(promptText);
-    actionBarState.logs = solutions.map((line) => ({ message: `- ${line}`, kind: '' }));
+    const spec = await inferLocalGenerationSpec(promptText);
+    const created = applyLocalGeneratedFlow(spec);
+    if (!created.nodeCount && !created.linkCount) {
+      throw new Error('생성 결과가 비어 있습니다.');
+    }
+    const localSummary = `노드 ${created.nodeCount}개, 연결 ${created.linkCount}개 생성`;
+    actionBarState.logs = [{ message: `- ${localSummary}`, kind: '' }];
     renderActionBarLogs();
     setActionBarExpanded(true);
-    setAutoCreateAuthStatus('해결책 생성 완료', 'ok');
-    showActionBar(`해결책 ${solutions.length}개 제시`, 'ok', 2500);
+    setAutoCreateAuthStatus('로컬 생성 완료', 'ok');
+    showActionBar(`AI 생성 적용 완료: ${localSummary}`, 'ok', 2600);
     setResult({
       ok: true,
-      kind: 'solution_suggestions',
+      kind: 'local_generation',
       prompt: promptText,
-      suggestions: solutions
+      created
     });
     closeAutoCreateDialog(false);
   } catch (error) {
-    setAutoCreateAuthStatus(`해결책 생성 실패: ${error?.message || 'unknown error'}`, 'error');
-    showActionBar(`해결책 생성 실패: ${error?.message || 'unknown error'}`, 'error', 3800);
+    const message = error?.message || 'unknown error';
+    setAutoCreateAuthStatus(`AI 생성 실패: ${message}`, 'error');
+    showActionBar(`AI 생성 실패: ${message}`, 'error', 3800);
   } finally {
     autoCreateState.generateInFlight = false;
     refreshAutoCreateGenerateEnabled();
@@ -3696,7 +4985,7 @@ function applyCollaborativeStateFromRemote(payload) {
         let restoredSnapTargetPort = localConnectionDraft.snapTargetPort || null;
         if (restoredSnapTargetId) {
           const targetNode = state.blocks.find((it) => it.id === restoredSnapTargetId);
-          if (!targetNode || !canLinkKindToType(restoredKind, targetNode.type)) {
+          if (!targetNode || !canLinkKindToPort(restoredKind, targetNode.type, restoredSnapTargetPort || '', localConnectionDraft.from)) {
             restoredSnapTargetId = null;
             restoredSnapTargetPort = null;
           }
@@ -3730,6 +5019,7 @@ function applyCollaborativeStateFromRemote(payload) {
     state.panning = localPanning;
     renderWorkspaceTree();
     renderCanvas();
+    scheduleGraphDecision(true);
     saveWorkspaceState();
     historyState.lastSerialized = JSON.stringify(captureEditorState());
   } finally {
@@ -3774,6 +5064,7 @@ async function publishCollaborativeStateNow() {
 
 function scheduleCollaborativePublish(immediate = false) {
   scheduleWorkspacePersist(immediate);
+  scheduleGraphDecision(immediate);
   if (realtimeState.suspended) return;
   if (immediate) {
     if (realtimeState.publishTimer) {
@@ -3981,6 +5272,7 @@ function applyWorkspaceSnapshot(workspaceId) {
     state.scale = 1;
     state.connectionDraft = null;
     renderCanvas();
+    scheduleGraphDecision(true);
     return;
   }
   state.comments = Array.isArray(snapshot.comments) ? cloneJson(snapshot.comments) : [];
@@ -4003,6 +5295,7 @@ function applyWorkspaceSnapshot(workspaceId) {
   state.scale = Number.isFinite(snapshot.scale) ? snapshot.scale : 1;
   state.connectionDraft = null;
   renderCanvas();
+  scheduleGraphDecision(true);
 }
 
 function selectWorkspace(workspaceId) {
@@ -4596,29 +5889,9 @@ function installEvents() {
     await loadSelectedPlugin().catch((error) => setResult(String(error)));
   });
 
-  el.autoCreateApiKeyInput.addEventListener('input', () => {
-    autoCreateState.apiKey = el.autoCreateApiKeyInput.value.trim();
-    autoCreateState.autoLoginTried = false;
-    autoCreateState.lastVerifiedKey = '';
-    if (!autoCreateState.apiKey) {
-      writeStoredGeminiApiKey('');
-      autoCreateState.authenticated = false;
-      setAutoCreateAuthStatus('로그인 필요');
-    } else {
-      writeStoredGeminiApiKey(autoCreateState.apiKey);
-    }
-    refreshAutoCreateGenerateEnabled();
-  });
   el.autoCreatePromptInput.addEventListener('input', () => {
     resizeAutoCreatePromptInput();
     refreshAutoCreateGenerateEnabled();
-  });
-  el.autoCreateLoginBtn.addEventListener('click', () => {
-    verifyAutoCreateLogin().catch((error) => {
-      autoCreateState.authenticated = false;
-      setAutoCreateAuthStatus(`로그인 실패: ${error?.message || 'unknown error'}`, 'error');
-      refreshAutoCreateGenerateEnabled();
-    });
   });
   el.autoCreateGenerateBtn.addEventListener('click', () => {
     runAutoCreateFromDialog().catch((error) => {
@@ -4862,6 +6135,26 @@ function installEvents() {
       closeAutoCreateDialog();
       renderCanvas();
       schedulePresencePublish(true);
+      return;
+    }
+
+    if (!typing && !selectingText) {
+      const isArrowPan =
+        event.key === 'ArrowLeft'
+        || event.key === 'ArrowRight'
+        || event.key === 'ArrowUp'
+        || event.key === 'ArrowDown';
+      if (isArrowPan) {
+        event.preventDefault();
+        const panStep = GRID_SIZE;
+        if (event.key === 'ArrowLeft') state.panX += panStep;
+        if (event.key === 'ArrowRight') state.panX -= panStep;
+        if (event.key === 'ArrowUp') state.panY += panStep;
+        if (event.key === 'ArrowDown') state.panY -= panStep;
+        renderCanvas();
+        schedulePresencePublish(true);
+        return;
+      }
     }
   });
 
@@ -5182,14 +6475,31 @@ function installEvents() {
     if (!el.contextMenu.contains(event.target) && event.target !== el.workspace && event.target !== el.canvas) return;
     if (event.target === el.workspace || event.target === el.canvas) hideContextMenu();
   });
+  document.addEventListener('mouseover', (event) => {
+    const target = event.target instanceof Element ? event.target.closest('[data-tooltip]') : null;
+    if (!(target instanceof HTMLElement)) return;
+    const message = target.dataset.tooltip || '';
+    if (!message.trim()) return;
+    const detail = (target.dataset.tooltipReason || '').trim() || describePortIssue(target);
+    showHoverTooltip(message, event.clientX, event.clientY, target, detail);
+  });
+  document.addEventListener('mousemove', (event) => {
+    const target = event.target instanceof Element ? event.target.closest('[data-tooltip]') : null;
+    if (!(target instanceof HTMLElement)) {
+      hideHoverTooltip();
+      return;
+    }
+    const message = target.dataset.tooltip || '';
+    if (!message.trim()) {
+      hideHoverTooltip();
+      return;
+    }
+    const detail = (target.dataset.tooltipReason || '').trim() || describePortIssue(target);
+    showHoverTooltip(message, event.clientX, event.clientY, target, detail);
+  });
+  document.addEventListener('mousedown', () => hideHoverTooltip());
+  window.addEventListener('blur', () => hideHoverTooltip());
   ensureActionBarStructure();
-  const actionBarHead = el.actionBar?.querySelector('.action-bar-head');
-  if (actionBarHead instanceof HTMLElement) {
-    actionBarHead.addEventListener('click', (event) => {
-      event.preventDefault();
-      setActionBarExpanded(!actionBarState.expanded);
-    });
-  }
   window.addEventListener('resize', () => {
     scheduleRelayoutRender();
     if (!el.autoCreateDialog.classList.contains('hidden')) {
@@ -5213,10 +6523,7 @@ function installEvents() {
 
 async function init() {
   ensureActionBarStructure();
-  autoCreateState.apiKey = readStoredGeminiApiKey();
-  if (autoCreateState.apiKey) {
-    tryAutoLoginWithStoredGeminiKey().catch(() => {});
-  }
+  migrateNativeTitleAttributes(document);
   loadWorkspaceState();
   await loadServerDraft();
   applyWorkspaceSnapshot(state.currentWorkspaceId || state.selectedWorkspaceId);
@@ -5225,6 +6532,12 @@ async function init() {
   saveWorkspaceState();
   commitHistoryState(false);
   installEvents();
+  // Keep UI responsive: warm up AI in the background instead of blocking init.
+  setTimeout(() => {
+    ensureAiModelAssets({ silent: false })
+      .then(() => ensureLocalAiRuntime({ silent: false }))
+      .catch(() => {});
+  }, 0);
   connectCollaborativeRealtime();
   if (document.fonts?.ready) {
     document.fonts.ready.then(() => scheduleRelayoutRender()).catch(() => {});

@@ -38,6 +38,7 @@ import org.macaroon3145.api.event.MoveMedium
 import org.macaroon3145.api.event.MoveReason
 import org.macaroon3145.api.event.PlayerInteractAction
 import org.macaroon3145.api.event.PlayerInteractEvent
+import org.macaroon3145.api.event.PlayerChatEvent
 import org.macaroon3145.api.event.PlayerJumpEvent
 import org.macaroon3145.api.event.PlayerMoveEvent
 import org.macaroon3145.api.event.PluginStateChangeEvent
@@ -182,6 +183,11 @@ object PluginSystem {
         val cancelAll: Boolean
             get() = cancelPosition && cancelRotation
     }
+
+    data class ChatDecision(
+        val cancelled: Boolean,
+        val message: String?
+    )
 
     fun initialize() {
         if (!initialized.compareAndSet(false, true)) return
@@ -395,6 +401,19 @@ object PluginSystem {
         )
         eventBus.post(event)
         return if (event.message == defaultMessage) null else event.message
+    }
+
+    fun onPlayerChat(session: PlayerSession, rawMessage: String): ChatDecision {
+        val event = PlayerChatEvent(
+            player = playerRef(session),
+            message = rawMessage
+        )
+        eventBus.post(event)
+        val changedMessage = if (event.message == rawMessage) null else event.message
+        return ChatDecision(
+            cancelled = event.cancelled,
+            message = changedMessage
+        )
     }
 
     internal fun <T> withPluginOwner(owner: String, block: () -> T): T {

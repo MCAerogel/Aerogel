@@ -16,6 +16,13 @@ data class PlayerJoinEvent(
     var message: String
 ) : Event
 
+data class PlayerChatEvent(
+    val player: ConnectedPlayer,
+    var message: String,
+    override var cancelled: Boolean = false,
+    override var cancelReason: String? = null
+) : CancellableEvent
+
 data class PlayerQuitEvent(
     val player: ConnectedPlayer,
     var message: String
