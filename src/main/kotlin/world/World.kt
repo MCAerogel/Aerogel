@@ -112,6 +112,13 @@ class World(
     private val inFlightChunkBuilds = ConcurrentHashMap<ChunkPos, InFlightChunkBuild>()
     private val inFlightChunkBuildCount = AtomicInteger(0)
     private val maxInFlightChunkBuilds = configuredMaxInFlightChunkBuilds()
+    private val chunkBuildCreatedTotal = AtomicLong(0L)
+    private val chunkBuildJoinedExistingTotal = AtomicLong(0L)
+    private val chunkBuildCompletedTotal = AtomicLong(0L)
+    private val chunkBuildFailedTotal = AtomicLong(0L)
+    private val chunkBuildWaitCancelledTotal = AtomicLong(0L)
+    private val chunkBuildEarlyCancelledTotal = AtomicLong(0L)
+    private val chunkBuildMaxInFlightObserved = AtomicInteger(0)
     private val pendingFluidUpdates = ConcurrentHashMap.newKeySet<BlockPos>()
     private val pendingFluidTickChanges = ConcurrentLinkedQueue<FluidBlockChange>()
     private val pendingGrassUpdates = ConcurrentHashMap.newKeySet<BlockPos>()
@@ -144,6 +151,34 @@ class World(
         val lastDemandNanos: AtomicLong = AtomicLong(System.nanoTime()),
         val cancelRequested: AtomicBoolean = AtomicBoolean(false)
     )
+
+    data class ChunkBuildStats(
+        val inFlightNow: Int,
+        val inFlightMapSize: Int,
+        val maxInFlightConfigured: Int,
+        val createdTotal: Long,
+        val joinedExistingTotal: Long,
+        val completedTotal: Long,
+        val failedTotal: Long,
+        val waitCancelledTotal: Long,
+        val earlyCancelledTotal: Long,
+        val maxInFlightObserved: Int
+    )
+
+    fun chunkBuildStats(): ChunkBuildStats {
+        return ChunkBuildStats(
+            inFlightNow = inFlightChunkBuildCount.get(),
+            inFlightMapSize = inFlightChunkBuilds.size,
+            maxInFlightConfigured = maxInFlightChunkBuilds,
+            createdTotal = chunkBuildCreatedTotal.get(),
+            joinedExistingTotal = chunkBuildJoinedExistingTotal.get(),
+            completedTotal = chunkBuildCompletedTotal.get(),
+            failedTotal = chunkBuildFailedTotal.get(),
+            waitCancelledTotal = chunkBuildWaitCancelledTotal.get(),
+            earlyCancelledTotal = chunkBuildEarlyCancelledTotal.get(),
+            maxInFlightObserved = chunkBuildMaxInFlightObserved.get()
+        )
+    }
 
     fun registerEntityProcessor(processor: ChunkEntityProcessor) {
         entityProcessors.add(processor)
@@ -216,6 +251,7 @@ class World(
         while (true) {
             inFlightChunkBuilds[chunkPos]?.let { existing ->
                 if (!existing.future.isCancelled) {
+                    chunkBuildJoinedExistingTotal.incrementAndGet()
                     existing.lastDemandNanos.set(System.nanoTime())
                     return existing
                 }
@@ -235,9 +271,11 @@ class World(
             val existing = inFlightChunkBuilds.putIfAbsent(chunkPos, created)
             if (existing != null) {
                 releaseInFlightBuildPermit()
+                chunkBuildJoinedExistingTotal.incrementAndGet()
                 existing.lastDemandNanos.set(System.nanoTime())
                 return existing
             }
+            chunkBuildCreatedTotal.incrementAndGet()
 
             val context = ChunkGenerationContext(
                 worldKey = key,
@@ -273,8 +311,10 @@ class World(
 
             result.whenComplete { generated, error ->
                 if (error != null) {
+                    chunkBuildFailedTotal.incrementAndGet()
                     created.future.completeExceptionally(error)
                 } else {
+                    chunkBuildCompletedTotal.incrementAndGet()
                     created.future.complete(generated)
                 }
                 removeInFlightBuild(chunkPos, created)
@@ -326,6 +366,7 @@ class World(
     private fun awaitChunkBuild(build: InFlightChunkBuild, shouldKeepWaiting: () -> Boolean): GeneratedChunk {
         while (true) {
             if (!shouldKeepWaiting()) {
+                chunkBuildWaitCancelledTotal.incrementAndGet()
                 throw CancellationException("Chunk build wait cancelled")
             }
             val future = build.future
@@ -353,6 +394,7 @@ class World(
 
         // No active demand remains for this build (e.g. stream target moved away).
         // Cancel promptly to prevent stale in-flight work from accumulating.
+        chunkBuildEarlyCancelledTotal.incrementAndGet()
         build.cancelRequested.set(true)
         build.sourceFutureRef.get()?.cancel(true)
         build.future.cancel(true)
@@ -363,7 +405,15 @@ class World(
         while (true) {
             val current = inFlightChunkBuildCount.get()
             if (current >= maxInFlightChunkBuilds) return false
-            if (inFlightChunkBuildCount.compareAndSet(current, current + 1)) return true
+            if (inFlightChunkBuildCount.compareAndSet(current, current + 1)) {
+                val observed = current + 1
+                while (true) {
+                    val prev = chunkBuildMaxInFlightObserved.get()
+                    if (observed <= prev) break
+                    if (chunkBuildMaxInFlightObserved.compareAndSet(prev, observed)) break
+                }
+                return true
+            }
         }
     }
 

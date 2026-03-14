@@ -233,6 +233,7 @@ class ChunkFutureConnectedWorldGenerator(
         }
         if (remaining == null) {
             chunkCache.remove(chunkPos)
+            lookupCache.remove(chunkPos)
         }
     }
 
@@ -276,6 +277,9 @@ class ChunkFutureConnectedWorldGenerator(
     }
 
     private fun scheduleLookupPrefetch(chunkPos: ChunkPos) {
+        // Prevent background worldgen amplification from random miss lookups outside
+        // actively retained (streamed/loaded) chunk footprints.
+        if (!isChunkRetained(chunkPos)) return
         if (lookupCache.containsKey(chunkPos)) return
         val created = CompletableFuture<StandaloneChunkData>()
         val existing = lookupPrefetchInFlight.putIfAbsent(chunkPos, created)

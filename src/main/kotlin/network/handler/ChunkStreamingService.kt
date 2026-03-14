@@ -232,6 +232,17 @@ object ChunkStreamingService {
         }
 
         lateinit var scheduleMore: () -> Unit
+        val scheduleQueued = AtomicBoolean(false)
+        fun requestScheduleMore() {
+            if (completion.isDone) return
+            if (!scheduleQueued.compareAndSet(false, true)) return
+            // Schedule on channel event-loop so dispatch cannot be starved by a saturated
+            // chunk worker pool. Still asynchronous (non-recursive) thanks to queue flag.
+            ctx.executor().execute {
+                scheduleQueued.set(false)
+                scheduleMore()
+            }
+        }
 
         val dispatchNext: (ChunkPos) -> Unit = dispatch@{ coord ->
             if (completion.isDone || !shouldSend()) {
@@ -242,7 +253,7 @@ object ChunkStreamingService {
             }
             if (!shouldSendCoord(coord)) {
                 generatingChunks.remove(coord)
-                scheduleMore()
+                requestScheduleMore()
                 return@dispatch
             }
 
@@ -276,7 +287,7 @@ object ChunkStreamingService {
                                     generatingChunks.remove(coord)
                                     retryQueue.add(coord)
                                     sourceExhausted.set(false)
-                                    scheduleMore()
+                                    requestScheduleMore()
                                     return@whenComplete
                                 }
                                 timeoutRetryCounts.remove(coord)
@@ -290,7 +301,7 @@ object ChunkStreamingService {
 
                             generatingChunks.remove(coord)
                             if (isChunkRequestCancelled(error) || isChunkBridgeTimeout(error)) {
-                                scheduleMore()
+                                requestScheduleMore()
                                 return@whenComplete
                             }
                             logger.error("Chunk stream failed for {},{}", coord.x, coord.z, error)
@@ -386,17 +397,17 @@ object ChunkStreamingService {
                                     finishSuccessIfReady()
                                 }
                                 // Resume build dispatch after packet task completion.
-                                scheduleMore()
+                                requestScheduleMore()
                             }
                         }
-                        scheduleMore()
+                        requestScheduleMore()
                     } finally {
                         if (retainedForLoadedCache && !becameLoaded.get()) {
                             releaseLoadedChunkCache(world, coord)
                         }
                         inFlightBuildTasks.decrementAndGet()
                         finishSuccessIfReady()
-                        scheduleMore()
+                        requestScheduleMore()
                     }
                 }
         }
@@ -427,12 +438,12 @@ object ChunkStreamingService {
                     inFlightBuildTasks.get() < currentBuildLimit() &&
                     (retryQueue.isNotEmpty() || nextIndex.get() < coords.size)
                 if (canContinue) {
-                    scheduleMore()
+                    requestScheduleMore()
                 }
             }
         }
 
-        scheduleMore()
+        requestScheduleMore()
 
         return completion
     }

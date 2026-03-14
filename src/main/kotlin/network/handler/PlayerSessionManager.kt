@@ -8435,6 +8435,14 @@ data class EncodedStackSection(
     fun leave(channelId: ChannelId) {
         val existing = sessions[channelId]
         if (existing != null) {
+            // Hard-stop any stream state before session removal so stale build waits do not
+            // bleed into subsequent reconnects.
+            existing.chunkStreamVersion.incrementAndGet()
+            existing.chunkStreamInFlight.set(false)
+            existing.pendingChunkTarget.set(null)
+            existing.targetChunks.clear()
+            existing.generatingChunks.clear()
+            activeChunkStreamTargets.remove(channelId)
             clearBlockBreakVisual(existing)
             dismountPlayerFromAnimal(existing)
             when (existing.openContainerType) {
@@ -23361,7 +23369,8 @@ data class EncodedStackSection(
                                     buildNanos = streamResult.buildNanos,
                                     packetNanos = streamResult.packetNanos,
                                     unloadNanos = unloadNanos,
-                                    stale = false
+                                    stale = false,
+                                    chunkBuildStats = world.chunkBuildStats()
                                 )
                             )
                             ctx.write(PlayPackets.chunkBatchFinishedPacket(streamResult.sentChunks))
@@ -23443,7 +23452,8 @@ data class EncodedStackSection(
                                     buildNanos = result.buildNanos,
                                     packetNanos = result.packetNanos,
                                     unloadNanos = unloadNanos,
-                                    stale = true
+                                    stale = true,
+                                    chunkBuildStats = world.chunkBuildStats()
                                 )
                             )
                             if (benchLog != null) {
@@ -23493,7 +23503,8 @@ data class EncodedStackSection(
         val buildNanos: Long,
         val packetNanos: Long,
         val unloadNanos: Long,
-        val stale: Boolean
+        val stale: Boolean,
+        val chunkBuildStats: org.macaroon3145.world.World.ChunkBuildStats? = null
     )
 
     private fun recordChunkLoadBench(sample: ChunkLoadBenchSample): String? {
@@ -23542,7 +23553,19 @@ data class EncodedStackSection(
                 "UNLOAD=${"%.3f".format(Locale.ROOT, unloadSecondsPer100)}s " +
                 "STALE=${"%.1f".format(Locale.ROOT, staleRatioPercent)}% " +
                 "STALE_avg_per_100=${"%.3f".format(Locale.ROOT, staleSecondsPer100)}s " +
-                "$label)"
+                "$label" +
+                sample.chunkBuildStats?.let { stats ->
+                    " BUILD[inFlight=${stats.inFlightNow}/${stats.maxInFlightConfigured}" +
+                        ",map=${stats.inFlightMapSize}" +
+                        ",maxObs=${stats.maxInFlightObserved}" +
+                        ",created=${stats.createdTotal}" +
+                        ",joined=${stats.joinedExistingTotal}" +
+                        ",done=${stats.completedTotal}" +
+                        ",fail=${stats.failedTotal}" +
+                        ",waitCancel=${stats.waitCancelledTotal}" +
+                        ",earlyCancel=${stats.earlyCancelledTotal}]"
+                }.orEmpty() +
+                ")"
         }
     }
 
