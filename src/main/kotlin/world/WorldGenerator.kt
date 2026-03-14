@@ -32,6 +32,10 @@ interface LoadedChunkCacheWorldGenerator {
     fun releaseLoadedChunk(chunkPos: ChunkPos)
 }
 
+interface RetainedChunkSetWorldGenerator {
+    fun syncRetainedLoadedChunks(chunks: Set<ChunkPos>)
+}
+
 fun interface ChunkEntityProcessor {
     fun process(context: ChunkGenerationContext, chunk: GeneratedChunk): GeneratedChunk
 }

@@ -56,6 +56,7 @@ import org.macaroon3145.world.VanillaBlockBreakingSpeed
 import org.macaroon3145.world.VanillaMiningRules
 import org.macaroon3145.world.VanillaWaterSubmersion
 import org.macaroon3145.world.LoadedChunkCacheWorldGenerator
+import org.macaroon3145.world.RetainedChunkSetWorldGenerator
 import org.macaroon3145.world.WorldManager
 import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
@@ -6205,6 +6206,18 @@ data class EncodedStackSection(
     private fun publishRetainedBaseChunksForWorld(worldKey: String) {
         val refs = retainedBaseRefCountByWorld[worldKey]
         val retained = if (refs == null || refs.isEmpty()) emptySet() else HashSet(refs.keys)
+        val world = WorldManager.world(worldKey)
+        val loadedUnion = if (world == null) {
+            emptySet()
+        } else {
+            val union = HashSet<ChunkPos>()
+            for (session in sessions.values) {
+                if (session.worldKey != worldKey) continue
+                union.addAll(session.loadedChunks)
+            }
+            union
+        }
+        (world?.generator as? RetainedChunkSetWorldGenerator)?.syncRetainedLoadedChunks(loadedUnion)
         val previous = retainedBaseChunksCacheByWorld[worldKey]
         if (retained.isEmpty()) {
             // Keep previously retained base chunks to improve reconnect cache hit ratio.

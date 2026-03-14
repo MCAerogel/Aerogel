@@ -25,6 +25,7 @@ import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.GeneratedChunk
 import org.macaroon3145.world.HeightmapData
 import org.macaroon3145.world.LoadedChunkCacheWorldGenerator
+import org.macaroon3145.world.RetainedChunkSetWorldGenerator
 import org.macaroon3145.world.SpawnPoint
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
@@ -41,7 +42,7 @@ import kotlin.math.max
 class ChunkFutureConnectedWorldGenerator(
     private val worldKey: String,
     seed: Long,
-) : AsyncWorldGenerator, BlockStateLookupWorldGenerator, LoadedChunkCacheWorldGenerator {
+) : AsyncWorldGenerator, BlockStateLookupWorldGenerator, LoadedChunkCacheWorldGenerator, RetainedChunkSetWorldGenerator {
     private data class LookupCacheEntry(
         val chunk: StandaloneChunkData,
         @Volatile var expiresAtNanos: Long
@@ -51,6 +52,8 @@ class ChunkFutureConnectedWorldGenerator(
     private val service = ChunkFutureService.createDefault()
     private val worldSeed = seed
     private val chunkCache = ConcurrentHashMap<ChunkPos, StandaloneChunkData>()
+    private val pinnedChunkCache = ConcurrentHashMap<ChunkPos, StandaloneChunkData>()
+    private val retainedChunkSnapshot = ConcurrentHashMap.newKeySet<ChunkPos>()
     private val lookupCache = ConcurrentHashMap<ChunkPos, LookupCacheEntry>()
     private val lookupPrefetchInFlight = ConcurrentHashMap<ChunkPos, CompletableFuture<StandaloneChunkData>>()
     private val lookupMaintenanceCounter = AtomicLong(0L)
@@ -161,7 +164,12 @@ class ChunkFutureConnectedWorldGenerator(
         val chunkPos = ChunkPos(x shr 4, z shr 4)
         // Never synchronously generate/load chunks from random gameplay queries.
         // Blocking here can run full worldgen on Netty event-loop threads.
-        val chunk = cachedChunk(chunkPos)
+        var chunk = cachedChunk(chunkPos)
+        if (chunk == null && isChunkRetained(chunkPos)) {
+            // Correctness path: for actively retained chunks, do one bounded blocking
+            // fetch to avoid transient AIR reads during interaction checks.
+            chunk = fetchRetainedChunkBlocking(chunkPos)
+        }
         if (chunk == null) {
             scheduleLookupPrefetch(chunkPos)
             return AIR_STATE_ID
@@ -225,6 +233,8 @@ class ChunkFutureConnectedWorldGenerator(
             out.incrementAndGet()
             out
         }
+        chunkCache[chunkPos]?.let { pinnedChunkCache[chunkPos] = it }
+        lookupCache[chunkPos]?.let { pinnedChunkCache.putIfAbsent(chunkPos, it.chunk) }
     }
 
     override fun releaseLoadedChunk(chunkPos: ChunkPos) {
@@ -232,20 +242,48 @@ class ChunkFutureConnectedWorldGenerator(
             if (counter.decrementAndGet() <= 0) null else counter
         }
         if (remaining == null) {
+            pinnedChunkCache.remove(chunkPos)
             chunkCache.remove(chunkPos)
-            lookupCache.remove(chunkPos)
+        }
+    }
+
+    override fun syncRetainedLoadedChunks(chunks: Set<ChunkPos>) {
+        retainedChunkSnapshot.clear()
+        retainedChunkSnapshot.addAll(chunks)
+        for (chunkPos in chunks) {
+            chunkCache[chunkPos]?.let { pinnedChunkCache[chunkPos] = it }
+            lookupCache[chunkPos]?.let { pinnedChunkCache.putIfAbsent(chunkPos, it.chunk) }
+        }
+        val drop = ArrayList<ChunkPos>()
+        for (chunkPos in pinnedChunkCache.keys) {
+            if (!isChunkRetained(chunkPos)) {
+                drop += chunkPos
+            }
+        }
+        for (chunkPos in drop) {
+            pinnedChunkCache.remove(chunkPos)
         }
     }
 
     private fun cacheChunk(chunkPos: ChunkPos, chunk: StandaloneChunkData) {
         cacheLookupChunk(chunkPos, chunk)
         chunkCache[chunkPos] = chunk
-        if (!isChunkRetained(chunkPos)) {
+        if (isChunkRetained(chunkPos)) {
+            pinnedChunkCache[chunkPos] = chunk
+        } else {
+            pinnedChunkCache.remove(chunkPos)
             chunkCache.remove(chunkPos, chunk)
         }
     }
 
     private fun cachedChunk(chunkPos: ChunkPos): StandaloneChunkData? {
+        val pinned = pinnedChunkCache[chunkPos]
+        if (pinned != null) {
+            cacheLookupChunk(chunkPos, pinned)
+            chunkCache[chunkPos] = pinned
+            return pinned
+        }
+
         val direct = chunkCache[chunkPos]
         if (direct != null) {
             cacheLookupChunk(chunkPos, direct)
@@ -254,7 +292,8 @@ class ChunkFutureConnectedWorldGenerator(
 
         val now = System.nanoTime()
         val lookup = lookupCache[chunkPos] ?: return null
-        if (lookup.expiresAtNanos <= now) {
+        // Retained (actively loaded/streamed) chunks must stay cacheable even if TTL elapsed.
+        if (lookup.expiresAtNanos <= now && !isChunkRetained(chunkPos)) {
             lookupCache.remove(chunkPos, lookup)
             return null
         }
@@ -264,7 +303,8 @@ class ChunkFutureConnectedWorldGenerator(
     }
 
     private fun isChunkRetained(chunkPos: ChunkPos): Boolean {
-        return retainedChunkRefCounts[chunkPos]?.get()?.let { it > 0 } == true
+        return (retainedChunkRefCounts[chunkPos]?.get()?.let { it > 0 } == true) ||
+            retainedChunkSnapshot.contains(chunkPos)
     }
 
     private fun cacheLookupChunk(chunkPos: ChunkPos, chunk: StandaloneChunkData) {
@@ -315,13 +355,33 @@ class ChunkFutureConnectedWorldGenerator(
         }
     }
 
+    private fun fetchRetainedChunkBlocking(chunkPos: ChunkPos): StandaloneChunkData? {
+        val context = ChunkGenerationContext(
+            worldKey = worldKey,
+            seed = worldSeed,
+            chunkPos = chunkPos,
+            isCancelled = { false }
+        )
+        return runCatching {
+            service.request(
+                worldId = runtimeWorldId,
+                chunkX = chunkPos.x,
+                chunkZ = chunkPos.z,
+                statusKey = "FULL",
+                create = true
+            )
+                .thenApply { result -> resolveStandaloneChunk(context, result) }
+                .get(BLOCK_LOOKUP_BLOCKING_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        }.getOrNull()
+    }
+
     private fun maybeMaintainLookupCache(force: Boolean = false) {
         val tick = lookupMaintenanceCounter.incrementAndGet()
         if (!force && (tick and 1023L) != 0L) return
         val now = System.nanoTime()
         var oversize = (lookupCache.size - lookupMaxEntries).coerceAtLeast(0)
         for ((key, entry) in lookupCache) {
-            if (entry.expiresAtNanos <= now) {
+            if (entry.expiresAtNanos <= now && !isChunkRetained(key)) {
                 lookupCache.remove(key, entry)
                 continue
             }
@@ -608,6 +668,12 @@ class ChunkFutureConnectedWorldGenerator(
                 ?.toIntOrNull()
                 ?.coerceAtLeast(2_048)
                 ?: 65_536
+            )
+        private val BLOCK_LOOKUP_BLOCKING_TIMEOUT_MS: Long = (
+            System.getProperty("aerogel.chunk.block-lookup-blocking-timeout-ms")
+                ?.toLongOrNull()
+                ?.coerceIn(1L, 1_000L)
+                ?: 50L
             )
         private const val WORLD_MIN_Y = -64
         private const val WORLD_MAX_Y = 319
