@@ -26,6 +26,12 @@ interface BlockStateLookupWorldGenerator {
     fun rawBrightnessAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? = null
 }
 
+interface LoadedChunkCacheWorldGenerator {
+    fun retainLoadedChunk(chunkPos: ChunkPos)
+
+    fun releaseLoadedChunk(chunkPos: ChunkPos)
+}
+
 fun interface ChunkEntityProcessor {
     fun process(context: ChunkGenerationContext, chunk: GeneratedChunk): GeneratedChunk
 }

@@ -76,6 +76,14 @@ class World(
     private val rawBrightnessProvider: (Int, Int, Int) -> Int = { _, _, _ -> 0 },
     private val cachedRawBrightnessProvider: (Int, Int, Int) -> Int? = { _, _, _ -> null }
 ) {
+    private fun configuredMaxInFlightChunkBuilds(): Int {
+        val cpuBased = (Runtime.getRuntime().availableProcessors() * 6).coerceAtLeast(64)
+        return System.getProperty("aerogel.chunk.max-inflight-builds")
+            ?.toIntOrNull()
+            ?.coerceAtLeast(16)
+            ?: cpuBased
+    }
+
     data class BlockEntityData(
         val typeId: Int,
         val nbtPayload: ByteArray
@@ -102,6 +110,8 @@ class World(
         clearBlockEntity = { x, y, z -> setBlockEntity(x, y, z, null) }
     )
     private val inFlightChunkBuilds = ConcurrentHashMap<ChunkPos, InFlightChunkBuild>()
+    private val inFlightChunkBuildCount = AtomicInteger(0)
+    private val maxInFlightChunkBuilds = configuredMaxInFlightChunkBuilds()
     private val pendingFluidUpdates = ConcurrentHashMap.newKeySet<BlockPos>()
     private val pendingFluidTickChanges = ConcurrentLinkedQueue<FluidBlockChange>()
     private val pendingGrassUpdates = ConcurrentHashMap.newKeySet<BlockPos>()
@@ -124,10 +134,14 @@ class World(
     @Volatile private var warmedSeed: Long = Long.MIN_VALUE
     private val warmupFutureRef = AtomicReference<CompletableFuture<Long>?>(null)
     private val cachedSpawnPointRef = AtomicReference<SpawnPoint?>(null)
+    private val spawnResolveInFlight = AtomicBoolean(false)
 
     private data class InFlightChunkBuild(
+        val chunkPos: ChunkPos,
         val future: CompletableFuture<GeneratedChunk>,
+        val sourceFutureRef: AtomicReference<CompletableFuture<GeneratedChunk>?> = AtomicReference(null),
         val activeWaiters: AtomicInteger = AtomicInteger(0),
+        val lastDemandNanos: AtomicLong = AtomicLong(System.nanoTime()),
         val cancelRequested: AtomicBoolean = AtomicBoolean(false)
     )
 
@@ -186,6 +200,7 @@ class World(
     fun buildChunk(chunkPos: ChunkPos, shouldKeepWaiting: () -> Boolean): GeneratedChunk {
         val build = getOrCreateChunkBuild(chunkPos, directExecutor)
         build.activeWaiters.incrementAndGet()
+        build.lastDemandNanos.set(System.nanoTime())
         return try {
             awaitChunkBuild(build, shouldKeepWaiting)
         } finally {
@@ -198,53 +213,114 @@ class World(
     }
 
     private fun getOrCreateChunkBuild(chunkPos: ChunkPos, fallbackExecutor: Executor): InFlightChunkBuild {
-        inFlightChunkBuilds[chunkPos]?.let { return it }
+        while (true) {
+            inFlightChunkBuilds[chunkPos]?.let { existing ->
+                if (!existing.future.isCancelled) {
+                    existing.lastDemandNanos.set(System.nanoTime())
+                    return existing
+                }
+                removeInFlightBuild(existing.chunkPos, existing)
+            }
 
-        val created = InFlightChunkBuild(CompletableFuture<GeneratedChunk>())
-        val existing = inFlightChunkBuilds.putIfAbsent(chunkPos, created)
-        if (existing != null) return existing
+            if (!tryAcquireInFlightBuildPermit()) {
+                // Hard backpressure to keep chunk build cost stable under movement churn.
+                LockSupport.parkNanos(200_000L)
+                continue
+            }
 
-        val context = ChunkGenerationContext(
-            worldKey = key,
-            seed = seed,
-            chunkPos = chunkPos,
-            isCancelled = { created.cancelRequested.get() }
-        )
+            val created = InFlightChunkBuild(
+                chunkPos = chunkPos,
+                future = CompletableFuture<GeneratedChunk>()
+            )
+            val existing = inFlightChunkBuilds.putIfAbsent(chunkPos, created)
+            if (existing != null) {
+                releaseInFlightBuildPermit()
+                existing.lastDemandNanos.set(System.nanoTime())
+                return existing
+            }
 
-        val result = runCatching {
-            val base = (generator as? AsyncWorldGenerator)?.generateChunkAsync(context)
-                ?: CompletableFuture.supplyAsync({ generator.generateChunk(context) }, fallbackExecutor)
-            if (entityProcessors.isEmpty()) {
-                base
-            } else {
-                base.thenApply { generated ->
-                    var out = generated
-                    for (processor in entityProcessors) {
-                        out = processor.process(context, out)
+            val context = ChunkGenerationContext(
+                worldKey = key,
+                seed = seed,
+                chunkPos = chunkPos,
+                isCancelled = { created.cancelRequested.get() }
+            )
+
+            val result = runCatching {
+                val base = (generator as? AsyncWorldGenerator)?.generateChunkAsync(context)
+                    ?: CompletableFuture.supplyAsync({ generator.generateChunk(context) }, fallbackExecutor)
+                if (entityProcessors.isEmpty()) {
+                    base
+                } else {
+                    base.thenApply { generated ->
+                        var out = generated
+                        for (processor in entityProcessors) {
+                            out = processor.process(context, out)
+                        }
+                        out
                     }
-                    out
+                }
+            }.getOrElse { throwable ->
+                created.future.completeExceptionally(throwable)
+                removeInFlightBuild(chunkPos, created)
+                when (throwable) {
+                    is RuntimeException -> throw throwable
+                    is Error -> throw throwable
+                    else -> throw RuntimeException(throwable)
                 }
             }
-        }.getOrElse { throwable ->
-            created.future.completeExceptionally(throwable)
-            inFlightChunkBuilds.remove(chunkPos, created)
-            when (throwable) {
-                is RuntimeException -> throw throwable
-                is Error -> throw throwable
-                else -> throw RuntimeException(throwable)
-            }
-        }
+            created.sourceFutureRef.set(result)
 
-        result.whenComplete { generated, error ->
-            if (error != null) {
-                created.future.completeExceptionally(error)
-            } else {
-                created.future.complete(generated)
+            result.whenComplete { generated, error ->
+                if (error != null) {
+                    created.future.completeExceptionally(error)
+                } else {
+                    created.future.complete(generated)
+                }
+                removeInFlightBuild(chunkPos, created)
             }
-            inFlightChunkBuilds.remove(chunkPos, created)
-        }
 
-        return created
+            return created
+        }
+    }
+
+    private fun enforceInFlightBuildBudget(preferredChunk: ChunkPos) {
+        val currentSize = inFlightChunkBuilds.size
+        if (currentSize < maxInFlightChunkBuilds) return
+
+        val over = (currentSize - maxInFlightChunkBuilds + 1).coerceAtLeast(1)
+        val candidates = inFlightChunkBuilds.values
+            .asSequence()
+            .filter { it.chunkPos != preferredChunk && !it.future.isDone }
+            .sortedWith(
+                compareBy<InFlightChunkBuild> { it.activeWaiters.get() }
+                    .thenBy { it.lastDemandNanos.get() }
+            )
+            .toList()
+        if (candidates.isEmpty()) return
+
+        val zeroWaiterVictims = candidates
+            .asSequence()
+            .filter { it.activeWaiters.get() <= 0 }
+            .take(over)
+            .toList()
+        val victims = if (zeroWaiterVictims.size >= over) {
+            zeroWaiterVictims
+        } else {
+            val additional = candidates
+                .asSequence()
+                .filter { it.activeWaiters.get() > 0 }
+                .take(over - zeroWaiterVictims.size)
+                .toList()
+            zeroWaiterVictims + additional
+        }
+        if (victims.isEmpty()) return
+
+        for (victim in victims) {
+            victim.cancelRequested.set(true)
+            inFlightChunkBuilds.remove(victim.chunkPos, victim)
+            victim.sourceFutureRef.get()?.cancel(true)
+        }
     }
 
     private fun awaitChunkBuild(build: InFlightChunkBuild, shouldKeepWaiting: () -> Boolean): GeneratedChunk {
@@ -257,20 +333,9 @@ class World(
                 LockSupport.parkNanos(200_000L)
                 continue
             }
-            var completed = false
-            var generated: GeneratedChunk? = null
-            var failure: Throwable? = null
-            future.whenComplete { value, error ->
-                generated = value
-                failure = error
-                completed = true
-            }
-            if (!completed) {
-                LockSupport.parkNanos(100_000L)
-                continue
-            }
-            val error = failure
-            if (error != null) {
+            try {
+                return future.join()
+            } catch (error: Throwable) {
                 val cause = (error as? CompletionException)?.cause ?: error
                 when (cause) {
                     is RuntimeException -> throw cause
@@ -278,17 +343,41 @@ class World(
                     else -> throw RuntimeException(cause)
                 }
             }
-            val chunk = generated
-            if (chunk != null) {
-                return chunk
-            }
         }
     }
 
     private fun releaseChunkBuildWaiter(build: InFlightChunkBuild) {
         val remaining = build.activeWaiters.decrementAndGet()
-        if (remaining <= 0 && !build.future.isDone) {
-            build.cancelRequested.set(true)
+        if (remaining > 0) return
+        if (build.future.isDone) return
+
+        // No active demand remains for this build (e.g. stream target moved away).
+        // Cancel promptly to prevent stale in-flight work from accumulating.
+        build.cancelRequested.set(true)
+        build.sourceFutureRef.get()?.cancel(true)
+        build.future.cancel(true)
+        removeInFlightBuild(build.chunkPos, build)
+    }
+
+    private fun tryAcquireInFlightBuildPermit(): Boolean {
+        while (true) {
+            val current = inFlightChunkBuildCount.get()
+            if (current >= maxInFlightChunkBuilds) return false
+            if (inFlightChunkBuildCount.compareAndSet(current, current + 1)) return true
+        }
+    }
+
+    private fun releaseInFlightBuildPermit() {
+        while (true) {
+            val current = inFlightChunkBuildCount.get()
+            if (current <= 0) return
+            if (inFlightChunkBuildCount.compareAndSet(current, current - 1)) return
+        }
+    }
+
+    private fun removeInFlightBuild(chunkPos: ChunkPos, build: InFlightChunkBuild) {
+        if (inFlightChunkBuilds.remove(chunkPos, build)) {
+            releaseInFlightBuildPermit()
         }
     }
 
@@ -2256,13 +2345,33 @@ class World(
             return resolved
         }
         cachedSpawnPointRef.get()?.let { return it }
-        val computed = findSharedSpawnNearOrigin()
-        cachedSpawnPointRef.compareAndSet(null, computed)
-        val resolved = cachedSpawnPointRef.get() ?: computed
+
         if (key == "minecraft:overworld") {
-            VanillaLevelDatSeedStore.saveSpawnPoint(resolved)
+            VanillaLevelDatSeedStore.loadSpawnPoint()?.let { persisted ->
+                cachedSpawnPointRef.compareAndSet(null, persisted)
+                return cachedSpawnPointRef.get() ?: persisted
+            }
         }
-        return resolved
+
+        val immediateFallback = SpawnPoint(0.5, DEFAULT_FALLBACK_SPAWN_Y, 0.5)
+        if (spawnResolveInFlight.compareAndSet(false, true)) {
+            Thread.ofVirtual()
+                .name("aerogel-spawn-resolve-$key")
+                .start {
+                    runCatching { findSharedSpawnNearOrigin() }
+                        .onSuccess { computed ->
+                            cachedSpawnPointRef.compareAndSet(null, computed)
+                            if (key == "minecraft:overworld") {
+                                VanillaLevelDatSeedStore.saveSpawnPoint(computed)
+                            }
+                        }
+                        .onFailure {
+                            cachedSpawnPointRef.compareAndSet(null, immediateFallback)
+                        }
+                    spawnResolveInFlight.set(false)
+                }
+        }
+        return cachedSpawnPointRef.get() ?: immediateFallback
     }
 
     fun highestSpawnPointAt(blockX: Int = 0, blockZ: Int = 0): SpawnPoint {

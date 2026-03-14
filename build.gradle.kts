@@ -161,6 +161,29 @@ tasks.register<Exec>("runAerogelJar") {
     }
 }
 
+tasks.register<JavaExec>("tpPracticalBench") {
+    group = "benchmark"
+    description = "Runs teleport-like practical chunk stream benchmark without starting full networking."
+    dependsOn("classes")
+    workingDir = project.projectDir
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("org.macaroon3145.perf.TpPracticalBenchmark")
+    jvmArgs(aerogelRunJvmArgs)
+    standardInput = System.`in`
+    standardOutput = System.out
+    errorOutput = System.err
+    isIgnoreExitValue = false
+
+    doFirst {
+        val forwardedPrefixes = listOf("tpbench.", "aerogel.chunk.", "world.seed.")
+        for (name in System.getProperties().stringPropertyNames()) {
+            if (name == "world.default" || forwardedPrefixes.any { prefix -> name.startsWith(prefix) }) {
+                systemProperty(name, System.getProperty(name))
+            }
+        }
+    }
+}
+
 tasks.register<Exec>("runAerogelJarInOsTerminal") {
     group = "application"
     description = "Builds Aerogel.jar and launches it in a new OS terminal window."

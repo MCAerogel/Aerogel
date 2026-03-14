@@ -6,6 +6,7 @@ import org.macaroon3145.network.codec.BlockEntityTypeRegistry
 import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.DroppedItemSnapshot
+import org.macaroon3145.world.LoadedChunkCacheWorldGenerator
 import org.macaroon3145.world.World
 import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
 import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
@@ -17,11 +18,18 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 import kotlin.math.floor
 
 object ChunkStreamingService {
+    data class StreamResult(
+        val sentChunks: Int = 0,
+        val buildNanos: Long = 0L,
+        val packetNanos: Long = 0L,
+    )
+
     private val logger = LoggerFactory.getLogger(ChunkStreamingService::class.java)
     private const val FORCED_REGION_GRID_EXPONENT = 0
     private const val DEFAULT_INTERLEAVE_CELL_EXPONENT = 4
@@ -97,7 +105,7 @@ object ChunkStreamingService {
         radius: Int,
         loadedChunks: MutableSet<ChunkPos>,
         generatingChunks: MutableSet<ChunkPos>
-    ): CompletableFuture<Int> {
+    ): CompletableFuture<StreamResult> {
         return streamAround(ctx, world, centerChunkX, centerChunkZ, radius, loadedChunks, generatingChunks)
     }
 
@@ -110,10 +118,11 @@ object ChunkStreamingService {
         loadedChunks: MutableSet<ChunkPos>,
         generatingChunks: MutableSet<ChunkPos>,
         shouldSend: () -> Boolean = { true },
+        shouldSendCoord: (ChunkPos) -> Boolean = { shouldSend() },
         onChunkSent: ((ChunkPos, List<DroppedItemSnapshot>) -> Unit)? = null
-    ): CompletableFuture<Int> {
+    ): CompletableFuture<StreamResult> {
         val coords = buildSquareCoords(centerChunkX, centerChunkZ, radius)
-        return streamCoords(ctx, world, coords, loadedChunks, generatingChunks, shouldSend, onChunkSent)
+        return streamCoords(ctx, world, coords, loadedChunks, generatingChunks, shouldSend, shouldSendCoord, onChunkSent)
     }
 
     fun prewarmAsync(world: World): CompletableFuture<Void> {
@@ -128,25 +137,44 @@ object ChunkStreamingService {
         loadedChunks: MutableSet<ChunkPos>,
         generatingChunks: MutableSet<ChunkPos>,
         shouldSend: () -> Boolean = { true },
+        shouldSendCoord: (ChunkPos) -> Boolean = { shouldSend() },
         onChunkSent: ((ChunkPos, List<DroppedItemSnapshot>) -> Unit)? = null,
-        workerLimit: Int = workerCount
-    ): CompletableFuture<Int> {
-        if (coordsInput.isEmpty()) return CompletableFuture.completedFuture(0)
+        workerLimit: Int = workerCount,
+        latencySensitive: Boolean = false,
+        flushFirstChunkImmediately: Boolean = false
+    ): CompletableFuture<StreamResult> {
+        if (coordsInput.isEmpty()) return CompletableFuture.completedFuture(StreamResult())
 
         val coords = coordsInput
-        val completion = CompletableFuture<Int>()
+        val completion = CompletableFuture<StreamResult>()
         val includeDroppedItems = world.hasDroppedItems()
         val sent = AtomicInteger(0)
+        val buildNanos = AtomicLong(0L)
+        val packetNanos = AtomicLong(0L)
         val nextIndex = AtomicInteger(0)
         val pendingChunksSinceFlush = AtomicInteger(0)
         val pendingPacketTasks = AtomicInteger(0)
+        val firstChunkFlushScheduled = AtomicBoolean(false)
         val generationWorkersDone = AtomicBoolean(false)
         val flushScheduled = AtomicBoolean(false)
         val streamFailure = AtomicReference<Throwable?>(null)
         val retryQueue = ConcurrentLinkedQueue<ChunkPos>()
         val timeoutRetryCounts = ConcurrentHashMap<ChunkPos, Int>()
         val maxChunkBridgeRetries = configuredChunkBridgeRetryCount()
-        val flushChunkBatchSize = configuredFlushChunkBatchSize(workerLimit)
+        val configuredFlushBatchSize = configuredFlushChunkBatchSize(workerLimit)
+        val flushChunkBatchSize = when {
+            !latencySensitive -> configuredFlushBatchSize
+            System.getProperty("aerogel.chunk.flush-batch-size") != null -> configuredFlushBatchSize
+            else -> configuredFlushBatchSize.coerceAtMost(4).coerceAtLeast(1)
+        }
+        val configuredPacketBackpressure = configuredPacketBackpressureLimit(workerLimit)
+        val maxPendingPacketTasks = when {
+            !latencySensitive -> configuredPacketBackpressure
+            System.getProperty("aerogel.chunk.packet-backpressure") != null -> configuredPacketBackpressure
+            else -> configuredPacketBackpressure
+                .coerceAtMost(workerLimit.coerceAtLeast(1))
+                .coerceAtLeast(1)
+        }
         val inFlightBuildTasks = AtomicInteger(0)
         val sourceExhausted = AtomicBoolean(false)
         val scheduling = AtomicBoolean(false)
@@ -170,7 +198,7 @@ object ChunkStreamingService {
             if (!sourceExhausted.get()) return
             if (inFlightBuildTasks.get() != 0) return
             if (pendingPacketTasks.get() != 0) return
-            if (!completion.complete(sent.get())) return
+            if (!completion.complete(StreamResult(sent.get(), buildNanos.get(), packetNanos.get()))) return
             ctx.executor().execute {
                 if (ctx.channel().isActive && shouldSend()) {
                     ctx.flush()
@@ -212,26 +240,37 @@ object ChunkStreamingService {
                 finishSuccessIfReady()
                 return@dispatch
             }
+            if (!shouldSendCoord(coord)) {
+                generatingChunks.remove(coord)
+                scheduleMore()
+                return@dispatch
+            }
 
+            val retainedForLoadedCache = retainLoadedChunkCache(world, coord)
+            val becameLoaded = AtomicBoolean(false)
             inFlightBuildTasks.incrementAndGet()
             CompletableFuture
-                .runAsync(
+                .supplyAsync(
                     {
-                        runCatching {
-                            VanillaAnvilWorldSaver.loadChunkOverrideIfPresent(world, coord)
-                        }.onFailure { throwable ->
-                            logger.warn("Failed to apply saved chunk override for {},{}", coord.x, coord.z, throwable)
+                        val startedAtNanos = System.nanoTime()
+                        try {
+                            runCatching {
+                                VanillaAnvilWorldSaver.loadChunkOverrideIfPresent(world, coord)
+                            }.onFailure { throwable ->
+                                logger.warn("Failed to apply saved chunk override for {},{}", coord.x, coord.z, throwable)
+                            }
+                            world.buildChunk(coord) { shouldSend() && !completion.isDone }
+                        } finally {
+                            val elapsed = (System.nanoTime() - startedAtNanos).coerceAtLeast(0L)
+                            buildNanos.addAndGet(elapsed)
                         }
                     },
                     workerPool
                 )
-                .thenCompose {
-                    world.buildChunkAsync(coord, workerPool)
-                }
                 .whenComplete { generated, error ->
                     try {
                         if (error != null) {
-                            if (isChunkBridgeTimeout(error) && shouldSend() && !completion.isDone) {
+                            if (isChunkBridgeTimeout(error) && shouldSend() && shouldSendCoord(coord) && !completion.isDone) {
                                 val attempt = timeoutRetryCounts.merge(coord, 1, Int::plus) ?: 1
                                 if (attempt <= maxChunkBridgeRetries) {
                                     generatingChunks.remove(coord)
@@ -263,8 +302,9 @@ object ChunkStreamingService {
 
                         pendingPacketTasks.incrementAndGet()
                         packetPool.execute {
+                            val startedAtNanos = System.nanoTime()
                             try {
-                                if (ctx.channel().isActive && shouldSend()) {
+                                if (ctx.channel().isActive && shouldSend() && shouldSendCoord(coord)) {
                                     val changedBlocks = world.changedBlocksInChunk(coord.x, coord.z)
                                     val changedBlockEntities = world.changedBlockEntitiesInChunk(coord.x, coord.z)
                                     val hasChangedBlocks = changedBlocks.isNotEmpty()
@@ -317,12 +357,20 @@ object ChunkStreamingService {
                                         ctx.write(packet)
                                     }
 
-                                    if (pendingChunksSinceFlush.incrementAndGet() >= flushChunkBatchSize) {
+                                    // Only force earliest flush on true cold-start streams.
+                                    if (flushFirstChunkImmediately &&
+                                        firstChunkFlushScheduled.compareAndSet(false, true)
+                                    ) {
+                                        pendingChunksSinceFlush.set(0)
+                                        scheduleIntermediateFlush()
+                                    } else if (pendingChunksSinceFlush.incrementAndGet() >= flushChunkBatchSize) {
                                         pendingChunksSinceFlush.set(0)
                                         scheduleIntermediateFlush()
                                     }
 
-                                    loadedChunks.add(coord)
+                                    if (loadedChunks.add(coord)) {
+                                        becameLoaded.set(true)
+                                    }
                                     timeoutRetryCounts.remove(coord)
                                     sent.incrementAndGet()
                                     onChunkSent?.invoke(coord, droppedItems)
@@ -331,6 +379,8 @@ object ChunkStreamingService {
                                 logger.error("Chunk packet stage failed for {},{}", coord.x, coord.z, t)
                                 failStream(RuntimeException("Chunk packet stage failed at ${coord.x},${coord.z}", t))
                             } finally {
+                                val elapsed = (System.nanoTime() - startedAtNanos).coerceAtLeast(0L)
+                                packetNanos.addAndGet(elapsed)
                                 generatingChunks.remove(coord)
                                 if (pendingPacketTasks.decrementAndGet() == 0) {
                                     finishSuccessIfReady()
@@ -341,6 +391,9 @@ object ChunkStreamingService {
                         }
                         scheduleMore()
                     } finally {
+                        if (retainedForLoadedCache && !becameLoaded.get()) {
+                            releaseLoadedChunkCache(world, coord)
+                        }
                         inFlightBuildTasks.decrementAndGet()
                         finishSuccessIfReady()
                         scheduleMore()
@@ -359,6 +412,7 @@ object ChunkStreamingService {
                         return@schedule
                     }
                     val limit = currentBuildLimit()
+                    if (pendingPacketTasks.get() >= maxPendingPacketTasks) return@schedule
                     if (inFlightBuildTasks.get() >= limit) return@schedule
                     val coord = pollNextCoordOrNull() ?: run {
                         finishSuccessIfReady()
@@ -493,6 +547,25 @@ object ChunkStreamingService {
             ?.coerceAtLeast(1)
             ?.coerceAtMost(workerLimit.coerceAtLeast(1))
             ?: autoDefault
+    }
+
+    private fun configuredPacketBackpressureLimit(workerLimit: Int): Int {
+        val configured = System.getProperty("aerogel.chunk.packet-backpressure")?.toIntOrNull()
+        if (configured == null || configured <= 0) {
+            // Default: no packet-stage backpressure limit.
+            return Int.MAX_VALUE
+        }
+        return configured
+    }
+
+    private fun retainLoadedChunkCache(world: World, chunkPos: ChunkPos): Boolean {
+        val cacheAware = world.generator as? LoadedChunkCacheWorldGenerator ?: return false
+        cacheAware.retainLoadedChunk(chunkPos)
+        return true
+    }
+
+    private fun releaseLoadedChunkCache(world: World, chunkPos: ChunkPos) {
+        (world.generator as? LoadedChunkCacheWorldGenerator)?.releaseLoadedChunk(chunkPos)
     }
 
     fun buildSquareCoords(cx: Int, cz: Int, radius: Int): List<ChunkPos> {

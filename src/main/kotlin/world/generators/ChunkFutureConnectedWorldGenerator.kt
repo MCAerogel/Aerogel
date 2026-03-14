@@ -8,10 +8,10 @@ import chunkfuture.WorldCreateRequest
 import chunkfuture.ported.runtime.StandaloneBiome
 import chunkfuture.ported.runtime.StandaloneBlockId
 import chunkfuture.ported.runtime.StandaloneChunkData
-import chunkfuture.ported.runtime.StandaloneChunkManagerAdapter
 import chunkfuture.ported.runtime.StandaloneRuntimeIds
 import chunkfuture.ported.runtime.StandaloneVanillaWorldFactory
 import chunkfuture.ported.runtime.StandaloneWorld
+import chunkfuture.ported.runtime.StandaloneWorldAdapter
 import chunkfuture.ported.runtime.StandaloneWorldSpec
 import chunkfuture.ported.runtime.StandaloneWorldType
 import chunkfuture.ported.runtime.StandaloneServer
@@ -24,7 +24,7 @@ import org.macaroon3145.world.ChunkGenerationContext
 import org.macaroon3145.world.ChunkPos
 import org.macaroon3145.world.GeneratedChunk
 import org.macaroon3145.world.HeightmapData
-import org.macaroon3145.world.WorldGenerator
+import org.macaroon3145.world.LoadedChunkCacheWorldGenerator
 import org.macaroon3145.world.SpawnPoint
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
@@ -32,8 +32,7 @@ import java.io.DataOutputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionException
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ceil
@@ -42,11 +41,20 @@ import kotlin.math.max
 class ChunkFutureConnectedWorldGenerator(
     private val worldKey: String,
     seed: Long,
-) : AsyncWorldGenerator, BlockStateLookupWorldGenerator {
+) : AsyncWorldGenerator, BlockStateLookupWorldGenerator, LoadedChunkCacheWorldGenerator {
+    private data class LookupCacheEntry(
+        val chunk: StandaloneChunkData,
+        @Volatile var expiresAtNanos: Long
+    )
+
     private val logger = LoggerFactory.getLogger(ChunkFutureConnectedWorldGenerator::class.java)
     private val service = ChunkFutureService.createDefault()
-    private val chunkManagerAdapter = StandaloneChunkManagerAdapter()
+    private val worldSeed = seed
     private val chunkCache = ConcurrentHashMap<ChunkPos, StandaloneChunkData>()
+    private val lookupCache = ConcurrentHashMap<ChunkPos, LookupCacheEntry>()
+    private val lookupPrefetchInFlight = ConcurrentHashMap<ChunkPos, CompletableFuture<StandaloneChunkData>>()
+    private val lookupMaintenanceCounter = AtomicLong(0L)
+    private val retainedChunkRefCounts = ConcurrentHashMap<ChunkPos, AtomicInteger>()
     private val runtimeIds = StandaloneRuntimeIds(
         blockStateIdLookup = { blockKey ->
             BlockStateRegistry.stateIdForBlockOrStateKey(blockKey) ?: AIR_STATE_ID
@@ -98,7 +106,7 @@ class ChunkFutureConnectedWorldGenerator(
                 }
             }
         )
-        service.registerChunkManager(runtimeWorldId, world.chunkManager, chunkManagerAdapter)
+        service.registerWorld(world, STANDALONE_WORLD_ADAPTER)
     }
 
     override fun generateChunk(context: ChunkGenerationContext): GeneratedChunk {
@@ -143,7 +151,7 @@ class ChunkFutureConnectedWorldGenerator(
         check(chunk.minY == standaloneHeightRange.first && chunk.maxY == standaloneHeightRange.last) {
             "Chunk height mismatch: expected=${standaloneHeightRange.first}..${standaloneHeightRange.last} actual=${chunk.minY}..${chunk.maxY} world=$worldKey chunk=${context.chunkPos.x},${context.chunkPos.z}"
         }
-        chunkCache[context.chunkPos] = chunk
+        cacheChunk(context.chunkPos, chunk)
         return chunk
     }
 
@@ -151,7 +159,13 @@ class ChunkFutureConnectedWorldGenerator(
         if (worldKey != this.worldKey) return AIR_STATE_ID
         if (y !in standaloneHeightRange) return AIR_STATE_ID
         val chunkPos = ChunkPos(x shr 4, z shr 4)
-        val chunk = chunkCache[chunkPos] ?: loadChunk(chunkPos) ?: return AIR_STATE_ID
+        // Never synchronously generate/load chunks from random gameplay queries.
+        // Blocking here can run full worldgen on Netty event-loop threads.
+        val chunk = cachedChunk(chunkPos)
+        if (chunk == null) {
+            scheduleLookupPrefetch(chunkPos)
+            return AIR_STATE_ID
+        }
         return blockStateId(chunk, x and 15, y, z and 15)
     }
 
@@ -168,42 +182,151 @@ class ChunkFutureConnectedWorldGenerator(
     override fun blockStateAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? {
         if (worldKey != this.worldKey) return null
         if (y !in standaloneHeightRange) return AIR_STATE_ID
-        val chunk = chunkCache[ChunkPos(x shr 4, z shr 4)] ?: return null
+        val chunkPos = ChunkPos(x shr 4, z shr 4)
+        val chunk = cachedChunk(chunkPos)
+        if (chunk == null) {
+            scheduleLookupPrefetch(chunkPos)
+            return null
+        }
         return blockStateId(chunk, x and 15, y, z and 15)
     }
 
     override fun rawBrightnessAt(worldKey: String, x: Int, y: Int, z: Int): Int {
         if (worldKey != this.worldKey) return 0
-        val chunk = chunkCache[ChunkPos(x shr 4, z shr 4)] ?: loadChunk(ChunkPos(x shr 4, z shr 4)) ?: return 0
+        val chunkPos = ChunkPos(x shr 4, z shr 4)
+        val chunk = cachedChunk(chunkPos)
+        if (chunk == null) {
+            scheduleLookupPrefetch(chunkPos)
+            return 0
+        }
         val surface = chunk.surfaceHeightAt(x and 15, z and 15) ?: chunk.surfaceHeight
         return if (y > surface) 15 else 0
     }
 
     override fun rawBrightnessAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? {
         if (worldKey != this.worldKey) return null
-        val chunk = chunkCache[ChunkPos(x shr 4, z shr 4)] ?: return null
+        val chunkPos = ChunkPos(x shr 4, z shr 4)
+        val chunk = cachedChunk(chunkPos)
+        if (chunk == null) {
+            scheduleLookupPrefetch(chunkPos)
+            return null
+        }
         val surface = chunk.surfaceHeightAt(x and 15, z and 15) ?: chunk.surfaceHeight
         return if (y > surface) 15 else 0
     }
 
-    private fun loadChunk(chunkPos: ChunkPos): StandaloneChunkData? {
-        val context = ChunkGenerationContext(worldKey = worldKey, seed = world.spec.seed, chunkPos = chunkPos)
-        return runCatching { requestChunkData(context).join() }
-            .onFailure { error ->
-                logger.warn(
-                    "Chunk preload failed world={} runtimeWorld={} chunk=({}, {})",
-                    worldKey,
-                    runtimeWorldId,
-                    chunkPos.x,
-                    chunkPos.z,
-                    error
-                )
-            }
-            .getOrNull()
+    override fun generateChunkAsync(context: ChunkGenerationContext): CompletableFuture<GeneratedChunk> {
+        return requestChunkData(context).thenApply(::toGeneratedChunk)
     }
 
-    override fun generateChunkAsync(context: ChunkGenerationContext): CompletableFuture<GeneratedChunk> {
-        return requestChunkData(context).thenApplyAsync(::toGeneratedChunk, CHUNK_POST_PROCESS_EXECUTOR)
+    override fun retainLoadedChunk(chunkPos: ChunkPos) {
+        retainedChunkRefCounts.compute(chunkPos) { _, counter ->
+            val out = counter ?: AtomicInteger(0)
+            out.incrementAndGet()
+            out
+        }
+    }
+
+    override fun releaseLoadedChunk(chunkPos: ChunkPos) {
+        val remaining = retainedChunkRefCounts.computeIfPresent(chunkPos) { _, counter ->
+            if (counter.decrementAndGet() <= 0) null else counter
+        }
+        if (remaining == null) {
+            chunkCache.remove(chunkPos)
+        }
+    }
+
+    private fun cacheChunk(chunkPos: ChunkPos, chunk: StandaloneChunkData) {
+        cacheLookupChunk(chunkPos, chunk)
+        chunkCache[chunkPos] = chunk
+        if (!isChunkRetained(chunkPos)) {
+            chunkCache.remove(chunkPos, chunk)
+        }
+    }
+
+    private fun cachedChunk(chunkPos: ChunkPos): StandaloneChunkData? {
+        val direct = chunkCache[chunkPos]
+        if (direct != null) {
+            cacheLookupChunk(chunkPos, direct)
+            return direct
+        }
+
+        val now = System.nanoTime()
+        val lookup = lookupCache[chunkPos] ?: return null
+        if (lookup.expiresAtNanos <= now) {
+            lookupCache.remove(chunkPos, lookup)
+            return null
+        }
+        lookup.expiresAtNanos = now + lookupTtlNanos
+        maybeMaintainLookupCache()
+        return lookup.chunk
+    }
+
+    private fun isChunkRetained(chunkPos: ChunkPos): Boolean {
+        return retainedChunkRefCounts[chunkPos]?.get()?.let { it > 0 } == true
+    }
+
+    private fun cacheLookupChunk(chunkPos: ChunkPos, chunk: StandaloneChunkData) {
+        val now = System.nanoTime()
+        lookupCache[chunkPos] = LookupCacheEntry(
+            chunk = chunk,
+            expiresAtNanos = now + lookupTtlNanos
+        )
+        maybeMaintainLookupCache(force = lookupCache.size > lookupMaxEntries * 2)
+    }
+
+    private fun scheduleLookupPrefetch(chunkPos: ChunkPos) {
+        if (lookupCache.containsKey(chunkPos)) return
+        val created = CompletableFuture<StandaloneChunkData>()
+        val existing = lookupPrefetchInFlight.putIfAbsent(chunkPos, created)
+        if (existing != null) return
+
+        service.request(
+            worldId = runtimeWorldId,
+            chunkX = chunkPos.x,
+            chunkZ = chunkPos.z,
+            statusKey = "FULL",
+            create = true
+        ).thenApply { result ->
+            resolveStandaloneChunk(
+                ChunkGenerationContext(
+                    worldKey = worldKey,
+                    seed = worldSeed,
+                    chunkPos = chunkPos,
+                    isCancelled = { false }
+                ),
+                result
+            )
+        }.whenComplete { chunk, throwable ->
+            try {
+                if (throwable == null && chunk != null) {
+                    cacheLookupChunk(chunkPos, chunk)
+                    created.complete(chunk)
+                } else if (throwable != null) {
+                    created.completeExceptionally(throwable)
+                }
+            } finally {
+                lookupPrefetchInFlight.remove(chunkPos, created)
+            }
+        }
+    }
+
+    private fun maybeMaintainLookupCache(force: Boolean = false) {
+        val tick = lookupMaintenanceCounter.incrementAndGet()
+        if (!force && (tick and 1023L) != 0L) return
+        val now = System.nanoTime()
+        var oversize = (lookupCache.size - lookupMaxEntries).coerceAtLeast(0)
+        for ((key, entry) in lookupCache) {
+            if (entry.expiresAtNanos <= now) {
+                lookupCache.remove(key, entry)
+                continue
+            }
+            if (oversize > 0 && retainedChunkRefCounts[key]?.get()?.let { it > 0 } != true) {
+                if (lookupCache.remove(key, entry)) {
+                    oversize--
+                }
+            }
+        }
     }
 
     private fun toGeneratedChunk(chunk: StandaloneChunkData): GeneratedChunk {
@@ -469,16 +592,19 @@ class ChunkFutureConnectedWorldGenerator(
 
     companion object {
         private val INSTANCE_SEQ = AtomicLong(0L)
-        private val CHUNK_POST_PROCESS_THREAD_ID = AtomicInteger(1)
-        private val CHUNK_POST_PROCESS_EXECUTOR: ExecutorService = Executors.newFixedThreadPool(
-            configuredChunkPostProcessWorkers()
-        ) { runnable ->
-            Thread(runnable, "aerogel-chunk-postprocess-${CHUNK_POST_PROCESS_THREAD_ID.getAndIncrement()}").apply {
-                isDaemon = true
-                priority = Thread.NORM_PRIORITY
-            }
-        }
-        private const val DEFAULT_CHUNK_POST_PROCESS_WORKERS = 4
+        private val STANDALONE_WORLD_ADAPTER = StandaloneWorldAdapter()
+        private val lookupTtlNanos: Long = TimeUnit.SECONDS.toNanos(
+            System.getProperty("aerogel.chunk.lookup-cache-ttl-seconds")
+                ?.toLongOrNull()
+                ?.coerceIn(5L, 600L)
+                ?: 45L
+        )
+        private val lookupMaxEntries: Int = (
+            System.getProperty("aerogel.chunk.lookup-cache-max-entries")
+                ?.toIntOrNull()
+                ?.coerceAtLeast(2_048)
+                ?: 65_536
+            )
         private const val WORLD_MIN_Y = -64
         private const val WORLD_MAX_Y = 319
         private const val SECTION_SIZE = 16
@@ -495,16 +621,5 @@ class ChunkFutureConnectedWorldGenerator(
         private const val HEIGHTMAP_MASK = (1L shl HEIGHTMAP_BITS) - 1L
 
         private val BIOME_PLAINS = RegistryCodec.entryIndex("minecraft:worldgen/biome", "minecraft:plains") ?: 0
-
-        private fun configuredChunkPostProcessWorkers(): Int {
-            val configured = System.getProperty("aerogel.chunkfuture.postprocess-workers")
-                ?.toIntOrNull()
-                ?.coerceAtLeast(1)
-            if (configured != null) return configured
-            return minOf(
-                Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
-                DEFAULT_CHUNK_POST_PROCESS_WORKERS
-            ).coerceAtLeast(1)
-        }
     }
 }

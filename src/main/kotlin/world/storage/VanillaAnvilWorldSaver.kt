@@ -147,12 +147,12 @@ object VanillaAnvilWorldSaver {
         val worldMap = persistedChunkLightingByWorld[worldKey] ?: return generated
         val lighting = worldMap[chunkPos] ?: return generated
         return generated.copy(
-            skyLightMask = lighting.skyLightMask.copyOf(),
-            blockLightMask = lighting.blockLightMask.copyOf(),
-            emptySkyLightMask = lighting.emptySkyLightMask.copyOf(),
-            emptyBlockLightMask = lighting.emptyBlockLightMask.copyOf(),
-            skyLight = lighting.skyLight.map { it.copyOf() },
-            blockLight = lighting.blockLight.map { it.copyOf() }
+            skyLightMask = lighting.skyLightMask,
+            blockLightMask = lighting.blockLightMask,
+            emptySkyLightMask = lighting.emptySkyLightMask,
+            emptyBlockLightMask = lighting.emptyBlockLightMask,
+            skyLight = lighting.skyLight,
+            blockLight = lighting.blockLight
         )
     }
 
@@ -189,12 +189,12 @@ object VanillaAnvilWorldSaver {
 
         val merged = sectionLightArraysToPersistedLighting(mergedSkyBySection, mergedBlockBySection) ?: return generated
         return generated.copy(
-            skyLightMask = merged.skyLightMask.copyOf(),
-            blockLightMask = merged.blockLightMask.copyOf(),
-            emptySkyLightMask = merged.emptySkyLightMask.copyOf(),
-            emptyBlockLightMask = merged.emptyBlockLightMask.copyOf(),
-            skyLight = merged.skyLight.map { it.copyOf() },
-            blockLight = merged.blockLight.map { it.copyOf() }
+            skyLightMask = merged.skyLightMask,
+            blockLightMask = merged.blockLightMask,
+            emptySkyLightMask = merged.emptySkyLightMask,
+            emptyBlockLightMask = merged.emptyBlockLightMask,
+            skyLight = merged.skyLight,
+            blockLight = merged.blockLight
         )
     }
 
@@ -211,11 +211,11 @@ object VanillaAnvilWorldSaver {
         val remapped = ArrayList<HeightmapData>(max(generated.heightmaps.size, persistedByType.size))
         for (entry in generated.heightmaps) {
             val values = persistedByType[entry.typeId] ?: entry.values
-            remapped.add(HeightmapData(typeId = entry.typeId, values = values.copyOf()))
+            remapped.add(HeightmapData(typeId = entry.typeId, values = values))
         }
         for ((typeId, values) in persistedByType) {
             if (remapped.any { it.typeId == typeId }) continue
-            remapped.add(HeightmapData(typeId = typeId, values = values.copyOf()))
+            remapped.add(HeightmapData(typeId = typeId, values = values))
         }
         return generated.copy(heightmaps = remapped)
     }

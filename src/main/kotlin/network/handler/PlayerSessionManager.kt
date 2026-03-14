@@ -55,6 +55,7 @@ import org.macaroon3145.world.ThrownItemSnapshot
 import org.macaroon3145.world.VanillaBlockBreakingSpeed
 import org.macaroon3145.world.VanillaMiningRules
 import org.macaroon3145.world.VanillaWaterSubmersion
+import org.macaroon3145.world.LoadedChunkCacheWorldGenerator
 import org.macaroon3145.world.WorldManager
 import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
@@ -567,6 +568,15 @@ data class EncodedStackSection(
     private val gamemodeCompletionCandidates = listOf("survival", "creative", "adventure", "spectator")
     private val nextEntityId = AtomicInteger(1)
     private val sessions = ConcurrentHashMap<ChannelId, PlayerSession>()
+    private val activeChunkStreamTargets = ConcurrentHashMap<ChannelId, ChunkStreamTarget>()
+    private val chunkLoadBenchLock = Any()
+    private var chunkLoadBenchAccumChunks = 0L
+    private var chunkLoadBenchAccumNanos = 0L
+    private var chunkLoadBenchAccumBuildNanos = 0L
+    private var chunkLoadBenchAccumPacketNanos = 0L
+    private var chunkLoadBenchAccumUnloadNanos = 0L
+    private var chunkLoadBenchAccumStaleChunks = 0L
+    private var chunkLoadBenchAccumStaleNanos = 0L
     private val itemTextMetaByPlayerUuid = ConcurrentHashMap<UUID, PlayerItemTextMeta>()
     private val contexts = ConcurrentHashMap<ChannelId, ChannelHandlerContext>()
     private val channelFlushStates = ConcurrentHashMap<ChannelId, ChannelFlushState>()
@@ -1602,7 +1612,7 @@ data class EncodedStackSection(
             )
             syncPlayerAbilities(session, ctx, flush = false)
             ctx.write(PlayPackets.gameStateStartLoadingPacket())
-            resetRespawningSessionChunkView(session, ctx)
+            resetRespawningSessionChunkView(session, ctx, cacheWorldKey = oldWorldKey)
             requestChunkStream(session, ctx, targetWorld, targetChunkX, targetChunkZ, session.chunkRadius)
 
             for (other in newViewers) {
@@ -8031,12 +8041,14 @@ data class EncodedStackSection(
     private fun resetRespawningSessionChunkView(
         session: PlayerSession,
         ctx: ChannelHandlerContext,
-        sendUnloadPackets: Boolean = true
+        sendUnloadPackets: Boolean = true,
+        cacheWorldKey: String = session.worldKey
     ) {
         // Invalidate any in-flight stream generation from pre-respawn state.
         session.chunkStreamVersion.incrementAndGet()
         session.chunkStreamInFlight.set(false)
         session.pendingChunkTarget.set(null)
+        activeChunkStreamTargets.remove(session.channelId)
         session.targetChunks.clear()
         session.generatingChunks.clear()
         session.visibleDroppedItemEntityIds.clear()
@@ -8049,6 +8061,7 @@ data class EncodedStackSection(
         session.animalTrackerStates.clear()
         val toUnload = ArrayList<ChunkPos>(session.loadedChunks)
         session.loadedChunks.clear()
+        releaseLoadedChunkCaches(cacheWorldKey, toUnload)
         if (sendUnloadPackets) {
             for (pos in toUnload) {
                 ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
@@ -8431,6 +8444,7 @@ data class EncodedStackSection(
             }
         }
         val removed = sessions.remove(channelId) ?: return
+        activeChunkStreamTargets.remove(channelId)
         val removedSnapshot = playerPersistenceSnapshot(removed)
         pendingOfflinePlayerPersistenceByUuid[removed.profile.uuid] = removedSnapshot
         contexts.remove(channelId)
@@ -8459,6 +8473,8 @@ data class EncodedStackSection(
             }
         }
         removeRetainedBaseChunksForSession(removed)
+        releaseLoadedChunkCaches(removed.worldKey, removed.loadedChunks)
+        removed.loadedChunks.clear()
 
         val removeEntitiesPacket = PlayPackets.removeEntitiesPacket(intArrayOf(removed.entityId))
         val removeInfoPacket = PlayPackets.playerInfoRemovePacket(listOf(removed.profile.uuid))
@@ -9709,9 +9725,10 @@ data class EncodedStackSection(
         // Pick-block pending state must only live for the next matching creative slot update.
         session.pendingPickedBlockStateId = 0
 
-        val cached = resolvePickedBlockData(world, x, y, z, cachedOnly = true, includeData = includeData)
-        if (cached == null) return
-        applyPickedBlockData(session, ctx, cached, includeData = includeData)
+        val picked = resolvePickedBlockData(world, x, y, z, cachedOnly = true, includeData = includeData)
+            ?: resolvePickedBlockData(world, x, y, z, cachedOnly = false, includeData = includeData)
+            ?: return
+        applyPickedBlockData(session, ctx, picked, includeData = includeData)
     }
 
     private fun resolvePickedBlockData(
@@ -23102,6 +23119,19 @@ data class EncodedStackSection(
     private const val ENTITY_ANIMATION_CRITICAL_HIT = 4
     private const val KNOCKBACK_Y_PRE_GRAVITY_COMPENSATION = 0.08
 
+    private fun releaseLoadedChunkCache(world: org.macaroon3145.world.World, chunkPos: ChunkPos) {
+        val cacheAware = world.generator as? LoadedChunkCacheWorldGenerator ?: return
+        cacheAware.releaseLoadedChunk(chunkPos)
+    }
+
+    private fun releaseLoadedChunkCaches(worldKey: String, chunks: Collection<ChunkPos>) {
+        if (chunks.isEmpty()) return
+        val world = WorldManager.world(worldKey) ?: return
+        for (chunkPos in chunks) {
+            releaseLoadedChunkCache(world, chunkPos)
+        }
+    }
+
     private fun chunkStreamBatchWorkers(): Int = ChunkStreamingService.maxWorkerCount().coerceAtLeast(1)
 
     private fun requestChunkStream(
@@ -23112,14 +23142,22 @@ data class EncodedStackSection(
         centerChunkZ: Int,
         radius: Int
     ) {
+        fun sameTarget(a: ChunkStreamTarget?, x: Int, z: Int, r: Int): Boolean {
+            return a != null && a.centerChunkX == x && a.centerChunkZ == z && a.radius == r
+        }
+
         // Deduplicate identical targets while a stream is in flight.
         if (session.chunkStreamInFlight.get()) {
             val pending = session.pendingChunkTarget.get()
+            val active = activeChunkStreamTargets[session.channelId]
             if (pending != null &&
                 pending.centerChunkX == centerChunkX &&
                 pending.centerChunkZ == centerChunkZ &&
                 pending.radius == radius
             ) {
+                return
+            }
+            if (sameTarget(active, centerChunkX, centerChunkZ, radius)) {
                 return
             }
         }
@@ -23135,6 +23173,7 @@ data class EncodedStackSection(
             val next = session.pendingChunkTarget.getAndSet(null)
             if (next == null || !ctx.channel().isActive) {
                 session.chunkStreamInFlight.set(false)
+                activeChunkStreamTargets.remove(session.channelId)
                 val race = session.pendingChunkTarget.get()
                 if (race != null && session.chunkStreamInFlight.compareAndSet(false, true)) {
                     ctx.executor().execute { drain() }
@@ -23142,22 +23181,39 @@ data class EncodedStackSection(
                 return
             }
 
-            // Drop stale targets captured while player kept moving.
-            if (next.centerChunkX != session.centerChunkX ||
+            // Rebase stale pending target to current player center immediately.
+            // This avoids a cancel/requeue spin while moving quickly across chunks.
+            val streamTarget = if (
+                next.centerChunkX != session.centerChunkX ||
                 next.centerChunkZ != session.centerChunkZ ||
                 next.radius != session.chunkRadius ||
                 next.streamId != session.chunkStreamVersion.get()
             ) {
-                ctx.executor().execute { drain() }
-                return
+                ChunkStreamTarget(
+                    streamId = session.chunkStreamVersion.get(),
+                    centerChunkX = session.centerChunkX,
+                    centerChunkZ = session.centerChunkZ,
+                    radius = session.chunkRadius
+                )
+            } else {
+                next
             }
+            activeChunkStreamTargets[session.channelId] = streamTarget
 
             // Keep client chunk center/limit synchronized with server-side cap.
-            ctx.write(PlayPackets.updateViewDistancePacket(next.radius))
-            ctx.write(PlayPackets.updateViewPositionPacket(next.centerChunkX, next.centerChunkZ))
+            ctx.write(PlayPackets.updateViewDistancePacket(streamTarget.radius))
+            ctx.write(PlayPackets.updateViewPositionPacket(streamTarget.centerChunkX, streamTarget.centerChunkZ))
             ctx.write(PlayPackets.chunkBatchStartPacket())
+            val coldStartStream = session.loadedChunks.isEmpty()
+            if (coldStartStream) {
+                ctx.flush()
+            }
 
-            val targetCoords = ChunkStreamingService.buildSquareCoords(next.centerChunkX, next.centerChunkZ, next.radius)
+            val targetCoords = ChunkStreamingService.buildSquareCoords(
+                streamTarget.centerChunkX,
+                streamTarget.centerChunkZ,
+                streamTarget.radius
+            )
             val targetKeys = HashSet<ChunkPos>(targetCoords.size)
             val toLoadAll = ArrayList<ChunkPos>()
             for (coord in targetCoords) {
@@ -23180,10 +23236,21 @@ data class EncodedStackSection(
             }
 
             val shouldSendCurrentTarget = {
-                next.streamId == session.chunkStreamVersion.get() &&
-                    next.centerChunkX == session.centerChunkX &&
-                    next.centerChunkZ == session.centerChunkZ &&
-                    next.radius == session.chunkRadius
+                streamTarget.streamId == session.chunkStreamVersion.get() &&
+                    streamTarget.centerChunkX == session.centerChunkX &&
+                    streamTarget.centerChunkZ == session.centerChunkZ &&
+                    streamTarget.radius == session.chunkRadius
+            }
+            // Abort stale stream work as soon as the player's current target changes.
+            // Keeping old streams alive until completion causes stale chunk amplification.
+            val shouldKeepStreamActive = {
+                ctx.channel().isActive && shouldSendCurrentTarget()
+            }
+            val shouldSendCoordInCurrentView: (ChunkPos) -> Boolean = { coord ->
+                val dx = coord.x - session.centerChunkX
+                val dz = coord.z - session.centerChunkZ
+                val radiusNow = session.chunkRadius
+                (dx * dx + dz * dz) <= (radiusNow * radiusNow)
             }
             val streamStartedAtNanos = System.nanoTime()
 
@@ -23192,8 +23259,21 @@ data class EncodedStackSection(
                 shouldContinue: () -> Boolean = { true },
                 onDone: () -> Unit
             ) {
+                fun pruneLoadedChunksToTarget() {
+                    val removedChunks = ArrayList<ChunkPos>()
+                    for (loaded in session.loadedChunks) {
+                        if (unloadTargetKeys.contains(loaded)) continue
+                        if (session.loadedChunks.remove(loaded)) {
+                            removedChunks.add(loaded)
+                        }
+                    }
+                    for (chunkPos in removedChunks) {
+                        releaseLoadedChunkCache(world, chunkPos)
+                    }
+                }
+
                 if (!ctx.channel().isActive || !shouldContinue()) {
-                    session.loadedChunks.retainAll(unloadTargetKeys)
+                    pruneLoadedChunksToTarget()
                     refreshRetainedBaseChunksForSession(session)
                     onDone()
                     return
@@ -23212,54 +23292,89 @@ data class EncodedStackSection(
                     onDone()
                     return
                 }
-                for (pos in toUnload) {
+                val unloadBatchSize = 64
+                fun processUnloadBatch(start: Int) {
                     if (!ctx.channel().isActive || !shouldContinue()) {
-                        session.loadedChunks.retainAll(unloadTargetKeys)
+                        pruneLoadedChunksToTarget()
                         refreshRetainedBaseChunksForSession(session)
                         onDone()
                         return
                     }
-                    hideDroppedItemsForChunk(session, ctx, pos, world.droppedItemEntityIdsInChunk(pos.x, pos.z))
-                    if (includeFallingBlocksOnUnload) {
-                        hideFallingBlocksForChunk(session, ctx, pos, world.fallingBlockEntityIdsInChunk(pos.x, pos.z))
+
+                    var index = start
+                    var processed = 0
+                    while (index < toUnload.size && processed < unloadBatchSize) {
+                        val pos = toUnload[index]
+                        hideDroppedItemsForChunk(session, ctx, pos, world.droppedItemEntityIdsInChunk(pos.x, pos.z))
+                        if (includeFallingBlocksOnUnload) {
+                            hideFallingBlocksForChunk(session, ctx, pos, world.fallingBlockEntityIdsInChunk(pos.x, pos.z))
+                        }
+                        if (includeThrownItemsOnUnload) {
+                            hideThrownItemsForChunk(session, ctx, pos, world.thrownItemEntityIdsInChunk(pos.x, pos.z))
+                        }
+                        if (includeAnimalsOnUnload) {
+                            hideAnimalsForChunk(session, ctx, pos, world.animalEntityIdsInChunk(pos.x, pos.z))
+                        }
+                        if (session.loadedChunks.remove(pos)) {
+                            releaseLoadedChunkCache(world, pos)
+                        }
+                        ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
+                        index++
+                        processed++
                     }
-                    if (includeThrownItemsOnUnload) {
-                        hideThrownItemsForChunk(session, ctx, pos, world.thrownItemEntityIdsInChunk(pos.x, pos.z))
+
+                    if (index < toUnload.size) {
+                        ctx.flush()
+                        ctx.executor().execute { processUnloadBatch(index) }
+                        return
                     }
-                    if (includeAnimalsOnUnload) {
-                        hideAnimalsForChunk(session, ctx, pos, world.animalEntityIdsInChunk(pos.x, pos.z))
-                    }
-                    session.loadedChunks.remove(pos)
-                    ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
+
+                    // Defensive pruning: keep bookkeeping bounded to current target footprint.
+                    pruneLoadedChunksToTarget()
+                    refreshRetainedBaseChunksForSession(session)
+                    onDone()
                 }
-                // Defensive pruning: keep bookkeeping bounded to current target footprint.
-                session.loadedChunks.retainAll(unloadTargetKeys)
-                refreshRetainedBaseChunksForSession(session)
-                onDone()
+
+                processUnloadBatch(0)
             }
 
-            fun finishStream(totalSentCount: Int) {
+            fun finishStream(streamResult: ChunkStreamingService.StreamResult) {
                 ctx.executor().execute {
                     if (ctx.channel().isActive) {
-                        if (next.streamId != session.chunkStreamVersion.get()) {
+                        if (streamTarget.streamId != session.chunkStreamVersion.get()) {
+                            activeChunkStreamTargets.remove(session.channelId)
                             drain()
                             return@execute
                         }
                         // Load-first, unload-after to avoid transparent border holes.
                         unloadOutsideTarget(
                             unloadTargetKeys = targetKeys,
-                            shouldContinue = { next.streamId == session.chunkStreamVersion.get() }
+                            shouldContinue = { streamTarget.streamId == session.chunkStreamVersion.get() }
                         ) {
-                            val elapsedMs = (System.nanoTime() - streamStartedAtNanos).coerceAtLeast(0L) / 1_000_000.0
-                            val summaryPacket = PlayPackets.systemChatPacket(
-                                "청크 로드 완료: ${totalSentCount}개, ${String.format(Locale.ROOT, "%.1f", elapsedMs)}ms (loaded=${session.loadedChunks.size}, target=${targetKeys.size})"
+                            val elapsedNanos = (System.nanoTime() - streamStartedAtNanos).coerceAtLeast(0L)
+                            val unloadNanos = (elapsedNanos - streamResult.buildNanos - streamResult.packetNanos)
+                                .coerceAtLeast(0L)
+                            val benchLog = recordChunkLoadBench(
+                                ChunkLoadBenchSample(
+                                    sentChunks = streamResult.sentChunks,
+                                    elapsedNanos = elapsedNanos,
+                                    buildNanos = streamResult.buildNanos,
+                                    packetNanos = streamResult.packetNanos,
+                                    unloadNanos = unloadNanos,
+                                    stale = false
+                                )
                             )
-                            ctx.write(PlayPackets.chunkBatchFinishedPacket(totalSentCount))
-                            ctx.writeAndFlush(summaryPacket)
+                            ctx.write(PlayPackets.chunkBatchFinishedPacket(streamResult.sentChunks))
+                            ctx.flush()
+                            if (benchLog != null) {
+                                logger.info(benchLog)
+                            }
+                            activeChunkStreamTargets.remove(session.channelId)
                             drain()
                         }
                         return@execute
                     }
+                    activeChunkStreamTargets.remove(session.channelId)
                     drain()
                 }
             }
@@ -23270,7 +23385,8 @@ data class EncodedStackSection(
                 coordsInput = toLoad,
                 loadedChunks = session.loadedChunks,
                 generatingChunks = session.generatingChunks,
-                shouldSend = shouldSendCurrentTarget,
+                shouldSend = shouldKeepStreamActive,
+                shouldSendCoord = shouldSendCoordInCurrentView,
                 onChunkSent = { chunkPos, droppedItems ->
                     if (includeDroppedItemsInStream && droppedItems.isNotEmpty()) {
                         sendDroppedItemsForChunk(session, ctx, world, droppedItems)
@@ -23297,10 +23413,13 @@ data class EncodedStackSection(
                         resendChestLidEventsForChunkToSession(session, ctx, world, chunkPos)
                     }
                 },
-                workerLimit = chunkStreamBatchWorkers()
-            ).whenComplete { sentCount, error ->
+                workerLimit = chunkStreamBatchWorkers(),
+                latencySensitive = true,
+                flushFirstChunkImmediately = coldStartStream
+            ).whenComplete { streamResult, error ->
                 ctx.executor().execute {
                     if (!ctx.channel().isActive) {
+                        activeChunkStreamTargets.remove(session.channelId)
                         drain()
                         return@execute
                     }
@@ -23313,7 +23432,25 @@ data class EncodedStackSection(
                             session.chunkRadius
                         ).toHashSet()
                         unloadOutsideTarget(latestTarget) {
+                            val elapsedNanos = (System.nanoTime() - streamStartedAtNanos).coerceAtLeast(0L)
+                            val result = streamResult ?: ChunkStreamingService.StreamResult()
+                            val unloadNanos = (elapsedNanos - result.buildNanos - result.packetNanos)
+                                .coerceAtLeast(0L)
+                            val benchLog = recordChunkLoadBench(
+                                ChunkLoadBenchSample(
+                                    sentChunks = result.sentChunks,
+                                    elapsedNanos = elapsedNanos,
+                                    buildNanos = result.buildNanos,
+                                    packetNanos = result.packetNanos,
+                                    unloadNanos = unloadNanos,
+                                    stale = true
+                                )
+                            )
+                            if (benchLog != null) {
+                                logger.info(benchLog)
+                            }
                             ctx.flush()
+                            activeChunkStreamTargets.remove(session.channelId)
                             drain()
                         }
                         return@execute
@@ -23322,9 +23459,9 @@ data class EncodedStackSection(
                         logger.warn(
                             "Chunk stream failed for player={} at center=({}, {}) radius={}; closing loading state",
                             session.profile.username,
-                            next.centerChunkX,
-                            next.centerChunkZ,
-                            next.radius,
+                            streamTarget.centerChunkX,
+                            streamTarget.centerChunkZ,
+                            streamTarget.radius,
                             error
                         )
                         // Avoid "Loading terrain..." stall on persistent generator failures.
@@ -23332,14 +23469,15 @@ data class EncodedStackSection(
                         // to request a fresh stream.
                         unloadOutsideTarget(
                             unloadTargetKeys = targetKeys,
-                            shouldContinue = { next.streamId == session.chunkStreamVersion.get() }
+                            shouldContinue = { streamTarget.streamId == session.chunkStreamVersion.get() }
                         ) {
                             ctx.writeAndFlush(PlayPackets.chunkBatchFinishedPacket(0))
+                            activeChunkStreamTargets.remove(session.channelId)
                             drain()
                         }
                         return@execute
                     }
-                    finishStream(sentCount ?: 0)
+                    finishStream(streamResult ?: ChunkStreamingService.StreamResult())
                 }
             }
         }
@@ -23347,6 +23485,65 @@ data class EncodedStackSection(
         // Do not block stream start on prewarm; overlapping avoids front-loaded worker idle time.
         ChunkStreamingService.prewarmAsync(world)
         ctx.executor().execute { drain() }
+    }
+
+    private data class ChunkLoadBenchSample(
+        val sentChunks: Int,
+        val elapsedNanos: Long,
+        val buildNanos: Long,
+        val packetNanos: Long,
+        val unloadNanos: Long,
+        val stale: Boolean
+    )
+
+    private fun recordChunkLoadBench(sample: ChunkLoadBenchSample): String? {
+        if (sample.sentChunks <= 0 || sample.elapsedNanos <= 0L) return null
+        synchronized(chunkLoadBenchLock) {
+            chunkLoadBenchAccumChunks += sample.sentChunks.toLong()
+            chunkLoadBenchAccumNanos += sample.elapsedNanos.coerceAtLeast(0L)
+            chunkLoadBenchAccumBuildNanos += sample.buildNanos.coerceAtLeast(0L)
+            chunkLoadBenchAccumPacketNanos += sample.packetNanos.coerceAtLeast(0L)
+            chunkLoadBenchAccumUnloadNanos += sample.unloadNanos.coerceAtLeast(0L)
+            if (sample.stale) {
+                chunkLoadBenchAccumStaleChunks += sample.sentChunks.toLong()
+                chunkLoadBenchAccumStaleNanos += sample.elapsedNanos.coerceAtLeast(0L)
+            }
+            if (chunkLoadBenchAccumChunks < 100L || chunkLoadBenchAccumNanos <= 0L) return null
+
+            val chunks = chunkLoadBenchAccumChunks.toDouble().coerceAtLeast(1.0)
+            val totalSecondsPer100 = (chunkLoadBenchAccumNanos.toDouble() / chunks) * 100.0 / 1_000_000_000.0
+            val buildSecondsPer100 = (chunkLoadBenchAccumBuildNanos.toDouble() / chunks) * 100.0 / 1_000_000_000.0
+            val packetSecondsPer100 = (chunkLoadBenchAccumPacketNanos.toDouble() / chunks) * 100.0 / 1_000_000_000.0
+            val unloadSecondsPer100 = (chunkLoadBenchAccumUnloadNanos.toDouble() / chunks) * 100.0 / 1_000_000_000.0
+            val staleRatioPercent = if (chunkLoadBenchAccumChunks <= 0L) {
+                0.0
+            } else {
+                (chunkLoadBenchAccumStaleChunks.toDouble() * 100.0) / chunkLoadBenchAccumChunks.toDouble()
+            }
+            val staleSecondsPer100 = if (chunkLoadBenchAccumStaleChunks > 0L && chunkLoadBenchAccumStaleNanos > 0L) {
+                (chunkLoadBenchAccumStaleNanos.toDouble() / chunkLoadBenchAccumStaleChunks.toDouble()) * 100.0 / 1_000_000_000.0
+            } else {
+                0.0
+            }
+            val windows = (chunkLoadBenchAccumChunks / 100L).coerceAtLeast(1L)
+            val label = if (windows == 1L) "window=100" else "window=100 x$windows"
+
+            chunkLoadBenchAccumChunks = 0L
+            chunkLoadBenchAccumNanos = 0L
+            chunkLoadBenchAccumBuildNanos = 0L
+            chunkLoadBenchAccumPacketNanos = 0L
+            chunkLoadBenchAccumUnloadNanos = 0L
+            chunkLoadBenchAccumStaleChunks = 0L
+            chunkLoadBenchAccumStaleNanos = 0L
+
+            return "Chunk load benchmark avg_per_100_chunks=${"%.3f".format(Locale.ROOT, totalSecondsPer100)}s " +
+                "(GEN=${"%.3f".format(Locale.ROOT, buildSecondsPer100)}s " +
+                "PACKET=${"%.3f".format(Locale.ROOT, packetSecondsPer100)}s " +
+                "UNLOAD=${"%.3f".format(Locale.ROOT, unloadSecondsPer100)}s " +
+                "STALE=${"%.1f".format(Locale.ROOT, staleRatioPercent)}% " +
+                "STALE_avg_per_100=${"%.3f".format(Locale.ROOT, staleSecondsPer100)}s " +
+                "$label)"
+        }
     }
 
 }
