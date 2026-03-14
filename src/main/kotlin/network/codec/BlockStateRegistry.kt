@@ -12,7 +12,6 @@ object BlockStateRegistry {
     )
 
     private val json = Json { ignoreUnknownKeys = true }
-
     private val itemToBlock: Map<Int, String> by lazy {
         val root = loadRoot()
         val obj = root["itemToBlock"]?.jsonObject ?: return@lazy emptyMap()
@@ -103,6 +102,26 @@ object BlockStateRegistry {
     fun itemIdForBlock(blockKey: String): Int? = blockToItem[blockKey]
 
     fun defaultStateId(blockKey: String): Int? = defaultByBlock[blockKey]
+
+    /**
+     * Accepts either:
+     * - a plain block key: `minecraft:stone`
+     * - a full state key: `minecraft:oak_log[axis=x]`
+     */
+    fun stateIdForBlockOrStateKey(blockOrStateKey: String): Int? {
+        val bracket = blockOrStateKey.indexOf('[')
+        if (bracket < 0 || !blockOrStateKey.endsWith("]")) {
+            return defaultByBlock[blockOrStateKey]
+        }
+
+        val parsed = parseStateKey(blockOrStateKey)
+        if (parsed.properties.isEmpty()) {
+            return defaultByBlock[parsed.blockKey]
+        }
+        return stateId(parsed.blockKey, parsed.properties)
+            ?: stateToId[blockOrStateKey]
+            ?: defaultByBlock[parsed.blockKey]
+    }
 
     fun stateId(blockKey: String, properties: Map<String, String>): Int? {
         if (properties.isEmpty()) return defaultByBlock[blockKey]

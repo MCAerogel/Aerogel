@@ -23,10 +23,10 @@ import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Comparator
 import java.util.Locale
+import java.util.Base64
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.CopyOnWriteArrayList
@@ -103,7 +103,6 @@ object BlockEditorModule {
         host = configuredHost
         advertisedHost = resolveAdvertisedHost(configuredHost)
         privateKey = generatePrivateKey()
-        logger.info("Block editor started on {}", securedPublicUrl())
     }
 
     fun stop() {
@@ -119,6 +118,16 @@ object BlockEditorModule {
     fun publicUrl(): String = "http://$advertisedHost:$port"
 
     fun securedPublicUrl(): String = "${publicUrl()}/?privatekey=$privateKey"
+
+    fun maskedSecuredPublicUrl(visiblePrefix: Int = 8, visibleSuffix: Int = 8): String {
+        val key = privateKey
+        val masked = if (key.length <= visiblePrefix + visibleSuffix) {
+            key
+        } else {
+            "${key.take(visiblePrefix)}...${key.takeLast(visibleSuffix)}"
+        }
+        return "${publicUrl()}/?privatekey=$masked"
+    }
 
     private fun resolveAdvertisedHost(boundHost: String): String {
         val normalized = boundHost.trim().lowercase(Locale.ROOT)
@@ -343,11 +352,9 @@ object BlockEditorModule {
     }
 
     private fun generatePrivateKey(): String {
-        val randomBytes = ByteArray(64)
+        val randomBytes = ByteArray(PRIVATE_KEY_BYTE_LENGTH)
         SecureRandom().nextBytes(randomBytes)
-        val seed = randomBytes + System.nanoTime().toString().toByteArray(StandardCharsets.UTF_8)
-        val digest = MessageDigest.getInstance("SHA-512").digest(seed)
-        return digest.joinToString("") { b -> "%02x".format(b) }
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes)
     }
 
     private fun sendBytes(exchange: HttpExchange, status: Int, contentType: String, bytes: ByteArray) {
@@ -374,6 +381,8 @@ object BlockEditorModule {
         exchange.responseHeaders.set("Expires", "0")
         sendBytes(exchange, 200, contentType, bytes)
     }
+
+    private const val PRIVATE_KEY_BYTE_LENGTH = 16
 }
 
 private object RealtimeSyncHub {

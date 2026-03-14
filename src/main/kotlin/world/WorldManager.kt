@@ -23,7 +23,7 @@ object WorldManager {
         worlds.clear()
         for (worldKey in builtinWorldKeys) {
             val seed = worldSeeds[worldKey] ?: Random.nextLong()
-            val generator = WorldGenerators.forWorldKey(worldKey)
+            val generator = WorldGenerators.forWorldKey(worldKey, seed)
             val lookupGenerator = generator as? BlockStateLookupWorldGenerator
             val baseProvider: (Int, Int, Int) -> Int = if (lookupGenerator == null) {
                 { _, _, _ -> AIR_STATE_ID }

@@ -1727,6 +1727,7 @@ class DroppedItemSystem(
             NON_COLLIDING_BLOCK_KEYS.size
             ITEM_ID_BY_KEY.size
             ITEM_KEY_BY_ID.size
+            ITEM_MAX_STACK_SIZE_BY_ITEM_ID.size
             ITEM_BUOYANCY_PROFILE_BY_KEY.size
             for (stateId in BlockStateRegistry.allStateIds()) {
                 if (stateId <= 0) continue
@@ -1754,6 +1755,7 @@ class DroppedItemSystem(
             val maxId = ITEM_ID_BY_KEY.values.maxOrNull() ?: -1
             if (maxId < 0) return IntArray(0)
             val out = IntArray(maxId + 1) { DEFAULT_MAX_STACK_SIZE }
+
             val resource = DroppedItemSystem::class.java.classLoader
                 .getResourceAsStream("data/minecraft/item/max_stack_size.json")
                 ?: return out

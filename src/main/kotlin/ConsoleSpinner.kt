@@ -38,7 +38,7 @@ class ConsoleSpinner(
 
     fun clear() {
         if (!interactive || !rendered) return
-        out.print("\r${" ".repeat(lastLineLength)}\r")
+        out.print("\r\u001B[2K")
         out.flush()
         rendered = false
         lastLineLength = 0
@@ -50,12 +50,7 @@ class ConsoleSpinner(
 
     private fun render(line: String) {
         if (interactive) {
-            val paddedLine = if (line.length < lastLineLength) {
-                line + " ".repeat(lastLineLength - line.length)
-            } else {
-                line
-            }
-            out.print("\r$paddedLine")
+            out.print("\r\u001B[2K$line")
             out.flush()
             rendered = true
             lastLineLength = line.length

@@ -829,19 +829,20 @@ object PluginSystem {
         }
         for (jarPath in jarPaths) {
             val descriptorPreview = runCatching { readDescriptor(jarPath) }.getOrNull()
-            val pluginDisplayName = descriptorPreview?.name?.takeIf { it.isNotBlank() }
-                ?: descriptorPreview?.id?.lowercase()
-                ?: jarPath.fileName.toString()
-            val pluginIdLabel = descriptorPreview?.id?.lowercase() ?: jarPath.fileName.toString()
+            if (descriptorPreview == null) {
+                logger.debug("Skipping non-Aerogel plugin jar: {}", jarPath.fileName)
+                continue
+            }
+            val pluginDisplayName = descriptorPreview.name.takeIf { it.isNotBlank() }
+                ?: descriptorPreview.id.lowercase()
+            val pluginIdLabel = descriptorPreview.id.lowercase()
             val progressMessage = ServerI18n.tr("aerogel.log.plugin.load.progress", pluginDisplayName)
             runCatching {
                 DebugConsole.withSpinnerResult(
                     progressMessage = progressMessage,
                     doneMessage = { outcome ->
                         when (outcome) {
-                            PluginLoadOutcome.ENABLED -> if (descriptorPreview == null) {
-                                ServerI18n.tr("aerogel.log.plugin.load.done.unknown", jarPath.fileName.toString())
-                            } else {
+                            PluginLoadOutcome.ENABLED -> {
                                 ServerI18n.tr(
                                     "aerogel.log.plugin.load.done",
                                     pluginDisplayName
@@ -868,7 +869,18 @@ object PluginSystem {
                     loadPluginJar(jarPath, PluginLoadReason.STARTUP)
                 }
             }
-                .onFailure { logger.error("Failed to load plugin jar: {}", jarPath, it) }
+                .onFailure { error ->
+                    if (isClassLoadingFailure(error)) {
+                        val cause = rootCause(error)
+                        logger.warn(
+                            "Plugin '{}' skipped due to missing class dependency: {}",
+                            pluginIdLabel,
+                            cause.message ?: cause.javaClass.name
+                        )
+                    } else {
+                        logger.error("Failed to load plugin jar: {}", jarPath, error)
+                    }
+                }
         }
     }
 
@@ -894,12 +906,29 @@ object PluginSystem {
 
     private fun handlePluginJarChanged(jarPath: Path): Boolean {
         val descriptor = runCatching { readDescriptor(jarPath) }
-            .onFailure { logger.error("Failed to parse changed plugin descriptor: {}", jarPath, it) }
+            .onFailure { error ->
+                if (isMissingPluginDescriptor(error)) {
+                    logger.debug("Ignoring changed non-Aerogel jar: {}", jarPath.fileName)
+                } else {
+                    logger.error("Failed to parse changed plugin descriptor: {}", jarPath, error)
+                }
+            }
             .getOrNull() ?: return false
         val pluginId = descriptor.id.lowercase()
         val loaded = pluginsById[pluginId] ?: return false
         val reloaded = runCatching { reloadPluginWithJar(pluginId, jarPath) }
-            .onFailure { logger.error("Automatic plugin hot-reload failed for '{}'", pluginId, it) }
+            .onFailure { error ->
+                if (isClassLoadingFailure(error)) {
+                    val cause = rootCause(error)
+                    logger.warn(
+                        "Automatic plugin hot-reload skipped for '{}' due to missing class dependency: {}",
+                        pluginId,
+                        cause.message ?: cause.javaClass.name
+                    )
+                } else {
+                    logger.error("Automatic plugin hot-reload failed for '{}'", pluginId, error)
+                }
+            }
             .getOrDefault(false)
         val pluginName = loaded.metadata.name.ifBlank { loaded.metadata.id }
         if (reloaded) {
@@ -1214,6 +1243,41 @@ object PluginSystem {
         (plugin.context.commands as RuntimeCommandRegistrar).close()
         (plugin.context.dataStore as? AsyncPluginDataStore)?.shutdown()
         runCatching { plugin.classLoader.close() }
+    }
+
+    private fun isClassLoadingFailure(error: Throwable): Boolean {
+        return causeChain(error).any { cause ->
+            cause is ClassNotFoundException ||
+                cause is NoClassDefFoundError ||
+                cause is UnsupportedClassVersionError ||
+                cause is ExceptionInInitializerError ||
+                cause is IncompatibleClassChangeError
+        }
+    }
+
+    private fun isMissingPluginDescriptor(error: Throwable): Boolean {
+        return causeChain(error).any { cause ->
+            cause is IllegalStateException &&
+                cause.message?.contains("Missing aerogel-plugin.json", ignoreCase = true) == true
+        }
+    }
+
+    private fun rootCause(error: Throwable): Throwable {
+        var current = error
+        while (true) {
+            val next = current.cause ?: return current
+            if (next === current) return current
+            current = next
+        }
+    }
+
+    private fun causeChain(error: Throwable): Sequence<Throwable> = sequence {
+        val visited = HashSet<Throwable>()
+        var current: Throwable? = error
+        while (current != null && visited.add(current)) {
+            yield(current)
+            current = current.cause
+        }
     }
 
     private fun readDescriptor(jarPath: Path): PluginJarDescriptor {
@@ -3399,6 +3463,19 @@ private class RuntimeWorld(
 
     override fun addTime(deltaTicks: Long): Boolean {
         return PlayerSessionManager.addWorldTimeTicks(key, deltaTicks)
+    }
+
+    override fun pluginInternalSpawnPoint(): Location {
+        val world = WorldManager.world(key) ?: WorldManager.defaultWorld()
+        val spawn = world.spawnPointForPlayer(UUID(0L, 0L))
+        return Location(
+            world = this,
+            x = spawn.x,
+            y = spawn.y,
+            z = spawn.z,
+            yaw = 0f,
+            pitch = 0f
+        )
     }
 
     override fun pluginInternalDropItem(location: Location, item: Item, impulse: Boolean): DroppedItem? {

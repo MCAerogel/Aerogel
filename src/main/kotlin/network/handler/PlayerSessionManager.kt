@@ -29,6 +29,7 @@ import org.macaroon3145.network.item.FoodItemCache
 import org.macaroon3145.network.recipe.CraftingRecipeCache
 import org.macaroon3145.network.recipe.SmeltingRecipeCache
 import org.macaroon3145.network.packet.PlayerSample
+import org.macaroon3145.api.Server
 import org.macaroon3145.api.entity.ArmorSlot
 import org.macaroon3145.api.entity.Item
 import org.macaroon3145.api.event.BlockChangeReason
@@ -784,6 +785,7 @@ data class EncodedStackSection(
         private val persistedOperatorUuids = ConcurrentHashMap.newKeySet<UUID>()
     private val operatorUuids = ConcurrentHashMap.newKeySet<java.util.UUID>()
     private val fluidDependentDropCache = ConcurrentHashMap<Int, List<org.macaroon3145.world.VanillaDrop>>()
+    private val fluidDependentSupportCandidateCache = ConcurrentHashMap<Int, Boolean>()
     private val commandDispatcher = CommandDispatcher.default()
     private val commandContext = object : CommandContext {
         override fun sendConsoleMessage(message: String) {
@@ -1007,6 +1009,7 @@ data class EncodedStackSection(
         itemKeyById.size
         itemIdByKey.size
         itemMaxStackSizeByItemId.size
+        armorEquipSoundKeyByItemKey.size
         creativeNoBreakItemIds.size
         waterBucketItemId
         emptyBucketItemId
@@ -1019,6 +1022,9 @@ data class EncodedStackSection(
         chorusFruitItemId
         shieldItemId
         pigSpawnEggItemId
+        saddleItemId
+        carrotOnAStickItemId
+        pigFoodItemIds.size
         pigTemptItemIds.size
         waterSourceStateId
         CraftingRecipeCache.prewarm(itemIdByKey)
@@ -1042,12 +1048,25 @@ data class EncodedStackSection(
         EGG_THROW_SOUND_ID
         FALL_DAMAGE_TYPE_ID
         PLAYER_ATTACK_DAMAGE_TYPE_ID
+        STARVATION_DAMAGE_TYPE_ID
+        OUT_OF_WORLD_DAMAGE_TYPE_ID
+        furnaceMenuTypeId
+        generic9x1MenuTypeId
+        generic9x2MenuTypeId
+        generic9x3MenuTypeId
+        generic9x4MenuTypeId
+        generic9x5MenuTypeId
+        generic9x6MenuTypeId
+        shulkerBoxMenuTypeId
         vanillaItemAttackProfileByItemKey.size
+        defaultVanillaAttackDamage
+        defaultVanillaAttackSpeed
+        dimensionMinMaxYByWorldKey.size
     }
 
     fun prewarmFluidDependentDropCache() {
         val world = runCatching { WorldManager.defaultWorld() }.getOrNull() ?: return
-        for (stateId in BlockStateRegistry.allStateIds()) {
+        for (stateId in fluidDependentCandidateStateIds()) {
             if (stateId <= 0) continue
             val drops = runCatching {
                 VanillaMiningRules.resolveDrops(world, stateId, -1, 0, 64, 0)
@@ -1057,11 +1076,21 @@ data class EncodedStackSection(
     }
 
     fun prewarmFluidDependentRuntime() {
-        val world = runCatching { WorldManager.defaultWorld() }.getOrNull() ?: return
-        val seed = BlockPos(0, 64, 0)
-        runCatching {
-            breakDependentBlocksForFluidByChunk(world, listOf(seed))
+        for (stateId in fluidDependentCandidateStateIds()) {
+            fluidDependentSupportCandidateCache[stateId]
         }
+    }
+
+    private fun fluidDependentCandidateStateIds(): IntArray {
+        val all = BlockStateRegistry.allStateIds()
+        val out = IntArray(all.size)
+        var size = 0
+        for (stateId in all) {
+            if (stateId <= 0) continue
+            if (!isFluidDependentSupportCandidateState(stateId)) continue
+            out[size++] = stateId
+        }
+        return out.copyOf(size)
     }
 
     data class JoinResult(
@@ -1117,11 +1146,16 @@ data class EncodedStackSection(
         }
         val persisted = effectivePersisted ?: VanillaAnvilWorldSaver.loadPlayerData(profile.uuid)
         val fallbackWorld = WorldManager.world(worldKey) ?: WorldManager.defaultWorld()
+        val apiOverworldSpawn = Server.world("minecraft:overworld")?.spawnPoint
         val fallbackSpawn = if (spawnX.isFinite() && spawnY.isFinite() && spawnZ.isFinite()) {
             Triple(spawnX, spawnY, spawnZ)
         } else {
-            val resolved = fallbackWorld.spawnPointForPlayer(profile.uuid)
-            Triple(resolved.x, resolved.y, resolved.z)
+            if (apiOverworldSpawn != null) {
+                Triple(apiOverworldSpawn.x, apiOverworldSpawn.y, apiOverworldSpawn.z)
+            } else {
+                val resolved = fallbackWorld.spawnPointForPlayer(profile.uuid)
+                Triple(resolved.x, resolved.y, resolved.z)
+            }
         }
         val joinWorldKey = persisted?.worldKey?.takeIf { WorldManager.world(it) != null } ?: worldKey
         val joinX = persisted?.x?.takeIf { it.isFinite() } ?: fallbackSpawn.first
@@ -15026,6 +15060,11 @@ data class EncodedStackSection(
         }
     }
 
+    private data class OpenContainerAnchorKey(
+        val containerType: Int,
+        val anchor: BlockPos
+    )
+
     private fun isChestBlockKey(blockKey: String): Boolean {
         if (blockKey == "minecraft:chest" || blockKey == "minecraft:trapped_chest") return true
         return blockKey != "minecraft:ender_chest" && blockKey.endsWith("_chest")
@@ -15150,15 +15189,25 @@ data class EncodedStackSection(
         chunkPos: ChunkPos
     ) {
         val seen = HashSet<Triple<Int, Int, Int>>()
+        val viewerCountsByAnchor = HashMap<OpenContainerAnchorKey, Int>()
         for (viewer in sessions.values) {
             if (viewer.worldKey != session.worldKey) continue
             if (viewer.openContainerType != CONTAINER_TYPE_CHEST && viewer.openContainerType != CONTAINER_TYPE_ENDER_CHEST) continue
+            val anchor = containerAnchorFor(
+                world,
+                viewer.openContainerType,
+                viewer.openChestX,
+                viewer.openChestY,
+                viewer.openChestZ
+            )
+            val anchorKey = OpenContainerAnchorKey(viewer.openContainerType, anchor)
+            viewerCountsByAnchor[anchorKey] = (viewerCountsByAnchor[anchorKey] ?: 0) + 1
             val positions = chestLidBroadcastPositions(world, viewer.openChestX, viewer.openChestY, viewer.openChestZ)
             for ((px, py, pz) in positions) {
                 if ((px shr 4) != chunkPos.x || (pz shr 4) != chunkPos.z) continue
                 val key = Triple(px, py, pz)
                 if (!seen.add(key)) continue
-                val packets = chestLidPacketsAt(world, session.worldKey, px, py, pz)
+                val packets = chestLidPacketsAt(world, px, py, pz, viewerCountsByAnchor)
                 if (packets.isEmpty()) continue
                 for (packet in packets) {
                     ctx.write(packet)
@@ -15168,6 +15217,45 @@ data class EncodedStackSection(
         if (seen.isNotEmpty()) {
             ctx.flush()
         }
+    }
+
+    private fun chestLidPacketsAt(
+        world: org.macaroon3145.world.World,
+        x: Int,
+        y: Int,
+        z: Int,
+        viewerCountsByAnchor: Map<OpenContainerAnchorKey, Int>
+    ): List<ByteArray> {
+        val stateId = world.blockStateAt(x, y, z)
+        val parsed = BlockStateRegistry.parsedState(stateId) ?: return emptyList()
+        val blockKey = parsed.blockKey
+        if (!isChestBlockKey(blockKey) && blockKey != "minecraft:ender_chest" && blockKey != "minecraft:barrel" && !isShulkerBoxBlockKey(blockKey)) {
+            return emptyList()
+        }
+        val queryContainerType = when {
+            blockKey == "minecraft:ender_chest" -> CONTAINER_TYPE_ENDER_CHEST
+            isChestBlockKey(blockKey) -> CONTAINER_TYPE_CHEST
+            else -> CONTAINER_TYPE_CHEST
+        }
+        val queryAnchor = containerAnchorFor(world, queryContainerType, x, y, z)
+        val viewers = (viewerCountsByAnchor[OpenContainerAnchorKey(queryContainerType, queryAnchor)] ?: 0).coerceIn(0, 255)
+        if (blockKey == "minecraft:barrel") {
+            val properties = HashMap(parsed.properties)
+            properties["open"] = if (viewers > 0) "true" else "false"
+            val openedStateId = BlockStateRegistry.stateId(blockKey, properties) ?: stateId
+            return listOf(PlayPackets.blockChangePacket(x, y, z, openedStateId))
+        }
+        val blockId = itemIdByKey[blockKey] ?: return emptyList()
+        return listOf(
+            PlayPackets.blockActionPacket(
+                x = x,
+                y = y,
+                z = z,
+                actionId = 1,
+                actionParam = viewers,
+                blockId = blockId
+            )
+        )
     }
 
     private fun chestLidPacketsAt(
@@ -21713,12 +21801,37 @@ data class EncodedStackSection(
         stateId: Int,
         out: MutableList<BlockPos>
     ) {
+        if (!isFluidDependentSupportCandidateState(stateId)) return
         if (!shouldBreakForMissingSupport(world, x, y, z, stateId)) return
         val primary = BlockPos(x, y, z)
         out.add(primary)
         val pair = verticallyPairedBlockPos(world, x, y, z, stateId)
         if (pair != null && pair != primary) {
             out.add(pair)
+        }
+    }
+
+    private fun isFluidDependentSupportCandidateState(stateId: Int): Boolean {
+        if (stateId <= 0) return false
+        return fluidDependentSupportCandidateCache.computeIfAbsent(stateId) { id ->
+            val parsed = BlockStateRegistry.parsedState(id) ?: return@computeIfAbsent false
+            val blockKey = parsed.blockKey
+            val half = parsed.properties["half"]
+            if ((half == "lower" || half == "upper") && verticalHalfCounterpartStateId(id) != null) {
+                return@computeIfAbsent true
+            }
+            if (half != "upper" && requiresSupportBelow(blockKey)) {
+                return@computeIfAbsent true
+            }
+            val face = parsed.properties["face"]
+            val facing = parsed.properties["facing"]
+            if (face != null && facing != null) {
+                return@computeIfAbsent true
+            }
+            if (blockKey in WALL_MOUNTED_BLOCK_KEYS) {
+                return@computeIfAbsent true
+            }
+            blockKey == "minecraft:vine"
         }
     }
 
@@ -23057,12 +23170,72 @@ data class EncodedStackSection(
             session.targetChunks.addAll(targetKeys)
             refreshRetainedBaseChunksForSession(session)
             val toLoad = toLoadAll
+            val includeDroppedItemsInStream = world.hasDroppedItems()
+            val includeFallingBlocksInStream = world.hasFallingBlocks()
+            val includeThrownItemsInStream = world.hasThrownItems()
+            val includeAnimalsInStream = world.hasAnimals()
+            val includeChestLidResendInStream = sessions.values.any {
+                it.worldKey == session.worldKey &&
+                    (it.openContainerType == CONTAINER_TYPE_CHEST || it.openContainerType == CONTAINER_TYPE_ENDER_CHEST)
+            }
 
             val shouldSendCurrentTarget = {
                 next.streamId == session.chunkStreamVersion.get() &&
                     next.centerChunkX == session.centerChunkX &&
                     next.centerChunkZ == session.centerChunkZ &&
                     next.radius == session.chunkRadius
+            }
+            val streamStartedAtNanos = System.nanoTime()
+
+            fun unloadOutsideTarget(
+                unloadTargetKeys: Set<ChunkPos>,
+                shouldContinue: () -> Boolean = { true },
+                onDone: () -> Unit
+            ) {
+                if (!ctx.channel().isActive || !shouldContinue()) {
+                    session.loadedChunks.retainAll(unloadTargetKeys)
+                    refreshRetainedBaseChunksForSession(session)
+                    onDone()
+                    return
+                }
+                val toUnload = ArrayList<ChunkPos>()
+                val includeFallingBlocksOnUnload = world.hasFallingBlocks()
+                val includeThrownItemsOnUnload = world.hasThrownItems()
+                val includeAnimalsOnUnload = world.hasAnimals()
+                for (pos in session.loadedChunks) {
+                    if (!unloadTargetKeys.contains(pos)) {
+                        toUnload.add(pos)
+                    }
+                }
+                if (toUnload.isEmpty()) {
+                    refreshRetainedBaseChunksForSession(session)
+                    onDone()
+                    return
+                }
+                for (pos in toUnload) {
+                    if (!ctx.channel().isActive || !shouldContinue()) {
+                        session.loadedChunks.retainAll(unloadTargetKeys)
+                        refreshRetainedBaseChunksForSession(session)
+                        onDone()
+                        return
+                    }
+                    hideDroppedItemsForChunk(session, ctx, pos, world.droppedItemEntityIdsInChunk(pos.x, pos.z))
+                    if (includeFallingBlocksOnUnload) {
+                        hideFallingBlocksForChunk(session, ctx, pos, world.fallingBlockEntityIdsInChunk(pos.x, pos.z))
+                    }
+                    if (includeThrownItemsOnUnload) {
+                        hideThrownItemsForChunk(session, ctx, pos, world.thrownItemEntityIdsInChunk(pos.x, pos.z))
+                    }
+                    if (includeAnimalsOnUnload) {
+                        hideAnimalsForChunk(session, ctx, pos, world.animalEntityIdsInChunk(pos.x, pos.z))
+                    }
+                    session.loadedChunks.remove(pos)
+                    ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
+                }
+                // Defensive pruning: keep bookkeeping bounded to current target footprint.
+                session.loadedChunks.retainAll(unloadTargetKeys)
+                refreshRetainedBaseChunksForSession(session)
+                onDone()
             }
 
             fun finishStream(totalSentCount: Int) {
@@ -23073,58 +23246,17 @@ data class EncodedStackSection(
                             return@execute
                         }
                         // Load-first, unload-after to avoid transparent border holes.
-                        val toUnload = ArrayList<ChunkPos>()
-                        for (pos in session.loadedChunks) {
-                            if (!targetKeys.contains(pos)) {
-                                toUnload.add(pos)
-                            }
-                        }
-                        val unloadIdsByChunk = HashMap<ChunkPos, CompletableFuture<IntArray>>(toUnload.size)
-                        for (pos in toUnload) {
-                            unloadIdsByChunk[pos] = ChunkStreamingService.fetchDroppedItemEntityIdsAsync(world, pos)
-                        }
-
-                        val finishUnloadAndFlush = {
-                            for (pos in toUnload) {
-                                val ids = unloadIdsByChunk[pos]?.getNow(IntArray(0)) ?: IntArray(0)
-                                hideDroppedItemsForChunk(session, ctx, pos, ids)
-                                hideFallingBlocksForChunk(session, ctx, pos, world.fallingBlockEntityIdsInChunk(pos.x, pos.z))
-                                hideThrownItemsForChunk(session, ctx, pos, world.thrownItemEntityIdsInChunk(pos.x, pos.z))
-                                hideAnimalsForChunk(session, ctx, pos, world.animalEntityIdsInChunk(pos.x, pos.z))
-                                session.loadedChunks.remove(pos)
-                                ctx.write(PlayPackets.unloadChunkPacket(pos.x, pos.z))
-                            }
-                            refreshRetainedBaseChunksForSession(session)
-                            ctx.writeAndFlush(PlayPackets.chunkBatchFinishedPacket(totalSentCount))
+                        unloadOutsideTarget(
+                            unloadTargetKeys = targetKeys,
+                            shouldContinue = { next.streamId == session.chunkStreamVersion.get() }
+                        ) {
+                            val elapsedMs = (System.nanoTime() - streamStartedAtNanos).coerceAtLeast(0L) / 1_000_000.0
+                            val summaryPacket = PlayPackets.systemChatPacket(
+                                "청크 로드 완료: ${totalSentCount}개, ${String.format(Locale.ROOT, "%.1f", elapsedMs)}ms (loaded=${session.loadedChunks.size}, target=${targetKeys.size})"
+                            )
+                            ctx.write(PlayPackets.chunkBatchFinishedPacket(totalSentCount))
+                            ctx.writeAndFlush(summaryPacket)
                             drain()
-                        }
-
-                        if (unloadIdsByChunk.isEmpty()) {
-                            finishUnloadAndFlush()
-                            return@execute
-                        }
-
-                        val remainingUnloadFetches = AtomicInteger(unloadIdsByChunk.size)
-                        val unloadCompletionScheduled = AtomicBoolean(false)
-                        fun completeUnloadFetches() {
-                            if (remainingUnloadFetches.decrementAndGet() != 0) return
-                            if (!unloadCompletionScheduled.compareAndSet(false, true)) return
-                            ctx.executor().execute {
-                                if (!ctx.channel().isActive) {
-                                    drain()
-                                    return@execute
-                                }
-                                if (next.streamId != session.chunkStreamVersion.get()) {
-                                    drain()
-                                    return@execute
-                                }
-                                finishUnloadAndFlush()
-                            }
-                        }
-                        for (future in unloadIdsByChunk.values) {
-                            future.whenComplete { _, _ ->
-                                completeUnloadFetches()
-                            }
                         }
                         return@execute
                     }
@@ -23140,17 +23272,50 @@ data class EncodedStackSection(
                 generatingChunks = session.generatingChunks,
                 shouldSend = shouldSendCurrentTarget,
                 onChunkSent = { chunkPos, droppedItems ->
-                    sendDroppedItemsForChunk(session, ctx, world, droppedItems)
-                    sendFallingBlocksForChunk(session, ctx, world, world.fallingBlocksInChunk(chunkPos.x, chunkPos.z))
-                    sendThrownItemsForChunk(session, ctx, world.thrownItemsInChunk(chunkPos.x, chunkPos.z))
-                    sendAnimalsForChunk(session, ctx, world.animalsInChunk(chunkPos.x, chunkPos.z))
-                    resendChestLidEventsForChunkToSession(session, ctx, world, chunkPos)
+                    if (includeDroppedItemsInStream && droppedItems.isNotEmpty()) {
+                        sendDroppedItemsForChunk(session, ctx, world, droppedItems)
+                    }
+                    if (includeFallingBlocksInStream) {
+                        val fallingBlocks = world.fallingBlocksInChunk(chunkPos.x, chunkPos.z)
+                        if (fallingBlocks.isNotEmpty()) {
+                            sendFallingBlocksForChunk(session, ctx, world, fallingBlocks)
+                        }
+                    }
+                    if (includeThrownItemsInStream) {
+                        val thrownItems = world.thrownItemsInChunk(chunkPos.x, chunkPos.z)
+                        if (thrownItems.isNotEmpty()) {
+                            sendThrownItemsForChunk(session, ctx, thrownItems)
+                        }
+                    }
+                    if (includeAnimalsInStream) {
+                        val animals = world.animalsInChunk(chunkPos.x, chunkPos.z)
+                        if (animals.isNotEmpty()) {
+                            sendAnimalsForChunk(session, ctx, animals)
+                        }
+                    }
+                    if (includeChestLidResendInStream) {
+                        resendChestLidEventsForChunkToSession(session, ctx, world, chunkPos)
+                    }
                 },
                 workerLimit = chunkStreamBatchWorkers()
             ).whenComplete { sentCount, error ->
                 ctx.executor().execute {
-                    if (!ctx.channel().isActive || !shouldSendCurrentTarget()) {
+                    if (!ctx.channel().isActive) {
                         drain()
+                        return@execute
+                    }
+                    if (!shouldSendCurrentTarget()) {
+                        // Target changed while streaming: eagerly prune old loaded chunks to prevent
+                        // monotonic growth under rapid movement/teleport churn.
+                        val latestTarget = ChunkStreamingService.buildSquareCoords(
+                            session.centerChunkX,
+                            session.centerChunkZ,
+                            session.chunkRadius
+                        ).toHashSet()
+                        unloadOutsideTarget(latestTarget) {
+                            ctx.flush()
+                            drain()
+                        }
                         return@execute
                     }
                     if (error != null) {
@@ -23165,8 +23330,13 @@ data class EncodedStackSection(
                         // Avoid "Loading terrain..." stall on persistent generator failures.
                         // Do not requeue the same failing target; allow future movement/view changes
                         // to request a fresh stream.
-                        ctx.writeAndFlush(PlayPackets.chunkBatchFinishedPacket(0))
-                        drain()
+                        unloadOutsideTarget(
+                            unloadTargetKeys = targetKeys,
+                            shouldContinue = { next.streamId == session.chunkStreamVersion.get() }
+                        ) {
+                            ctx.writeAndFlush(PlayPackets.chunkBatchFinishedPacket(0))
+                            drain()
+                        }
                         return@execute
                     }
                     finishStream(sentCount ?: 0)

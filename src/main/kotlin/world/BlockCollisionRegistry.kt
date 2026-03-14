@@ -17,6 +17,7 @@ object BlockCollisionRegistry {
     )
 
     private val json = Json { ignoreUnknownKeys = true }
+
     private val resolverByBlockKey: Map<String, String> by lazy {
         val root = loadRoot()
         val out = HashMap<String, String>()

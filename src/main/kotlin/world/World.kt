@@ -3,7 +3,6 @@ package org.macaroon3145.world
 import org.macaroon3145.config.ServerConfig
 import org.macaroon3145.network.codec.BlockStateRegistry
 import org.macaroon3145.network.handler.ItemStackState
-import org.macaroon3145.world.FoliaSidecarSpawnPointProvider
 import org.macaroon3145.world.generators.FoliaSharedMemoryWorldGenerator
 import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
 import kotlinx.serialization.json.Json
@@ -2238,18 +2237,23 @@ class World(
     }
 
     fun spawnPointForPlayer(_playerUuid: UUID): SpawnPoint {
-        FoliaSidecarSpawnPointProvider.spawnPointFor(key)?.let { sidecar ->
-            if (isSpawnPointValid(sidecar)) {
-                if (key == "minecraft:overworld") {
-                    VanillaLevelDatSeedStore.saveSpawnPoint(sidecar)
-                }
-                return sidecar
+        (generator as? BlockStateLookupWorldGenerator)?.spawnPoint(key)?.let { generatorSpawn ->
+            val rawForSave = SpawnPoint(
+                x = generatorSpawn.x,
+                y = generatorSpawn.y,
+                z = generatorSpawn.z
+            )
+            val centered = SpawnPoint(
+                x = generatorSpawn.x + 0.5,
+                y = generatorSpawn.y,
+                z = generatorSpawn.z + 0.5
+            )
+            cachedSpawnPointRef.compareAndSet(null, centered)
+            val resolved = cachedSpawnPointRef.get() ?: centered
+            if (key == "minecraft:overworld") {
+                VanillaLevelDatSeedStore.saveSpawnPoint(rawForSave)
             }
-        }
-        if (key == "minecraft:overworld") {
-            VanillaLevelDatSeedStore.loadSpawnPoint()?.let { fromLevelDat ->
-                if (isSpawnPointValid(fromLevelDat)) return fromLevelDat
-            }
+            return resolved
         }
         cachedSpawnPointRef.get()?.let { return it }
         val computed = findSharedSpawnNearOrigin()

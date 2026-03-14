@@ -49,6 +49,7 @@ object Server {
         get() = checkNotNull(worldRegistry?.defaultWorld()) { "Server is not initialized yet: defaultWorld is unavailable." }
 
     fun getWorld(key: String): World? = worldRegistry?.world(key)
+    fun world(key: String): World? = getWorld(key)
 
     fun getPlayer(uuid: UUID): ConnectedPlayer? {
         val registry = checkNotNull(playerRegistry) { "Server is not initialized yet: playerRegistry is unavailable." }

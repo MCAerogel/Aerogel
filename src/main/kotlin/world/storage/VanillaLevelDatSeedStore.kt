@@ -2,6 +2,7 @@ package org.macaroon3145.world.storage
 
 import org.macaroon3145.Aerogel
 import org.macaroon3145.world.SpawnPoint
+import org.macaroon3145.world.WorldManager
 import org.slf4j.LoggerFactory
 import java.io.BufferedInputStream
 import java.io.DataInputStream
@@ -221,6 +222,7 @@ object VanillaLevelDatSeedStore {
             )
             data.entries.remove("Bukkit.Version")
             data.entries.remove("ServerBrands")
+            applySeedsToData(data, seeds)
 
             if (timeWeather != null) {
                 data.entries["Time"] = NbtLong(timeWeather.worldAgeTicks)
@@ -249,6 +251,7 @@ object VanillaLevelDatSeedStore {
 
     fun saveSpawnPoint(spawn: SpawnPoint) {
         runCatching {
+            Files.createDirectories(worldDir)
             val hadAnyLevelDat = Files.isRegularFile(levelDat) || Files.isRegularFile(levelDatOld)
             val existing = readLevelDatDocument()
             if (existing == null && hadAnyLevelDat) {
@@ -258,9 +261,11 @@ object VanillaLevelDatSeedStore {
                 )
                 return@runCatching
             }
-            val baseSeeds = normalizedSeeds(load())
             val effective = existing
-                ?: runtimeTemplateLevelDatDocument()
+                ?: createNewLevelDatDocument(
+                    seeds = runtimeWorldSeeds(),
+                    timeWeather = loadTimeWeatherMetadata()
+                )
             if (effective == null) {
                 logger.info(
                     "Skipping level.dat spawn write because source metadata is unavailable: {}",
@@ -299,6 +304,17 @@ object VanillaLevelDatSeedStore {
         }.onFailure {
             logger.warn("Failed to write level.dat spawn metadata: {}", levelDat.toAbsolutePath(), it)
         }
+    }
+
+    private fun runtimeWorldSeeds(): Map<String, Long> {
+        val runtime = LinkedHashMap<String, Long>()
+        for (world in WorldManager.allWorlds()) {
+            runtime[world.key] = world.seed
+        }
+        if (runtime.isEmpty()) {
+            return normalizedSeeds(load())
+        }
+        return normalizedSeeds(runtime)
     }
 
     private fun createNewLevelDatDocument(
@@ -394,6 +410,70 @@ object VanillaLevelDatSeedStore {
         )
     }
 
+    private fun applySeedsToData(data: NbtCompound, seeds: Map<String, Long>) {
+        val normalized = normalizedSeeds(seeds)
+        val overworldSeed = normalized["minecraft:overworld"] ?: 0L
+        data.entries["RandomSeed"] = NbtLong(overworldSeed)
+
+        val worldGenSettings = ensureCompound(data, "WorldGenSettings")
+        worldGenSettings.entries["seed"] = NbtLong(overworldSeed)
+        if (worldGenSettings.entries["generate_features"] !is NbtByte) {
+            worldGenSettings.entries["generate_features"] = NbtByte(1)
+        }
+        if (worldGenSettings.entries["bonus_chest"] !is NbtByte) {
+            worldGenSettings.entries["bonus_chest"] = NbtByte(0)
+        }
+
+        val dimensions = ensureCompound(worldGenSettings, "dimensions")
+        for ((worldKey, dimensionKey) in builtinWorldKeyToDimension) {
+            val seed = normalized[worldKey] ?: overworldSeed
+            val settingKey = builtinWorldKeyToGeneratorSettings[worldKey] ?: "minecraft:overworld"
+
+            val dimension = ensureCompound(dimensions, dimensionKey)
+            if (dimension.entries["type"] !is NbtString) {
+                dimension.entries["type"] = NbtString(dimensionKey)
+            }
+
+            val generator = ensureCompound(dimension, "generator")
+            if (generator.entries["type"] !is NbtString) {
+                generator.entries["type"] = NbtString("minecraft:noise")
+            }
+            if (generator.entries["settings"] !is NbtString) {
+                generator.entries["settings"] = NbtString(settingKey)
+            }
+            generator.entries["seed"] = NbtLong(seed)
+
+            val biomeSource = (generator.entries["biome_source"] as? NbtCompound)
+                ?: defaultBiomeSourceForWorld(worldKey, seed).also { generator.entries["biome_source"] = it }
+            biomeSource.entries["seed"] = NbtLong(seed)
+        }
+    }
+
+    private fun defaultBiomeSourceForWorld(worldKey: String, seed: Long): NbtCompound {
+        return when (worldKey) {
+            "minecraft:the_end" -> NbtCompound(
+                linkedMapOf(
+                    "type" to NbtString("minecraft:the_end"),
+                    "seed" to NbtLong(seed)
+                )
+            )
+            "minecraft:the_nether" -> NbtCompound(
+                linkedMapOf(
+                    "type" to NbtString("minecraft:multi_noise"),
+                    "preset" to NbtString("minecraft:nether"),
+                    "seed" to NbtLong(seed)
+                )
+            )
+            else -> NbtCompound(
+                linkedMapOf(
+                    "type" to NbtString("minecraft:multi_noise"),
+                    "preset" to NbtString("minecraft:overworld"),
+                    "seed" to NbtLong(seed)
+                )
+            )
+        }
+    }
+
     private fun normalizedSeeds(seeds: Map<String, Long>): Map<String, Long> {
         val base = seeds["minecraft:overworld"] ?: seeds.values.firstOrNull() ?: 0L
         return linkedMapOf(
@@ -469,6 +549,7 @@ object VanillaLevelDatSeedStore {
     }
 
     private fun writeLevelDatDocument(document: LevelDatDocument) {
+        Files.createDirectories(worldDir)
         DataOutputStream(
             when (document.compression) {
                 CompressionFormat.GZIP -> GZIPOutputStream(Files.newOutputStream(levelDatTmp))

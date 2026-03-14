@@ -15,6 +15,7 @@ import io.netty.channel.kqueue.KQueueServerSocketChannel
 import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioServerSocketChannel
+import io.netty.buffer.PooledByteBufAllocator
 import org.jline.reader.Candidate
 import org.jline.reader.Completer
 import org.jline.reader.EndOfFileException
@@ -45,6 +46,7 @@ import org.macaroon3145.world.EntityHitboxRegistry
 import org.macaroon3145.world.World
 import org.macaroon3145.world.WorldManager
 import org.macaroon3145.world.VanillaMiningRules
+import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 import org.macaroon3145.world.storage.VanillaLevelDatSeedStore
 import org.macaroon3145.plugin.PluginSystem
 import org.macaroon3145.blockeditor.BlockEditorModule
@@ -66,6 +68,7 @@ import kotlin.concurrent.thread
 import kotlin.random.Random
 
 object Aerogel {
+    @Suppress("unused")
     const val VERSION_STAGE = "Early development version"
     const val VERSION = "1.21.11"
     @Volatile
@@ -105,15 +108,6 @@ fun main() {
         ?: 25565
     val worldSeeds = resolveWorldSeeds(props)
     val defaultWorld = props.getProperty("world.default")
-    val sidecarLevelSeed = worldSeeds["minecraft:overworld"] ?: worldSeeds.values.firstOrNull()
-    if (sidecarLevelSeed != null) {
-        System.setProperty("aerogel.folia.sidecar.level-seed", sidecarLevelSeed.toString())
-    }
-    worldSeeds["minecraft:overworld"]?.let { System.setProperty("aerogel.folia.seed.overworld", it.toString()) }
-    worldSeeds["minecraft:the_nether"]?.let { System.setProperty("aerogel.folia.seed.the_nether", it.toString()) }
-    worldSeeds["minecraft:the_end"]?.let { System.setProperty("aerogel.folia.seed.the_end", it.toString()) }
-    ensureFoliaRuntimeReady(parsedChunkWorkerThreads)
-    // Folia sidecar bootstrap may emit noisy startup output.
     installJvmStderrWarningFilter()
     installStdoutInfoFilter()
     configureJulFormatting()
@@ -155,15 +149,27 @@ fun main() {
     ServerConfig.setDifficulty(parseDifficulty(props.getProperty("difficulty")))
     ServerI18n.initialize()
     WorldManager.bootstrap(worldSeeds = worldSeeds, defaultWorld = defaultWorld)
+    runCatching { VanillaAnvilWorldSaver.loadAllWorlds() }
     VanillaLevelDatSeedStore.loadTimeWeatherMetadata()?.let { metadata ->
         PlayerSessionManager.applyPersistedTimeWeather(metadata)
     }
     PluginSystem.initialize()
     runCatching { BlockEditorModule.start() }
+        .onSuccess {
+            ServerI18n.logCustom(
+                ServerI18n.style("· ", ServerI18n.Color.GRAY),
+                ServerI18n.label("aerogel.label.block_editor"),
+                ServerI18n.punct(": "),
+                ServerI18n.style(BlockEditorModule.securedPublicUrl(), ServerI18n.Color.CYAN)
+            )
+        }
         .onFailure { error ->
             ServerI18n.logCustom(
                 ServerI18n.style("[시스템] ", ServerI18n.Color.RED),
-                ServerI18n.style("BlockEditor start failed: ${error.message}", ServerI18n.Color.RED)
+                ServerI18n.style(
+                    ServerI18n.tr("aerogel.log.block_editor.start_failed", error.message ?: "unknown"),
+                    ServerI18n.Color.RED
+                )
             )
         }
     warmupPickBlockLookups()
@@ -184,6 +190,8 @@ fun main() {
     ) {
         serverChannel = ServerBootstrap().group(eventLoops.bossGroup, eventLoops.workerGroup)
             .channel(eventLoops.serverChannelClass)
+            .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+            .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
             .childOption(ChannelOption.TCP_NODELAY, true)
             .childOption(ChannelOption.SO_KEEPALIVE, true)
             .childHandler(object : ChannelInitializer<SocketChannel>() {
@@ -227,27 +235,28 @@ private fun warmupPickBlockLookups() {
             progressMessage = ServerI18n.tr("aerogel.log.cache.preparing"),
             doneMessage = ServerI18n.tr("aerogel.log.cache.prepared")
         ) {
-            val tasks = listOf<() -> Unit>(
-                { ItemBlockStateRegistry.prewarm() },
-                { BlockStateRegistry.prewarm() },
-                { BlockEntityTypeRegistry.prewarm() },
-                { RegistryCodec.prewarm() },
-                { MenuRegistry.prewarm() },
-                { VanillaMiningRules.prewarm() },
-                { EntitySelectorCompletions.prewarm() },
-                { PlayPackets.prewarm() },
-                { World.prewarm() },
-                { DroppedItemSystem.prewarm() },
-                { BlockCollisionRegistry.prewarm() },
-                { EntityHitboxRegistry.prewarm() },
-                { PlayerSessionManager.prewarm() },
-                { PlayerSessionManager.prewarmFluidDependentDropCache() },
-                { PlayerSessionManager.prewarmFluidDependentRuntime() }
+            data class WarmupTask(val name: String, val task: () -> Unit)
+            val tasks = listOf(
+                WarmupTask("ItemBlockStateRegistry.prewarm") { ItemBlockStateRegistry.prewarm() },
+                WarmupTask("BlockStateRegistry.prewarm") { BlockStateRegistry.prewarm() },
+                WarmupTask("BlockEntityTypeRegistry.prewarm") { BlockEntityTypeRegistry.prewarm() },
+                WarmupTask("RegistryCodec.prewarm") { RegistryCodec.prewarm() },
+                WarmupTask("MenuRegistry.prewarm") { MenuRegistry.prewarm() },
+                WarmupTask("VanillaMiningRules.prewarm") { VanillaMiningRules.prewarm() },
+                WarmupTask("EntitySelectorCompletions.prewarm") { EntitySelectorCompletions.prewarm() },
+                WarmupTask("PlayPackets.prewarm") { PlayPackets.prewarm() },
+                WarmupTask("World.prewarm") { World.prewarm() },
+                WarmupTask("DroppedItemSystem.prewarm") { DroppedItemSystem.prewarm() },
+                WarmupTask("BlockCollisionRegistry.prewarm") { BlockCollisionRegistry.prewarm() },
+                WarmupTask("EntityHitboxRegistry.prewarm") { EntityHitboxRegistry.prewarm() },
+                WarmupTask("PlayerSessionManager.prewarm") { PlayerSessionManager.prewarm() },
+                WarmupTask("PlayerSessionManager.prewarmFluidDependentDropCache") { PlayerSessionManager.prewarmFluidDependentDropCache() },
+                WarmupTask("PlayerSessionManager.prewarmFluidDependentRuntime") { PlayerSessionManager.prewarmFluidDependentRuntime() }
             )
             Executors.newVirtualThreadPerTaskExecutor().use { executor ->
                 val futures = tasks.map { task ->
                     executor.submit<Unit> {
-                        runCatching { task() }
+                        runCatching { task.task() }
                         Unit
                     }
                 }

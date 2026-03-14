@@ -10,6 +10,7 @@ abstract class World {
     abstract val key: String
     abstract val elapsedTicks: Long
     abstract var timeOfDayTicks: Long
+    protected abstract fun pluginInternalSpawnPoint(): Location
     abstract fun blockAt(x: Int, y: Int, z: Int): Block
     abstract fun chunkAt(chunkX: Int, chunkZ: Int): Chunk
     abstract fun addTime(deltaTicks: Long): Boolean
@@ -35,6 +36,8 @@ abstract class World {
     }
     fun getEntityByType(type: EntityType): List<Entity> = pluginInternalEntitiesByType(type)
     fun getEntityById(entityId: UUID): Entity? = pluginInternalEntityById(entityId)
+    val spawnPoint: Location
+        get() = pluginInternalSpawnPoint()
 
     val elapsedYears: Long
         get() = elapsedSecondsTotal / SECONDS_PER_YEAR

@@ -17,6 +17,8 @@ interface WarmupWorldGenerator {
 interface BlockStateLookupWorldGenerator {
     fun blockStateAt(worldKey: String, x: Int, y: Int, z: Int): Int
 
+    fun spawnPoint(worldKey: String): SpawnPoint? = null
+
     fun blockStateAtIfCached(worldKey: String, x: Int, y: Int, z: Int): Int? = null
 
     fun rawBrightnessAt(worldKey: String, x: Int, y: Int, z: Int): Int = 0

@@ -203,6 +203,10 @@ object PlayPackets {
         val packet = ByteArrayOutputStream()
         val out = DataOutputStream(packet)
         val clampedGameMode = gameMode.coerceIn(0, 3)
+        val dimensionTypeId = RegistryCodec.entryIndex("minecraft:dimension_type", worldKey)
+            ?: RegistryCodec.entryIndex("dimension_type", worldKey)
+            ?: RegistryCodec.entryIndex("minecraft:dimension_type", "minecraft:overworld")
+            ?: 0
         NetworkUtils.writeVarInt(packet, LOGIN_PACKET_ID)
         out.writeInt(entityId)
         out.writeBoolean(false)
@@ -215,7 +219,7 @@ object PlayPackets {
         out.writeBoolean(true)
         out.writeBoolean(false)
 
-        NetworkUtils.writeVarInt(packet, clampedGameMode)
+        NetworkUtils.writeVarInt(packet, dimensionTypeId)
         NetworkUtils.writeString(packet, worldKey)
         out.writeLong(0L)
         out.writeByte(clampedGameMode)
@@ -1397,30 +1401,13 @@ object PlayPackets {
             NetworkUtils.writeVarInt(packet, entry.typeId.coerceAtLeast(0))
             out.write(entry.nbtPayload)
         }
-        // skyLightMask
-        NetworkUtils.writeVarInt(packet, generated.skyLightMask.size)
-        for (value in generated.skyLightMask) out.writeLong(value)
-        // blockLightMask
-        NetworkUtils.writeVarInt(packet, generated.blockLightMask.size)
-        for (value in generated.blockLightMask) out.writeLong(value)
-        // emptySkyLightMask
-        NetworkUtils.writeVarInt(packet, generated.emptySkyLightMask.size)
-        for (value in generated.emptySkyLightMask) out.writeLong(value)
-        // emptyBlockLightMask
-        NetworkUtils.writeVarInt(packet, generated.emptyBlockLightMask.size)
-        for (value in generated.emptyBlockLightMask) out.writeLong(value)
-        // skyLight arrays
-        NetworkUtils.writeVarInt(packet, generated.skyLight.size)
-        for (bytes in generated.skyLight) {
-            NetworkUtils.writeVarInt(packet, bytes.size)
-            out.write(bytes)
-        }
-        // blockLight arrays
-        NetworkUtils.writeVarInt(packet, generated.blockLight.size)
-        for (bytes in generated.blockLight) {
-            NetworkUtils.writeVarInt(packet, bytes.size)
-            out.write(bytes)
-        }
+        val lightData = normalizedLightData(generated)
+        writeLongArray(packet, out, lightData.skyLightMask)
+        writeLongArray(packet, out, lightData.blockLightMask)
+        writeLongArray(packet, out, lightData.emptySkyLightMask)
+        writeLongArray(packet, out, lightData.emptyBlockLightMask)
+        writeByteArrayList(packet, lightData.skyLight)
+        writeByteArrayList(packet, lightData.blockLight)
         return packet.toByteArray()
     }
 
@@ -1684,6 +1671,77 @@ object PlayPackets {
         val out = DataOutputStream(stream)
         out.writeByte(0)
         NetworkUtils.writeVarInt(stream, valueId)
+    }
+
+    private data class NormalizedChunkLightData(
+        val skyLightMask: LongArray,
+        val blockLightMask: LongArray,
+        val emptySkyLightMask: LongArray,
+        val emptyBlockLightMask: LongArray,
+        val skyLight: List<ByteArray>,
+        val blockLight: List<ByteArray>
+    )
+
+    private fun normalizedLightData(generated: GeneratedChunk): NormalizedChunkLightData {
+        val normalizedSky = normalizeLightSeries(generated.skyLightMask, generated.skyLight)
+        val normalizedBlock = normalizeLightSeries(generated.blockLightMask, generated.blockLight)
+        return NormalizedChunkLightData(
+            skyLightMask = normalizedSky.first,
+            blockLightMask = normalizedBlock.first,
+            emptySkyLightMask = generated.emptySkyLightMask.copyOf(),
+            emptyBlockLightMask = generated.emptyBlockLightMask.copyOf(),
+            skyLight = normalizedSky.second,
+            blockLight = normalizedBlock.second
+        )
+    }
+
+    private fun normalizeLightSeries(mask: LongArray, arrays: List<ByteArray>): Pair<LongArray, List<ByteArray>> {
+        if (mask.isEmpty() || arrays.isEmpty()) return LongArray(0) to emptyList()
+
+        val normalizedMask = mask.copyOf()
+        val expectedCount = countMaskBits(normalizedMask)
+        if (expectedCount <= 0) return LongArray(0) to emptyList()
+
+        val copiedArrays = arrays.map { it.copyOf() }.toMutableList()
+        if (copiedArrays.size == expectedCount) return normalizedMask to copiedArrays
+
+        if (copiedArrays.size > expectedCount) {
+            return normalizedMask to copiedArrays.subList(0, expectedCount)
+        }
+
+        var missing = expectedCount - copiedArrays.size
+        for (wordIndex in normalizedMask.indices.reversed()) {
+            if (missing == 0) break
+            var word = normalizedMask[wordIndex]
+            if (word == 0L) continue
+            for (bit in 63 downTo 0) {
+                if (missing == 0) break
+                val bitFlag = 1L shl bit
+                if ((word and bitFlag) == 0L) continue
+                word = word and bitFlag.inv()
+                missing--
+            }
+            normalizedMask[wordIndex] = word
+        }
+
+        return normalizedMask to copiedArrays
+    }
+
+    private fun countMaskBits(mask: LongArray): Int = mask.sumOf { java.lang.Long.bitCount(it) }
+
+    private fun writeLongArray(packet: ByteArrayOutputStream, out: DataOutputStream, values: LongArray) {
+        NetworkUtils.writeVarInt(packet, values.size)
+        for (value in values) {
+            out.writeLong(value)
+        }
+    }
+
+    private fun writeByteArrayList(packet: ByteArrayOutputStream, values: List<ByteArray>) {
+        NetworkUtils.writeVarInt(packet, values.size)
+        for (value in values) {
+            NetworkUtils.writeVarInt(packet, value.size)
+            packet.write(value)
+        }
     }
 
 }

@@ -18,6 +18,7 @@ dependencies {
     testImplementation(kotlin("test"))
     implementation(project(":api"))
     implementation(project(":blockEditor"))
+    implementation(project(":aerogelWorldGen"))
 
     implementation("io.netty:netty-all:4.2.10.Final")
     runtimeOnly("io.netty:netty-transport-native-epoll:4.2.10.Final:linux-x86_64")
@@ -71,6 +72,7 @@ tasks.register<Jar>("aerogelJar") {
     description = "Builds Aerogel.jar"
     dependsOn("classes")
     dependsOn(":api:jar")
+    dependsOn(":aerogelWorldGen:jar")
     archiveBaseName.set("Aerogel")
     archiveVersion.set("")
     archiveClassifier.set("")
@@ -90,6 +92,9 @@ tasks.register<Jar>("aerogelJar") {
     }
     from(
         configurations.runtimeClasspath.get().mapNotNull { dependency ->
+            if (!dependency.exists()) {
+                null
+            } else {
             val name = dependency.name.lowercase()
             val path = dependency.path.lowercase()
             val isNmsOrUserdevRuntime =
@@ -105,6 +110,7 @@ tasks.register<Jar>("aerogelJar") {
                 dependency
             } else {
                 zipTree(dependency)
+            }
             }
         }
     )

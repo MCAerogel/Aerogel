@@ -12,7 +12,9 @@ import org.macaroon3145.world.storage.VanillaAnvilWorldSaver
 import org.slf4j.LoggerFactory
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CancellationException
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -21,9 +23,10 @@ import kotlin.math.floor
 
 object ChunkStreamingService {
     private val logger = LoggerFactory.getLogger(ChunkStreamingService::class.java)
-    private const val CHUNK_WRITE_FLUSH_THRESHOLD = 16
     private const val FORCED_REGION_GRID_EXPONENT = 0
     private const val DEFAULT_INTERLEAVE_CELL_EXPONENT = 4
+    private const val DEFAULT_FLUSH_CHUNK_BATCH_SIZE = 8
+    private const val DEFAULT_CHUNK_BRIDGE_RETRY_COUNT = 2
     private val workerCount = configuredOrAutoWorkerParallelism()
     private val workerId = AtomicInteger(1)
     private val workerPool = Executors.newFixedThreadPool(workerCount) { runnable ->
@@ -46,7 +49,7 @@ object ChunkStreamingService {
 
         val jvmLogical = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
         val osLogical = detectOsLogicalCores()
-        return maxOf(jvmLogical, osLogical).coerceAtLeast(1)
+        return resolveEffectiveLogicalCores(jvmLogical, osLogical)
     }
 
     private fun detectOsLogicalCores(): Int {
@@ -67,7 +70,16 @@ object ChunkStreamingService {
         return maxOf(linuxCpuInfo, nprocValue, windowsEnv, 1)
     }
 
-    fun maxWorkerCount(): Int = workerCount
+    private fun resolveEffectiveLogicalCores(jvmLogical: Int, osLogical: Int): Int {
+        val jvm = jvmLogical.coerceAtLeast(1)
+        val os = osLogical.coerceAtLeast(1)
+        // In containerized deployments, OS-level probes can reflect host cores while JVM is cgroup-aware.
+        return minOf(jvm, os).coerceAtLeast(1)
+    }
+
+    fun maxWorkerCount(): Int {
+        return workerCount
+    }
 
     private fun configuredPacketWorkerParallelism(): Int {
         val configured = System.getProperty("aerogel.chunk.packet-workers")
@@ -126,17 +138,18 @@ object ChunkStreamingService {
         val includeDroppedItems = world.hasDroppedItems()
         val sent = AtomicInteger(0)
         val nextIndex = AtomicInteger(0)
-        val pendingWrites = AtomicInteger(0)
+        val pendingChunksSinceFlush = AtomicInteger(0)
         val pendingPacketTasks = AtomicInteger(0)
         val generationWorkersDone = AtomicBoolean(false)
         val flushScheduled = AtomicBoolean(false)
         val streamFailure = AtomicReference<Throwable?>(null)
-        val parallelism = workerLimit
-            .coerceAtLeast(1)
-            .coerceAtMost(workerCount)
-            .coerceAtMost(coords.size)
-        val dispatcherCount = AtomicInteger(parallelism)
+        val retryQueue = ConcurrentLinkedQueue<ChunkPos>()
+        val timeoutRetryCounts = ConcurrentHashMap<ChunkPos, Int>()
+        val maxChunkBridgeRetries = configuredChunkBridgeRetryCount()
+        val flushChunkBatchSize = configuredFlushChunkBatchSize(workerLimit)
         val inFlightBuildTasks = AtomicInteger(0)
+        val sourceExhausted = AtomicBoolean(false)
+        val scheduling = AtomicBoolean(false)
 
         fun scheduleIntermediateFlush() {
             if (!flushScheduled.compareAndSet(false, true)) return
@@ -154,7 +167,7 @@ object ChunkStreamingService {
         }
 
         fun finishSuccessIfReady() {
-            if (!generationWorkersDone.get()) return
+            if (!sourceExhausted.get()) return
             if (inFlightBuildTasks.get() != 0) return
             if (pendingPacketTasks.get() != 0) return
             if (!completion.complete(sent.get())) return
@@ -165,58 +178,86 @@ object ChunkStreamingService {
             }
         }
 
-        fun finishDispatcher() {
-            if (dispatcherCount.decrementAndGet() == 0) {
-                generationWorkersDone.set(true)
-                finishSuccessIfReady()
+        fun currentBuildLimit(): Int {
+            return workerLimit
+                .coerceAtLeast(1)
+                .coerceAtMost(workerCount)
+                .coerceAtMost(coords.size)
+                .coerceAtMost(maxWorkerCount().coerceAtLeast(1))
+        }
+
+        fun pollNextCoordOrNull(): ChunkPos? {
+            while (true) {
+                val coord = retryQueue.poll() ?: run {
+                    val index = nextIndex.getAndIncrement()
+                    if (index >= coords.size) {
+                        sourceExhausted.set(true)
+                        return null
+                    }
+                    coords[index]
+                }
+                if (loadedChunks.contains(coord)) continue
+                if (!generatingChunks.add(coord)) continue
+                sourceExhausted.set(false)
+                return coord
             }
         }
 
-        fun dispatchNext() {
-            if (completion.isDone || !shouldSend()) {
-                finishDispatcher()
-                return
-            }
-            while (true) {
-                val index = nextIndex.getAndIncrement()
-                if (index >= coords.size) {
-                    finishDispatcher()
-                    return
-                }
-                val coord = coords[index]
-                if (loadedChunks.contains(coord)) continue
-                if (!generatingChunks.add(coord)) continue
+        lateinit var scheduleMore: () -> Unit
 
-                inFlightBuildTasks.incrementAndGet()
-                CompletableFuture
-                    .runAsync(
-                        {
-                            runCatching {
-                                VanillaAnvilWorldSaver.loadChunkOverrideIfPresent(world, coord)
-                            }.onFailure { throwable ->
-                                logger.warn("Failed to apply saved chunk override for {},{}", coord.x, coord.z, throwable)
-                            }
-                        },
-                        workerPool
-                    )
-                    .thenCompose {
-                        world.buildChunkAsync(coord, workerPool)
-                    }
-                    .whenComplete { generated, error ->
+        val dispatchNext: (ChunkPos) -> Unit = dispatch@{ coord ->
+            if (completion.isDone || !shouldSend()) {
+                generatingChunks.remove(coord)
+                sourceExhausted.set(true)
+                finishSuccessIfReady()
+                return@dispatch
+            }
+
+            inFlightBuildTasks.incrementAndGet()
+            CompletableFuture
+                .runAsync(
+                    {
+                        runCatching {
+                            VanillaAnvilWorldSaver.loadChunkOverrideIfPresent(world, coord)
+                        }.onFailure { throwable ->
+                            logger.warn("Failed to apply saved chunk override for {},{}", coord.x, coord.z, throwable)
+                        }
+                    },
+                    workerPool
+                )
+                .thenCompose {
+                    world.buildChunkAsync(coord, workerPool)
+                }
+                .whenComplete { generated, error ->
                     try {
                         if (error != null) {
+                            if (isChunkBridgeTimeout(error) && shouldSend() && !completion.isDone) {
+                                val attempt = timeoutRetryCounts.merge(coord, 1, Int::plus) ?: 1
+                                if (attempt <= maxChunkBridgeRetries) {
+                                    generatingChunks.remove(coord)
+                                    retryQueue.add(coord)
+                                    sourceExhausted.set(false)
+                                    scheduleMore()
+                                    return@whenComplete
+                                }
+                                timeoutRetryCounts.remove(coord)
+                                logger.warn(
+                                    "Chunk stream retry exhausted for {},{} after {} timeout(s)",
+                                    coord.x,
+                                    coord.z,
+                                    attempt
+                                )
+                            }
+
                             generatingChunks.remove(coord)
                             if (isChunkRequestCancelled(error) || isChunkBridgeTimeout(error)) {
-                                if (!shouldSend() || completion.isDone) {
-                                    finishDispatcher()
-                                } else {
-                                    dispatchNext()
-                                }
+                                scheduleMore()
                                 return@whenComplete
                             }
                             logger.error("Chunk stream failed for {},{}", coord.x, coord.z, error)
                             failStream(RuntimeException("Chunk stream failed at ${coord.x},${coord.z}", error))
-                            finishDispatcher()
+                            sourceExhausted.set(true)
+                            finishSuccessIfReady()
                             return@whenComplete
                         }
 
@@ -238,11 +279,9 @@ object ChunkStreamingService {
                                         // Re-fetch after pushing updates so reconnect streams do not reuse stale pre-update light.
                                         FoliaSharedMemoryWorldGenerator.invalidateChunkGeneratedAndLighting(world.key, coord.x, coord.z)
                                     }
-                                    val baseChunk = if (hasChangedBlocks) {
-                                        runCatching { world.buildChunk(coord) }.getOrElse { generated }
-                                    } else {
-                                        generated
-                                    }
+                                    // Avoid per-chunk synchronous rebuild during stream.
+                                    // Runtime block changes are already sent via delta packets below.
+                                    val baseChunk = generated
                                     val chunkWithPersistedLighting =
                                         if (hasChangedBlocks) {
                                             val changedSectionYs = changedBlocks
@@ -260,7 +299,10 @@ object ChunkStreamingService {
                                         }
                                     val chunkWithPersistedHeightmaps =
                                         VanillaAnvilWorldSaver.applyPersistedHeightmapsIfPresent(world.key, coord, chunkWithPersistedLighting)
-                                    val chunkBlockEntities = collectChunkBlockEntitiesForClient(world, coord)
+                                    val chunkBlockEntities = collectChunkBlockEntitiesForClient(
+                                        changedBlocks = changedBlocks,
+                                        changedBlockEntities = changedBlockEntities
+                                    )
                                     val chunkPacket = PlayPackets.mapChunkPacket(
                                         chunkX = coord.x,
                                         chunkZ = coord.z,
@@ -275,13 +317,13 @@ object ChunkStreamingService {
                                         ctx.write(packet)
                                     }
 
-                                    val writes = 1 + deltaPackets.size
-                                    if (pendingWrites.addAndGet(writes) >= CHUNK_WRITE_FLUSH_THRESHOLD) {
-                                        pendingWrites.set(0)
+                                    if (pendingChunksSinceFlush.incrementAndGet() >= flushChunkBatchSize) {
+                                        pendingChunksSinceFlush.set(0)
                                         scheduleIntermediateFlush()
                                     }
 
                                     loadedChunks.add(coord)
+                                    timeoutRetryCounts.remove(coord)
                                     sent.incrementAndGet()
                                     onChunkSent?.invoke(coord, droppedItems)
                                 }
@@ -293,21 +335,50 @@ object ChunkStreamingService {
                                 if (pendingPacketTasks.decrementAndGet() == 0) {
                                     finishSuccessIfReady()
                                 }
+                                // Resume build dispatch after packet task completion.
+                                scheduleMore()
                             }
                         }
-                        dispatchNext()
+                        scheduleMore()
                     } finally {
                         inFlightBuildTasks.decrementAndGet()
                         finishSuccessIfReady()
+                        scheduleMore()
                     }
                 }
-                return
+        }
+
+        scheduleMore = schedule@{
+            if (!scheduling.compareAndSet(false, true)) return@schedule
+            try {
+                while (true) {
+                    if (completion.isDone) return@schedule
+                    if (!shouldSend()) {
+                        sourceExhausted.set(true)
+                        finishSuccessIfReady()
+                        return@schedule
+                    }
+                    val limit = currentBuildLimit()
+                    if (inFlightBuildTasks.get() >= limit) return@schedule
+                    val coord = pollNextCoordOrNull() ?: run {
+                        finishSuccessIfReady()
+                        return@schedule
+                    }
+                    dispatchNext.invoke(coord)
+                }
+            } finally {
+                scheduling.set(false)
+                val canContinue = !completion.isDone &&
+                    shouldSend() &&
+                    inFlightBuildTasks.get() < currentBuildLimit() &&
+                    (retryQueue.isNotEmpty() || nextIndex.get() < coords.size)
+                if (canContinue) {
+                    scheduleMore()
+                }
             }
         }
 
-        repeat(parallelism) {
-            dispatchNext()
-        }
+        scheduleMore()
 
         return completion
     }
@@ -406,6 +477,24 @@ object ChunkStreamingService {
             ?: DEFAULT_INTERLEAVE_CELL_EXPONENT
     }
 
+    private fun configuredChunkBridgeRetryCount(): Int {
+        return System.getProperty("aerogel.chunk.bridge-timeout-retries")
+            ?.toIntOrNull()
+            ?.coerceAtLeast(0)
+            ?: DEFAULT_CHUNK_BRIDGE_RETRY_COUNT
+    }
+
+    private fun configuredFlushChunkBatchSize(workerLimit: Int): Int {
+        val autoDefault = DEFAULT_FLUSH_CHUNK_BATCH_SIZE
+            .coerceAtMost(workerLimit.coerceAtLeast(1))
+            .coerceAtLeast(1)
+        return System.getProperty("aerogel.chunk.flush-batch-size")
+            ?.toIntOrNull()
+            ?.coerceAtLeast(1)
+            ?.coerceAtMost(workerLimit.coerceAtLeast(1))
+            ?: autoDefault
+    }
+
     fun buildSquareCoords(cx: Int, cz: Int, radius: Int): List<ChunkPos> {
         val clampedRadius = radius.coerceAtLeast(0)
         val result = ArrayList<ChunkPos>((clampedRadius * 2 + 1) * (clampedRadius * 2 + 1))
@@ -465,41 +554,52 @@ object ChunkStreamingService {
         return packets
     }
 
-    private fun collectChunkBlockEntitiesForClient(world: World, chunkPos: ChunkPos): List<PlayPackets.ChunkBlockEntityEntry> {
+    private fun collectChunkBlockEntitiesForClient(
+        changedBlocks: List<Pair<org.macaroon3145.world.BlockPos, Int>>,
+        changedBlockEntities: List<Pair<org.macaroon3145.world.BlockPos, World.BlockEntityData>>
+    ): List<PlayPackets.ChunkBlockEntityEntry> {
         val chestTypeId = BlockEntityTypeRegistry.idOf("minecraft:chest") ?: return emptyList()
         val trappedChestTypeId = BlockEntityTypeRegistry.idOf("minecraft:trapped_chest") ?: chestTypeId
         val enderChestTypeId = BlockEntityTypeRegistry.idOf("minecraft:ender_chest")
         val shulkerTypeId = BlockEntityTypeRegistry.idOf("minecraft:shulker_box")
 
-        val out = ArrayList<PlayPackets.ChunkBlockEntityEntry>()
-        val baseX = chunkPos.x shl 4
-        val baseZ = chunkPos.z shl 4
-        for (y in -64..319) {
-            for (localZ in 0 until 16) {
-                for (localX in 0 until 16) {
-                    val x = baseX + localX
-                    val z = baseZ + localZ
-                    val blockKey = BlockStateRegistry.parsedState(world.blockStateAt(x, y, z))?.blockKey ?: continue
-                    val typeId = when {
-                        blockKey == "minecraft:trapped_chest" -> trappedChestTypeId
-                        blockKey == "minecraft:ender_chest" -> enderChestTypeId ?: continue
-                        isChestLikeBlockKey(blockKey) -> chestTypeId
-                        isShulkerBoxBlockKey(blockKey) -> shulkerTypeId ?: continue
-                        else -> continue
-                    }
-                    val blockEntity = world.blockEntityAt(x, y, z)
-                    val payload = blockEntity?.nbtPayload ?: EMPTY_COMPOUND_NBT
-                    out.add(
-                        PlayPackets.ChunkBlockEntityEntry(
-                            x = x,
-                            y = y,
-                            z = z,
-                            typeId = typeId,
-                            nbtPayload = payload
-                        )
-                    )
-                }
+        if (changedBlocks.isEmpty() && changedBlockEntities.isEmpty()) return emptyList()
+
+        val out = ArrayList<PlayPackets.ChunkBlockEntityEntry>(changedBlockEntities.size + changedBlocks.size)
+        val existing = HashSet<org.macaroon3145.world.BlockPos>(changedBlockEntities.size + changedBlocks.size)
+
+        for ((pos, blockEntity) in changedBlockEntities) {
+            out.add(
+                PlayPackets.ChunkBlockEntityEntry(
+                    x = pos.x,
+                    y = pos.y,
+                    z = pos.z,
+                    typeId = blockEntity.typeId.coerceAtLeast(0),
+                    nbtPayload = blockEntity.nbtPayload
+                )
+            )
+            existing.add(pos)
+        }
+
+        for ((pos, stateId) in changedBlocks) {
+            if (existing.contains(pos)) continue
+            val blockKey = BlockStateRegistry.parsedState(stateId)?.blockKey ?: continue
+            val typeId = when {
+                blockKey == "minecraft:trapped_chest" -> trappedChestTypeId
+                blockKey == "minecraft:ender_chest" -> enderChestTypeId ?: continue
+                isChestLikeBlockKey(blockKey) -> chestTypeId
+                isShulkerBoxBlockKey(blockKey) -> shulkerTypeId ?: continue
+                else -> continue
             }
+            out.add(
+                PlayPackets.ChunkBlockEntityEntry(
+                    x = pos.x,
+                    y = pos.y,
+                    z = pos.z,
+                    typeId = typeId,
+                    nbtPayload = EMPTY_COMPOUND_NBT
+                )
+            )
         }
         return out
     }

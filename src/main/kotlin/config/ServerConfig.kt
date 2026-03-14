@@ -10,7 +10,7 @@ object ServerConfig {
 
     // Server-wide max player count used for status response and dashboard display.
     @Volatile
-    var maxPlayers: Int = 20
+    var maxPlayers: Int = 100
 
     // Global simulation time scale.
     // 1.0 = normal speed, <1.0 = slower, >1.0 = faster.
@@ -73,4 +73,5 @@ object ServerConfig {
     fun setDifficulty(difficulty: Int) {
         this.difficulty = difficulty.coerceIn(0, 3)
     }
+
 }

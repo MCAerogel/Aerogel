@@ -256,7 +256,7 @@ private object FoliaRuntimeBootstrap {
 
         val jvmLogical = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
         val osLogical = detectOsLogicalCores()
-        return maxOf(jvmLogical, osLogical).coerceAtLeast(1)
+        return resolveEffectiveLogicalCores(jvmLogical, osLogical)
     }
 
     private fun detectOsLogicalCores(): Int {
@@ -275,6 +275,13 @@ private object FoliaRuntimeBootstrap {
         }.getOrDefault(0)
         val windowsEnv = System.getenv("NUMBER_OF_PROCESSORS")?.toIntOrNull() ?: 0
         return maxOf(linuxCpuInfo, nprocValue, windowsEnv, 1)
+    }
+
+    private fun resolveEffectiveLogicalCores(jvmLogical: Int, osLogical: Int): Int {
+        val jvm = jvmLogical.coerceAtLeast(1)
+        val os = osLogical.coerceAtLeast(1)
+        // Favor a cgroup-aware effective count rather than host over-reporting.
+        return minOf(jvm, os).coerceAtLeast(1)
     }
 
     private fun resolveDownloadInfo(): FoliaDownloadInfo {

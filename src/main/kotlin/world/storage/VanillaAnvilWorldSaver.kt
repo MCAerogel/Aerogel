@@ -117,6 +117,8 @@ object VanillaAnvilWorldSaver {
     private val endDimensionId = "minecraft:the_end"
     private val regionFileRegex = Regex("""r\.(-?\d+)\.(-?\d+)\.mca""")
     private val loadedChunkOverridesByWorld = ConcurrentHashMap<String, MutableSet<ChunkPos>>()
+    private val preloadedOverrideWorldKeys = ConcurrentHashMap.newKeySet<String>()
+    private val worldHasPersistedOverrides = ConcurrentHashMap<String, Boolean>()
     private val persistedChunkLightingByWorld = ConcurrentHashMap<String, ConcurrentHashMap<ChunkPos, PersistedChunkLighting>>()
     private val persistedChunkHeightmapsByWorld = ConcurrentHashMap<String, ConcurrentHashMap<ChunkPos, List<HeightmapData>>>()
     private val autosaveInFlight = AtomicBoolean(false)
@@ -245,6 +247,11 @@ object VanillaAnvilWorldSaver {
     }
 
     fun loadChunkOverrideIfPresent(world: World, chunkPos: ChunkPos): Int {
+        if (preloadedOverrideWorldKeys.contains(world.key)) return 0
+        val hasPersistedOverrides = worldHasPersistedOverrides.computeIfAbsent(world.key) { key ->
+            detectPersistedOverridesInWorld(key)
+        }
+        if (!hasPersistedOverrides) return 0
         return runOnSaveExecutor {
             val loadedForWorld = loadedChunkOverridesByWorld
                 .computeIfAbsent(world.key) { ConcurrentHashMap.newKeySet() }
@@ -358,11 +365,15 @@ object VanillaAnvilWorldSaver {
 
     private fun loadAllWorldsInternal(): LoadReport {
         val worlds = WorldManager.allWorlds()
+        preloadedOverrideWorldKeys.clear()
+        worldHasPersistedOverrides.clear()
         var worldsWithOverrides = 0
         var loadedChunks = 0
         var loadedOverrides = 0
         for (world in worlds) {
             val (chunks, overrides) = loadWorldChunkOverrides(world)
+            worldHasPersistedOverrides[world.key] = chunks > 0
+            preloadedOverrideWorldKeys.add(world.key)
             if (chunks > 0) {
                 worldsWithOverrides++
                 loadedChunks += chunks
@@ -375,6 +386,25 @@ object VanillaAnvilWorldSaver {
             loadedChunks = loadedChunks,
             loadedOverrides = loadedOverrides
         )
+    }
+
+    private fun detectPersistedOverridesInWorld(worldKey: String): Boolean {
+        val regionDir = worldRegionDirectory(worldKey)
+        if (!Files.isDirectory(regionDir)) return false
+        return runCatching {
+            Files.newDirectoryStream(regionDir).use { paths ->
+                for (path in paths) {
+                    if (!Files.isRegularFile(path)) continue
+                    if (regionFileRegex.matches(path.fileName.toString())) {
+                        return@use true
+                    }
+                }
+                false
+            }
+        }.getOrElse { throwable ->
+            logger.warn("Failed to detect persisted chunk overrides for world={}", worldKey, throwable)
+            true
+        }
     }
 
     fun loadPlayerData(uuid: UUID): PersistedPlayerData? {
